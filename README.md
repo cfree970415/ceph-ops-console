@@ -30,6 +30,7 @@
 - [卸载](#卸载)
 - [常用运维](#常用运维)
 - [升级已部署实例](#升级已部署实例)
+- [登录后没有真实数据](#登录后没有真实数据)
 - [常见问题](#常见问题)
 - [目录结构](#目录结构)
 
@@ -94,7 +95,7 @@ flowchart LR
 | 运行时 | Python **3.6+ 标准库**，无 pip 包、无编译、无需联网 |
 | 浏览器 | 现代浏览器（原生 ES5+ JS / SVG，无需构建、无 CDN 依赖） |
 
-> 后端仅面向 Linux 部署。由后端或任意 HTTP 服务器托管的页面**默认就是 LIVE 控制台**——打开先要求登录，用 admin 登录后进入真实数据视图（顶栏显示 `LIVE · …`）。只有两种情况会进入 **DEMO 模式**（本地模拟数据、不连接集群）：本地 `file://` 双击打开 `ceph-dashboard.html`，或在页面里**主动点**「运行模式 → DEMO 演示」/ 登录页「不连接后端，进入离线演示」。**只要浏览器里存在有效登录会话，刷新一律回到 LIVE 控制台**（登录态优先，不会被 DEMO 覆盖）；未登录时该选择会暂时保留，点「LIVE 对接集群」可切回并自动恢复会话。想一直停在演示，在地址后加 `?demo=1`。设置页「关于」与登录页底部会显示前端构建号，便于确认加载的是哪版代码。
+> 后端仅面向 Linux 部署。由后端或任意 HTTP 服务器托管的页面**默认就是 LIVE 控制台**——打开先要求登录，用 admin 登录后进入真实数据视图（顶栏显示 `LIVE · …`）。只有两种情况会进入 **DEMO 模式**（本地模拟数据、不连接集群）：本地 `file://` 双击打开 `ceph-dashboard.html`，或在页面里**主动点**「运行模式 → DEMO 演示」/ 登录页「不连接后端，进入离线演示」。**只要浏览器里存在有效登录会话，刷新一律回到 LIVE 控制台**（登录态优先，不会被 DEMO 覆盖）；未登录时该选择会暂时保留，点「LIVE 对接集群」可切回并自动恢复会话。想一直停在演示，在地址后加 `?demo=1`。设置页「关于」与登录页底部会显示前端构建号，便于确认加载的是哪版代码。**LIVE 下若后端没返回真实集群状态，页面会显示「集群数据未就绪」诊断页而不是任何数值**，详见 [登录后没有真实数据](#登录后没有真实数据)。
 
 ---
 
@@ -319,6 +320,7 @@ unset PW
 | POST | `/api/password` | 修改当前登录账号密码：需会话 + `old_password` + `new_password` + `confirm_password` |
 | GET | `/api/probe` | Ceph 版本 / 编排器 / 能力探测结果 |
 | GET | `/api/state` | 集群实时状态（20 秒缓存） |
+| GET | `/api/diag` | 后端自检：`ceph status` 命令/退出码/stderr、ceph 与 keyring 路径、能力探测，仅返回诊断信息不含凭据 |
 | GET | `/api/plan` | 当前版本可用能力 |
 | POST | `/api/plan` | 生成操作步骤与命令序列 |
 | GET | `/api/progress` | 回填 / 任务进度 |
@@ -457,32 +459,73 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 ### 10 秒确认是否真的更新了
 
 ```bash
-grep -c 'Logging in as admin' /opt/ceph-console/app-live.js    # 新版 = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-live.js | grep -c 'UI 构建'   # 新版 = 1
+grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.3+ = 1，旧版 = 0
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.0.3-20261109'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.0.2-20261109`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.0.3-20261109`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
+
+---
+
+## 登录后没有真实数据
+
+**这通常不是 DEMO 页面。** 从 1.0.3 起，LIVE 控制台如果拿不到 `GET /api/state` 的有效集群状态，概览 / 告警 / OSD / 存储池 / 主机页面会统一显示「集群数据未就绪」诊断页，**不再渲染任何数值**。旧版会在告警横幅下继续画出内置的 711 TiB、94/96 OSD、18,420 IOPS 等占位数据，很容易被误认为「登录了还是 DEMO」。现在顶栏是 `LIVE · 等待后端数据`，健康状态显示 `UNKNOWN`，页面里明确写着「这里没有显示任何集群数据，也不是演示数据」。
+
+诊断页会直接列出失败原因、后端地址、登录账号、前端构建号与最近尝试时间，并提供三个动作：
+
+| 按钮 | 作用 |
+| --- | --- |
+| 重新同步 | 立即重发 `/api/state`，拿到真实状态后自动恢复集群视图 |
+| 运行后端自检 | 调用 `GET /api/diag`，在页面上显示 `ceph status` 的实际命令、退出码、stderr、ceph 可执行文件位置、专用 keyring 是否存在及权限、能力探测结果和自检结论 |
+| 切换到 DEMO 演示 | 明确进入离线演示（顶栏标 `DEMO`），适合本机没有真实 Ceph 集群、只想体验界面与流程的场景 |
+
+`/api/diag` 只返回路径、退出码与 stderr，**不返回 keyring 内容、API token、密码或会话 id**；该端点只读，不会对集群产生任何变更。
+
+### 按自检结果对号入座
+
+| 自检结果 | 原因 | 处理 |
+| --- | --- | --- |
+| `ceph 可执行文件：未在 PATH 中找到` | 后端主机没装 `ceph-common`，或 systemd 服务的 PATH 与登录 shell 不同 | 安装 `ceph-common`；确认 `systemctl cat ceph-console` 的启动环境 |
+| `ceph status 失败`，stderr 含 `Error ENOENT` / 连接 monitor 超时 | 没有 `/etc/ceph/ceph.conf`、集群不可达，或后端根本不在 Ceph 管理节点上 | 把后端部署到能跑通 `ceph -s` 的管理节点；本项目的读状态依赖本机 ceph CLI |
+| `keyring 文件 · 不存在` 或 `permission denied` | 专用 keyring 丢失、权限不对，或服务用户读不到 | `ls -l /etc/ceph/ceph.client.ceph-console.keyring`，必要时 `chmod 0600` 并重跑安装 |
+| stderr 含 `access denied` / caps 不足 | 早期 `readonly` 安装遗留，`client.ceph-console` 只有 `allow r` | `ceph auth caps client.ceph-console mon 'allow rwx' osd 'allow rwx' mgr 'allow rwx'` |
+| 诊断页显示 `HTTP 401` / `not authenticated` | 会话过期（服务重启后会话存在内存中） | 点「重新登录」，用 admin 重新登录 |
+| 请求未完成（网络 / CORS） | 形态 B 的 `?api=` 后端地址不对，或 `--cors-origin` 没放行前端来源 | 核对登录页后端地址与安装时的 `--cors-origin`；8780 需对浏览器可达 |
+| 自检全部通过但页面仍无数据 | `/api/state` 有 20 秒缓存，或浏览器缓存了旧 JS | 点「重新同步」，必要时 `systemctl restart ceph-console`，浏览器 Ctrl+F5 |
+
+也可以直接在【Ceph 节点】上确认：
+
+```bash
+systemctl status ceph-console --no-pager
+ceph -s
+ceph auth get client.ceph-console
+ls -l /etc/ceph/ceph.client.ceph-console.keyring
+curl -H "X-Console-Token: <token>" http://127.0.0.1:8780/api/diag | python3 -m json.tool
+journalctl -u ceph-console -n 50 --no-pager
+```
+
+> 如果这台机器上**本来就没有 Ceph 集群**，`/api/state` 永远不会返回真实状态，这是预期结果而不是 bug。点「切换到 DEMO 演示」即可正常体验全部界面与流程；DEMO 模式会明确标注，且不会向后端下发任何写操作。
 
 ---
 
 ## 常见问题
 
 **Q：登录 admin 后页面还是 DEMO？**
-先按这个顺序排查：
+先看顶栏：显示 `DEMO` 才是演示模式；显示 `LIVE` 但没有数据，属于[登录后没有真实数据](#登录后没有真实数据)，按诊断页的自检结果处理，不是模式问题。确实是 `DEMO` 时按顺序排查：
 
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.0.2-20261109`。不是这个号（或没有这一行）就是**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.0.3-20261109`。不是这个号（或没有这一行）就是**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但仍 DEMO**：确认是 HTTP 页面而非本地 `file://` 双击、URL 没带 `?demo=1`，然后点设置页「运行模式 → LIVE 对接集群」；已保存的会话会自动恢复，通常无需重新输密码。
 3. 只要浏览器里存在有效登录会话，刷新就一定会回到 LIVE，DEMO 选择不会压过登录态。
 
 分离部署时还要确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
 
-**Q：顶栏显示「LIVE · 等待后端数据」？**
-说明登录成功但 `GET /api/state` 尚未取到集群数据，此时界面不会用演示数据冒充真实状态。检查后端主机 `ceph -s` 是否可执行、keyring 权限是否足够，以及 `GET /api/probe` 的能力探测结果；同步成功后顶栏会自动变成 `LIVE · <集群名>`。
+**Q：顶栏显示「LIVE · 等待后端数据」/ 页面显示「集群数据未就绪」？**
+说明登录成功，但 `GET /api/state` 没拿到有效集群状态。此时**页面不会显示任何占位数值**：顶栏健康为 `UNKNOWN`，集群视图被诊断页替代。点「运行后端自检」看 `ceph status` 的实际报错，完整排查见 [登录后没有真实数据](#登录后没有真实数据)；同步成功后顶栏会自动变成 `LIVE · <集群名>`。
 
 **Q：登录后看不到集群状态？**
-确认后端主机可读取 ceph 配置与 keyring（`ceph -s` 可执行）、`client.ceph-console` 权限充足，并查看 `GET /api/probe` 返回的能力探测结果。
+同上一个问题。最常见的是后端主机 `ceph -s` 跑不通（没装 ceph CLI / 不在管理节点 / 没有真实集群）、专用 keyring 缺失或 caps 不足，其次是形态 B 的后端地址与 CORS 配置。
 
 **Q：点了一键踢盘但集群没变化？**
 先确认服务是否处于 DRY-RUN：按快速开始安装时带了 `--allow-write`，应已开启真实执行；检查 `/api/session` 是否返回 `allow_write: true`、登录角色是否为 admin。若当初去掉了 `--allow-write`，改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console` 即可，无需重装。

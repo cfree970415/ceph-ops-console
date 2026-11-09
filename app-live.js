@@ -5,7 +5,8 @@
 /* ---------- extended state ---------- */
 state.auth={required:false,authenticated:false,user:'',role:'viewer',allowWrite:false,
             readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false};
-state.link={apiBase:'',stateOk:false};
+state.link={apiBase:'',stateOk:false,stateError:'',stateHttp:0,stateAt:0,
+            diag:null,diagBusy:false,diagError:''};
 state.quick=null;
 state.isolation=null;
 
@@ -24,7 +25,7 @@ function apiFetch(m,p,b){
  var body=b?JSON.stringify(b):undefined;
  return fetch(backendBase()+p,{method:m,headers:h,body:body,credentials:'omit'}).then(function(r){
   if(!r.ok)return r.json().catch(function(){return {};}).then(function(j){
-   throw new Error(j.error||('HTTP '+r.status));});
+   var e=new Error(j.error||('HTTP '+r.status));e.status=r.status;throw e;});
   return r.json();});
 }
 var __origApiCall=API.call;
@@ -70,6 +71,7 @@ function applySession(r){
  /* Logging in as admin (or any real account) always means the live console.
     The demo shell is only reachable by explicitly choosing DEMO. */
  state.mode='live';try{sessionStorage.removeItem('cc_demo');}catch(e){}
+ if(state.link){state.link.stateError='';state.link.stateHttp=0;state.link.diag=null;}
  state.auth.authenticated=true;state.auth.user=r.user||'admin';state.auth.role=r.role||'viewer';
  state.auth.allowWrite=!!r.allow_write&&state.auth.role==='admin';
  state.auth.readOnly=!!r.read_only;state.auth.backend=r.backend||'cli';
@@ -94,7 +96,9 @@ function doLogin(){
 function doLogout(){
  apiFetch('POST','/api/logout',{}).catch(function(){});
  try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');sessionStorage.removeItem('cc_demo');}catch(e){}
- state.token='';state.quick=null;state.profile=null;state.isolation=null;state.link.stateOk=false;
+ state.token='';state.quick=null;state.profile=null;state.isolation=null;
+ if(state.link){state.link.stateOk=false;state.link.stateError='';state.link.stateHttp=0;
+  state.link.stateAt=0;state.link.diag=null;state.link.diagError='';}
  state.auth=authReset();render();renderAuth();toast('已退出登录','ok');
 }
 /* ---------- change the signed-in account's password ---------- */
@@ -196,12 +200,27 @@ render=function(){
   if(c)c.innerHTML='<div class="empty">'+ic('lock',34)+'<div>正在连接后端，请先登录</div></div>';
   return;}
  __baseRender();
+ /* A signed-in LIVE console that has no valid /api/state must not fall back
+    to the built-in demo fixtures on any cluster view. */
+ if(state.auth.authenticated&&liveNoData()&&CLUSTER_VIEWS.indexOf(state.view)>=0){
+  var box=document.getElementById('content');if(box)box.innerHTML=noDataPage();
+ }
 };
+/* Ask the backend why ceph status cannot be read. Read-only, no side effects. */
+function runDiag(){
+ if(!state.link)return;
+ state.link.diagBusy=true;state.link.diagError='';render();
+ apiFetch('GET','/api/diag').then(function(r){
+  state.link.diag=r.data||null;state.link.diagBusy=false;render();
+ }).catch(function(e){
+  state.link.diagError=(e&&e.message)||'自检请求失败';state.link.diagBusy=false;render();
+ });
+}
 var __baseRenderTop=renderTop;
 renderTop=function(){
  __baseRenderTop();
  var bar=document.getElementById('topbar');if(!bar)return;
- var n=activeAlerts().filter(function(a){return a.sev==='critical'&&a.status==='active';}).length;
+ var n=liveNoData()?0:activeAlerts().filter(function(a){return a.sev==='critical'&&a.status==='active';}).length;
  var h='<button class="ib" data-act="nav" data-view="alerts" title="查看告警页面" style="position:relative">'+ic('bell')+
    (n?'<span class="nav-badge" style="position:absolute;top:-6px;right:-6px">'+n+'</span>':'')+'</button>';
  if(state.mode==='demo')h='<button class="btn sm" data-act="show-login">'+ic('link',13)+' 连接后端</button>'+h;
@@ -437,6 +456,13 @@ var __baseOnAct=onAct;
 onAct=function(act,el){
  if(act.indexOf('auth-')===0)return authAction(act,el);
  if(act.indexOf('q-')===0)return quickAction(act,el);
+ if(act==='diag-retry'){syncState().then(function(){render();});return;}
+ if(act==='diag-run'){runDiag();return;}
+ if(act==='diag-demo'){
+  try{sessionStorage.setItem('cc_demo','1');}catch(e){}
+  state.mode='demo';state.auth=authReset();state.auth.required=false;
+  state.settings.allowWrite=false;if(state.link)state.link.stateOk=false;
+  state.view='overview';render();renderAuth();toast('已切换到离线演示','w');return;}
  if(act==='logout')return doLogout();
  if(act==='change-password')return changePassword();
  if(act==='show-login')return enterLive();

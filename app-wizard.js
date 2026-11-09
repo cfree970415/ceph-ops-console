@@ -73,13 +73,16 @@ var WSTEPS=['选择 OSD 与意图','自动预检','二次确认','执行与观�
 function syncState(){
  if(state.mode!=='live')return Promise.resolve();
  return API.call('GET','/api/state').then(function(r){
-  var d=r.data||{},c=d.cluster||{};
-  if(state.link)state.link.stateOk=!c.error;
+  var d=r.data||{},c=d.cluster||{},err=c.error||d.error||'';
+  /* Record WHY there is no real data, so the UI can show the exact error
+     instead of a vague "waiting for backend" label. */
+  if(state.link){state.link.stateOk=!err;state.link.stateError=err?String(err):'';
+   state.link.stateHttp=200;state.link.stateAt=Date.now();}
   ['health','version','codename','deploy'].forEach(function(k){if(c[k])state.cluster[k]=c[k];});
   ['total','used','osds','osdsUp','osdsIn','mons','monInQuorum','pgs','pools','iops','throughput'].forEach(function(k){
    if(typeof c[k]==='number'&&c[k]>0)state.cluster[k]=c[k];});
   if(c.fsid)state.cluster.fsid=c.fsid;
-  if(c.error)console.warn('backend state:',c.error);
+  if(err)console.warn('backend state:',err);
   if(d.profile)state.profile=d.profile;
   if(d.osds&&d.osds.length)state.osds=d.osds.map(function(o){
    return {id:o.id,host:o.host||'',dev:o.dev||'',type:o.type||'SSD',size:o.size||0,used:o.used||0,
@@ -90,7 +93,11 @@ function syncState(){
   if(d.pools&&d.pools.length)state.pools=d.pools;
   if(d.hosts&&d.hosts.length)state.hosts=d.hosts;
   state.lastRefresh=Date.now();if(!state.wizard)render();
- }).catch(function(e){if(state.link)state.link.stateOk=false;toast('同步集群状态失败：'+e.message,'e');});}
+ }).catch(function(e){
+  if(state.link){state.link.stateOk=false;state.link.stateError=(e&&e.message)||'请求失败';
+   state.link.stateHttp=(e&&e.status)||0;state.link.stateAt=Date.now();}
+  if(state.auth.authenticated&&!state.wizard)render();
+  toast('同步集群状态失败：'+((e&&e.message)||'未知错误'),'e');});}
 function startWizard(id,intent){var n=id==null?7:Number(id),o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[7];
  state.wizard={step:1,osdId:o.id,host:o.host,dev:o.dev,intent:intent||'replace',phrase:'',confirmed:false,checks:null,plan:null,
   logs:[],progress:0,running:false,done:false,aborted:false,newOsdId:null,remote:null};

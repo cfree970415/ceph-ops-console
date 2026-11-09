@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.0.2-20261109';
+var UI_BUILD='1.0.3-20261109';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -90,7 +90,8 @@ var state={
  filters:{alertSev:'all',alertStatus:'all',alertQ:'',osdStatus:'all',osdQ:''},
  settings:{nearfull:85,full:95,downMin:10,pgDegraded:1,slowOps:1000,webhook:'',notifyWebhook:true,notifyMail:false,notifyWecom:false,notifyDing:false,deployMode:'auto',forceVersion:'auto',allowWrite:false,confirm:true},
  deploy:{host:'192.168.27.134',user:'root',port:'8780',dir:'/opt/ceph-console',keytype:'full',restUrl:''},
- profile:null,wizard:null,modal:null};
+ profile:null,wizard:null,modal:null,
+ link:{apiBase:'',stateOk:false,stateError:'',stateHttp:0,stateAt:0,diag:null,diagBusy:false,diagError:''}};
 
 /* ---- shared helpers (must exist before the first render) ---- */
 function backendBase(){return state.apiBase||(state.link&&state.link.apiBase)||'';}
@@ -120,8 +121,14 @@ function donut(p,color,label){var r=44,c=2*Math.PI*r;
 
 /* ---- shell ---- */
 var NAV=[{cap:'监控'},{v:'overview',t:'集群概览',i:'grid'},{v:'alerts',t:'告警中心',i:'bell',badge:function(){return state.alerts.filter(function(a){return a.status==='active'&&a.sev==='critical';}).length;}},{cap:'存储资源'},{v:'osds',t:'OSD / 磁盘',i:'disk'},{v:'pools',t:'存储池',i:'layers'},{v:'hosts',t:'主机与 MON',i:'server'},{cap:'运维'},{v:'audit',t:'变更审计',i:'history'},{v:'deploy',t:'部署与对接',i:'rocket'},{v:'settings',t:'系统设置',i:'settings'}];
+/* LIVE without a valid /api/state response must never render the built-in
+   demo fixtures. All cluster views are replaced by an explicit diagnostic
+   page instead of showing fabricated numbers as if they were real. */
+function liveNoData(){return state.mode==='live'&&!!state.link&&!state.link.stateOk;}
+var CLUSTER_VIEWS=['overview','alerts','osds','pools','hosts'];
 function activeAlerts(){return state.alerts.filter(function(a){return a.status!=='resolved';});}
 function healthInfo(){
+ if(liveNoData())return {t:'UNKNOWN',cl:'',dot:'off',txt:'数据未就绪'};
  if(state.mode==='live'&&state.cluster.health&&state.cluster.health.indexOf('HEALTH_')===0){
   var h=state.cluster.health;
   if(h==='HEALTH_ERR')return {t:'HEALTH_ERR',cl:'err',dot:'err',txt:'集群错误'};
@@ -134,8 +141,8 @@ function healthInfo(){
  return {t:'HEALTH_OK',cl:'ok',dot:'ok',txt:'集群健康'};}
 function renderNav(){var h='';NAV.forEach(function(n){if(n.cap){h+='<div class="nav-cap">'+n.cap+'</div>';return;}var b=n.badge?n.badge():0;
  h+='<button class="nav-i '+(state.view===n.v?'on':'')+'" data-act="nav" data-view="'+n.v+'">'+ic(n.i)+'<span>'+n.t+'</span>'+(b?'<span class="nav-badge">'+b+'</span>':'')+'</button>';});
- document.getElementById('nav').innerHTML=h;var c=state.cluster;
- document.getElementById('side-foot').innerHTML='<div class="row"><span>集群</span><b class="mono tm">'+esc(c.name)+'</b></div><div class="row"><span>Ceph</span><b class="mono" style="color:var(--accent2)">'+esc(c.version)+' '+esc(c.codename)+'</b></div><div class="row"><span>OSD</span><b class="mono '+(c.osdsUp<c.osds?'tw':'t')+'">'+c.osdsUp+' / '+c.osds+'</b></div><div class="row" style="margin-top:9px"><span><span class="dot '+(state.mode==='live'?'ok':'off')+'"></span>'+(state.mode==='live'?'已对接集群':'演示数据')+'</span><span class="mono">:'+state.deploy.port+'</span></div>';}
+ document.getElementById('nav').innerHTML=h;var c=state.cluster,nd=liveNoData();
+ document.getElementById('side-foot').innerHTML='<div class="row"><span>集群</span><b class="mono tm">'+esc(nd?'—':c.name)+'</b></div><div class="row"><span>Ceph</span><b class="mono" style="color:var(--accent2)">'+esc(nd?'—':c.version+' '+c.codename)+'</b></div><div class="row"><span>OSD</span><b class="mono '+(nd?'':(c.osdsUp<c.osds?'tw':'t'))+'">'+(nd?'—':c.osdsUp+' / '+c.osds)+'</b></div><div class="row" style="margin-top:9px"><span><span class="dot '+(nd?'off':(state.mode==='live'?'ok':'off'))+'"></span>'+(nd?'数据未就绪':(state.mode==='live'?'已对接集群':'演示数据'))+'</span><span class="mono">:'+state.deploy.port+'</span></div>';}
 var TITLES={overview:'集群概览',alerts:'告警中心',osds:'OSD / 磁盘',pools:'存储池',hosts:'主机与 MON',audit:'变更审计',deploy:'部署与对接',settings:'系统设置'};
 function renderTop(){var H=healthInfo(),c=state.cluster,
  liveLabel=(state.link&&state.link.stateOk)?'LIVE · '+esc(c.name):'LIVE · 等待后端数据';
@@ -149,8 +156,62 @@ function render(){document.documentElement.setAttribute('data-theme',state.theme
 function pageH(t,s,right){return '<div class="page-h"><div><h2>'+t+'</h2><p>'+s+'</p></div><div class="btn-row">'+(right||'')+'</div></div>';}
 function card(title,body,right,noPad){return '<div class="card"><div class="card-h"><h3>'+title+'</h3><div class="sp"></div>'+(right||'')+'</div><div class="'+(noPad===false?'':'card-b')+'">'+body+'</div></div>';}
 
+/* ---- view: LIVE but no real backend data ---- */
+function noDataPage(){
+ var L=state.link||{},err=L.stateError||'',http=L.stateHttp||0,d=L.diag||null;
+ var pending=!L.stateAt;
+ var authGone=http===401||/not authenticated|sign in|请登录/i.test(err);
+ var reason=pending?'正在向后端请求集群状态（首次同步尚未完成）':
+  (authGone?'登录会话已失效，请重新登录':
+   (http?('请求返回 HTTP '+http+(err?'：'+esc(err):'')):
+    (err?('后端返回：'+esc(err)):'请求未完成（网络不可达 / CORS 被拦截 / 后端无响应）')));
+ var rows='<div class="stat-line"><span>失败原因</span><b>'+reason+'</b></div>'+
+  '<div class="stat-line"><span>后端地址</span><b class="mono">'+esc(backendBase()||'同源 · 由后端托管')+'</b></div>'+
+  '<div class="stat-line"><span>登录账号</span><b class="mono">'+esc(state.auth.authenticated?state.auth.user:'未登录')+'</b></div>'+
+  '<div class="stat-line"><span>前端构建</span><b class="mono">'+esc(UI_BUILD)+'</b></div>'+
+  '<div class="stat-line"><span>最近尝试</span><b class="mono">'+(L.stateAt?dt(L.stateAt):'—')+'</b></div>';
+ var btns='<div class="btn-row" style="margin:14px 0">'+
+  '<button class="btn pri" data-act="diag-retry">'+ic('refresh',14)+' 重新同步</button>'+
+  '<button class="btn" data-act="diag-run">'+ic('wrench',14)+' 运行后端自检</button>'+
+  (authGone?'<button class="btn" data-act="logout">重新登录</button>':'')+
+  '<button class="btn" data-act="nav" data-view="settings">系统设置</button>'+
+  '<button class="btn gho" data-act="diag-demo">切换到 DEMO 演示</button></div>';
+ var diagHtml='';
+ if(L.diagBusy)diagHtml='<div class="empty" style="padding:18px">'+ic('refresh',26)+'<div>正在运行后端自检…</div></div>';
+ else if(L.diagError)diagHtml='<div class="warnbox">'+ic('alert')+'<div>自检请求失败：'+esc(L.diagError)+'</div></div>';
+ else if(d){
+  var st=d.status||{},pr=d.probe||{};
+  diagHtml='<div class="grid g2" style="gap:0 20px">'+
+   '<div><div class="stat-line"><span>后端版本</span><b class="mono">'+esc(d.version||'-')+'</b></div>'+
+   '<div class="stat-line"><span>ceph 可执行文件</span><b class="mono '+(d.ceph_bin?'t':'td')+'">'+esc(d.ceph_bin||'未在 PATH 中找到')+'</b></div>'+
+   '<div class="stat-line"><span>ceph status</span><b class="mono '+(st.ok?'t':'td')+'">'+(st.ok?'执行成功（rc=0）':'失败 rc='+esc(st.rc))+'</b></div>'+
+   '<div class="stat-line"><span>客户端 / keyring</span><b class="mono">'+esc(d.ceph_name||'-')+'</b></div>'+
+   '<div class="stat-line"><span>keyring 文件</span><b class="mono '+(d.keyring_exists?'t':'td')+'">'+esc(d.ceph_keyring||'-')+(d.keyring_exists?' · '+esc(d.keyring_mode||''):' · 不存在')+'</b></div></div>'+
+   '<div><div class="stat-line"><span>探测版本</span><b class="mono">'+esc(pr.version||'-')+' '+(pr.detected?'· 已探测':'· 推断')+'</b></div>'+
+   '<div class="stat-line"><span>探测错误</span><b class="mono">'+esc(pr.error||'无')+'</b></div>'+
+   '<div class="stat-line"><span>写操作</span><b class="mono">'+(d.allow_write?'已启用':'DRY-RUN')+'</b></div>'+
+   '<div class="stat-line"><span>后端平台</span><b class="mono">'+esc(d.python||'-')+'</b></div>'+
+   '<div class="stat-line"><span>执行命令</span><b class="mono mini">'+esc(st.command||'-')+'</b></div></div></div>'+
+   (st.error?'<div class="warnbox" style="margin-top:12px">'+ic('alert')+'<div><b>ceph 报错原文</b><br><span class="mono">'+esc(st.error)+'</span></div></div>':'')+
+   '<div class="note" style="margin-top:12px"><b>自检结论</b> · '+esc(d.hint||'-')+'</div>';
+ }
+ var cmds='# 在【Ceph 节点】执行\nsystemctl status ceph-console --no-pager\nceph -s\nceph auth get client.ceph-console\nls -l /etc/ceph/ceph.client.ceph-console.keyring\ngrep -E "CEPH_CONSOLE|CEPH_ARGS" /etc/ceph-console/env\ncurl -H "X-Console-Token: <token>" http://127.0.0.1:8780/api/diag | python3 -m json.tool\njournalctl -u ceph-console -n 50 --no-pager';
+ var cmdCard='<div class="card" style="margin-top:14px"><div class="card-h"><h3>在后端主机上排查</h3><div class="sp"></div><button class="btn sm" data-act="copy" data-target="diag-cmd">复制</button></div><div class="card-b"><pre class="mono" id="diag-cmd" style="white-space:pre-wrap;font-size:11px;line-height:1.7;margin:0">'+esc(cmds)+'</pre></div></div>';
+ return pageH(pending?'正在同步集群状态':'集群数据未就绪','LIVE 控制台 · 后端未返回真实集群状态',
+   '<button class="btn" data-act="diag-retry">'+ic('refresh',14)+' 重新同步</button>')+
+  '<div class="card"><div class="card-b">'+
+  '<div class="warnbox" style="margin-bottom:14px">'+ic('alert')+'<div><b>'+
+  (pending?'正在同步集群状态，暂不展示任何数据':'这里没有显示任何集群数据，也不是演示数据')+'</b><br>'+
+  (pending?'登录成功后会先拉取 <span class="mono">/api/state</span>；为避免把占位数值误当成真实集群状态，同步完成前概览 / 告警 / OSD / 存储池 / 主机页面全部暂停展示。':'为避免把占位数值误当成真实集群状态，LIVE 模式下未取到 <span class="mono">/api/state</span> 有效响应时，概览 / 告警 / OSD / 存储池 / 主机页面全部暂停展示；同步成功后自动恢复。')+
+  '</div></div>'+
+  rows+btns+'<div class="hr"></div>'+diagHtml+cmdCard+
+  '<div class="note" style="margin-top:12px">只想体验界面和流程可点「切换到 DEMO 演示」——DEMO 会明确标注，且不会向后端下发任何写操作。</div>'+
+  '</div></div>';
+}
+
 /* ---- view: overview ---- */
-function vOverview(){var c=state.cluster,H=healthInfo(),up=pct(c.used,c.total),active=activeAlerts(),crit=active.filter(function(a){return a.sev==='critical';}).length;
+function vOverview(){if(liveNoData())return noDataPage();
+ var c=state.cluster,H=healthInfo(),up=pct(c.used,c.total),active=activeAlerts(),crit=active.filter(function(a){return a.sev==='critical';}).length;
  var K=[{l:'集群健康',i:'activity',v:H.t.replace('HEALTH_',''),s:'<b class="'+(H.cl==='err'?'td':H.cl==='warn'?'tw':'t')+'">'+H.txt+'</b> · '+esc(c.codename)+' '+esc(c.version)},
   {l:'已用容量',i:'db',v:bytes(c.used),s:'共 '+bytes(c.total)+' · <b>'+up+'%</b> 已用',bar:up,color:up>85?'var(--warn)':'var(--ok)'},
   {l:'OSD 状态',i:'disk',v:c.osdsUp+'<small>/ '+c.osds+'</small>',s:'<b class="tw">'+(c.osds-c.osdsUp)+' 个 down</b> · '+(c.osds-c.osdsIn)+' 个 out',bar:pct(c.osdsUp,c.osds),color:'var(--warn)'},
@@ -165,8 +226,9 @@ function vOverview(){var c=state.cluster,H=healthInfo(),up=pct(c.used,c.total),a
   '<div class="btn-row" style="margin-bottom:14px"><button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fq.id+'">'+ic('trash',14)+'一键踢盘</button>'+
   '<button class="qbtn lg" data-act="q-open" data-kind="replace" data-id="'+fq.id+'">'+ic('zap',14)+'一键换盘</button>'+
   '<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+'查看告警页面</button></div><div class="hr"></div>':'';
- var noData=(state.mode==='live'&&state.link&&!state.link.stateOk)?
-  '<div class="warnbox" style="margin-bottom:14px">'+ic('alert')+'<div><b>尚未取到集群真实数据</b> · 当前已是 LIVE 控制台，但 <span class="mono">GET /api/state</span> 未返回有效状态，下方数值仍是界面占位数据，请勿据此判断集群。请检查后端主机 <span class="mono">ceph -s</span> 与 keyring 权限，或点顶栏刷新重新同步。</div></div>':'';
+ /* Unreachable while liveNoData() is true (vOverview returns noDataPage()
+    above); kept empty so no stale "placeholder numbers" banner survives. */
+ var noData='';
  var p=liveProfile(),recent=card('告警速览 · 点击查看全部',state.alerts.slice(0,5).map(function(a){return alertRow(a,true);}).join(''),'<button class="btn sm" data-act="nav" data-view="alerts">查看全部 '+ic('arrow',12)+'</button>',false);
  var quick=card('快捷运维',quickOps+'<div class="note" style="margin-bottom:12px">磁盘故障处理推荐走「踢盘换盘向导」：自动完成版本适配、预检、二次确认、执行与回填观察。</div><div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="simulate">'+ic('zap',14)+' 模拟一次磁盘故障</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
  return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="replace">'+ic('zap',14)+' 一键换盘</button>')+

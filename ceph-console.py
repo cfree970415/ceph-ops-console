@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import socketserver
 import ssl
 import subprocess
@@ -39,7 +40,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.0"
+VERSION = "1.0.3"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -769,6 +770,57 @@ def isolation_info(cfg, probe):
     return info
 
 
+def diag_info(cfg, probe):
+    """Explain why /api/state has no real cluster data.
+
+    Exposes paths, exit codes and stderr only - never keyring contents,
+    passwords, session ids or the service token.
+    """
+    keyring = cfg.ceph_keyring or ""
+    kr_exists = bool(keyring) and os.path.isfile(keyring)
+    kr_mode = ""
+    if kr_exists:
+        try:
+            kr_mode = oct(os.stat(keyring).st_mode & 0o777)
+        except OSError:
+            pass
+    info = {"version": VERSION, "backend": cfg.backend,
+            "python": platform.python_version(), "platform": platform.platform(),
+            "ceph_bin": shutil.which("ceph") or "",
+            "ceph_conf": cfg.ceph_conf or "(default /etc/ceph/ceph.conf)",
+            "ceph_name": cfg.ceph_name or "(default client.admin)",
+            "ceph_keyring": keyring or "(default keyring)",
+            "keyring_exists": kr_exists, "keyring_mode": kr_mode,
+            "allow_write": bool(cfg.allow_write), "read_only": bool(cfg.read_only),
+            "rest_url": cfg.rest_url or "", "probe": probe.as_dict(),
+            "status": {}, "hint": ""}
+    if cfg.backend == "rest":
+        info["status"] = {"ok": bool(cfg.rest_url), "rc": 0,
+                          "command": "GET %s/api/summary" % (cfg.rest_url or "<unset>"),
+                          "error": "" if cfg.rest_url else "--rest-url is not configured"}
+    else:
+        argv = ["ceph"]
+        if cfg.ceph_conf:
+            argv += ["--conf", cfg.ceph_conf]
+        if cfg.ceph_name:
+            argv += ["-n", cfg.ceph_name]
+        if cfg.ceph_keyring:
+            argv += ["-k", cfg.ceph_keyring]
+        argv += ["status", "--format=json"]
+        rc, out, err = run(argv, 8)
+        info["status"] = {"ok": rc == 0, "rc": rc, "command": cmd_str(argv),
+                          "error": ((err or out).strip()[:800] if rc else "")}
+    if cfg.backend == "cli" and not info["ceph_bin"]:
+        info["hint"] = "ceph 可执行文件不在后端进程 PATH 中，无法读取集群状态"
+    elif cfg.backend == "cli" and keyring and not kr_exists:
+        info["hint"] = "专用 keyring 文件不存在，ceph 命令会因认证失败而拿不到状态"
+    elif not info["status"].get("ok"):
+        info["hint"] = "ceph status 执行失败：检查 ceph.conf、keyring 权限与 ceph auth caps"
+    else:
+        info["hint"] = "ceph status 可正常执行；若页面仍无数据，等 20 秒缓存过期或重启服务"
+    return info
+
+
 _PROGRESS_CACHE = {"ts": 0.0, "data": None}
 
 
@@ -1081,6 +1133,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/probe":
             self.probe.refresh()
             return self._json({"ok": True, "profile": self.probe.as_dict()})
+        if path == "/api/diag":
+            return self._json({"ok": True, "data": diag_info(self.cfg, self.probe)})
         if path == "/api/state":
             now = time.time()
             if _STATE_CACHE["data"] is None or now - _STATE_CACHE["ts"] > 20:

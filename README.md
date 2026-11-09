@@ -99,72 +99,129 @@ flowchart LR
 
 ## 快速开始
 
-### 0. 准备文件
+本节涉及 4 类机器，先认清角色再看命令。**所有 `deploy.sh` 命令都在 Linux 服务器上执行；本地工作机不部署任何服务。**
 
-把以下 7 个文件放到目标 Linux 主机同一目录（例如 `/tmp/ceph-console/`）：
+| 标签 | 机器 | 作用 | 何时需要 |
+| --- | --- | --- | --- |
+| 【本地终端】 | 放源码的工作机（Windows 亦可） | 执行 `scp` 传文件、离线打开 DEMO 看界面 | 始终 |
+| 【Ceph 节点】 | Ceph 管理节点 / 后端服务器，示例 `192.168.27.134`；Linux，具备 `ceph` CLI 与 admin keyring，能跑通 `ceph -s` | 运行 `ceph-console.py`、下发 ceph 命令、写审计与日志 | 始终 |
+| 【Web 服务器】 | 另一台 Linux，仅形态 B 使用 | 只托管静态页面，不装 Python 后端、不碰集群 | 仅形态 B |
+| 【浏览器】 | 任意能访问上述服务器的电脑 | 登录、查看告警、点击一键踢盘 / 换盘 | 始终 |
+
+**步骤 × 执行位置速查**
+
+| 步骤 | 在哪敲命令 | 作用落到哪台机器 |
+| --- | --- | --- |
+| 0 准备文件 | 【本地终端】执行 `scp` | 文件复制到【Ceph 节点】`/tmp/`；形态 B 还要再传一份到【Web 服务器】 |
+| 1 预览体检 | 【Ceph 节点】 | 只读，不改任何系统 |
+| 2 形态 A 安装 | 【Ceph 节点】 | 前端 + 后端 + 服务都在这台 |
+| 3.1 形态 B 后端 | 【Ceph 节点】 | 只装 API 服务 |
+| 3.2 形态 B 前端 | 【Web 服务器】 | 只放静态页面 |
+| 3.3 访问页面 | 【浏览器】 | 形态 A 访问【Ceph 节点】；形态 B 访问【Web 服务器】 |
+| 4 开启真实执行 | 后端服务所在的【Ceph 节点】 | 命令最终由这台机器下发到集群 |
+| 5 离线 DEMO | 【本地终端】 | 不连接任何服务器 |
+
+> 关键：**无论从哪台机器点按钮，真正执行 `ceph ...` 的都是【Ceph 节点】上的 `ceph-console.py`**。【浏览器】与【Web 服务器】只负责发 HTTP 请求。
+
+### 0. 准备文件 · 【本地终端】
+
+> **执行位置**：在【本地终端】敲 `scp`，把 7 个文件送到【Ceph 节点】的 `/tmp/`（把 IP 换成你的实际管理节点地址）。
 
 ```bash
+# 在【本地终端】执行，当前目录为仓库根目录
 scp ceph-console.py ceph-dashboard.html \
     app-core.js app-views.js app-wizard.js app-live.js deploy.sh \
-    root@<ceph-admin-node>:/tmp/
+    root@192.168.27.134:/tmp/
 ```
 
-### 1. 先预览，再安装
-
-`deploy.sh` 不加 `--install` 时只做体检与预览，**不会改动系统**：
+若采用形态 B，同一批文件还要**从【本地终端】再传一份到【Web 服务器】**：
 
 ```bash
-bash deploy.sh --local --host 192.168.27.134 --port 8780
+# 在【本地终端】执行（仅形态 B 需要）
+scp ceph-console.py ceph-dashboard.html \
+    app-core.js app-views.js app-wizard.js app-live.js deploy.sh \
+    root@<web-server>:/tmp/
 ```
 
-### 2. 形态 A：Ceph 管理节点一键启动（推荐先这样验证）
+### 1. 先预览，再安装 · 【Ceph 节点】
+
+> **执行位置**：【Ceph 节点】（文件已在上一步传到 `/tmp/`）。不加 `--install` 时只做体检与预览，**不会改动系统**。
 
 ```bash
-# 只读 keyring + 默认 DRY-RUN，安全接入现有集群
-sudo bash deploy.sh --local --host 192.168.27.134 \
+# 在【Ceph 节点】执行
+cd /tmp && bash deploy.sh --local --host 192.168.27.134 --port 8780
+```
+
+### 2. 形态 A：Ceph 管理节点一键启动（推荐先这样验证） · 【Ceph 节点】
+
+> **执行位置**：【Ceph 节点】一台机器搞定，静态页面、API 后端、systemd 服务全在这台。
+
+```bash
+# 在【Ceph 节点】执行：只读 keyring + 默认 DRY-RUN，安全接入现有集群
+cd /tmp && sudo bash deploy.sh --local --host 192.168.27.134 \
   --keyring readonly --install
 ```
 
-安装结束时终端会打印 **访问地址、登录账号、初始密码、API token、审计路径**。初始密码只显示一次，请立即保存。
+安装结束时，**【Ceph 节点】的终端**会打印访问地址、登录账号、初始密码、API token 与审计路径。初始密码只显示一次，请立即保存。
 
-打开 `http://192.168.27.134:8780/` → 登录 → 概览页即显示真实集群状态。
+> **访问位置**：在【浏览器】打开 `http://192.168.27.134:8780/` → 登录 → 概览页显示真实集群状态（页面本身由【Ceph 节点】托管）。
 
-### 3. 形态 B：前后端分离部署
+### 3. 形态 B：前后端分离部署 · 【Ceph 节点】 + 【Web 服务器】
 
-后端部署在 Ceph 管理节点（只跑 API 服务）：
+> 形态 A 与形态 B **二选一**，不要在同一台机器上重复安装。
+
+**3.1 后端 · 【Ceph 节点】**（只跑 API 服务，必须能访问 Ceph 集群）：
 
 ```bash
-sudo bash deploy.sh --local --mode backend \
+# 在【Ceph 节点】执行
+cd /tmp && sudo bash deploy.sh --local --mode backend \
   --host 192.168.27.134 --port 8780 --install
 ```
 
-前端部署到另一台 Web 服务器：
+**3.2 前端 · 【Web 服务器】**（另一台机器，只放静态文件）：
 
 ```bash
-sudo bash deploy.sh --local --mode frontend \
+# 在【Web 服务器】执行（需先按步骤 0 把文件传到这台机器的 /tmp/）
+cd /tmp && sudo bash deploy.sh --local --mode frontend \
   --backend-url http://192.168.27.134:8780 \
   --cors-origin http://<web-server> \
   --dir /var/www/ceph-console --install
 ```
 
-访问时用 URL 参数指定后端（需 URL 编码），也可在登录页直接填写后端地址：
+**3.3 访问 · 【浏览器】**：用 URL 参数指定后端（需 URL 编码），也可在登录页直接填写后端地址：
 
 ```
 http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 ```
 
-### 4. 开启真实执行（可选，需谨慎）
+> 【Web 服务器】只返回静态页面，浏览器带着 `?api=` 直接向【Ceph 节点】的 8780 端口发 API 请求，因此 **8780 需对浏览器可达**，且 `--cors-origin` 要放行前端站点。
 
-确认 DRY-RUN 生成的命令序列无误后，再启用写能力：
+### 4. 开启真实执行（可选，需谨慎） · 【Ceph 节点】
+
+> **执行位置**：`ceph-console.py` 跑在哪台，就在哪台改 —— 形态 A 与形态 B 都是【Ceph 节点】（后端服务器），**【Web 服务器】不用动**。
+
+形态 A：
 
 ```bash
-sudo bash deploy.sh --local --host 192.168.27.134 \
+# 在【Ceph 节点】执行
+cd /tmp && sudo bash deploy.sh --local --host 192.168.27.134 \
   --keyring full --allow-write --install
 ```
 
-### 5. 离线预览 DEMO
+形态 B（保持 `--mode backend`，不要在后端节点上重装一份前端）：
 
-本地直接打开 `ceph-dashboard.html` 即为演示模式，无需后端，适合评审界面与流程。
+```bash
+# 在【Ceph 节点】执行
+cd /tmp && sudo bash deploy.sh --local --mode backend \
+  --host 192.168.27.134 --port 8780 \
+  --keyring full --allow-write --install
+```
+
+> 也可只改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后重启服务（`systemctl restart ceph-console`）；但若当初用的是 `--keyring readonly`，keyring 只有 `allow r` 权限，必须重跑 `--keyring full` 提权，否则 ceph 会返回权限不足。
+
+### 5. 离线预览 DEMO · 【本地终端】
+
+> **执行位置**：【本地终端】直接双击 `ceph-dashboard.html`。不连接任何服务器、不需要 Linux，仅供评审界面与流程，数据为本地模拟。
 
 ---
 
@@ -254,6 +311,8 @@ sudo bash deploy.sh --local --host 192.168.27.134 \
 
 ## 配置与文件位置
 
+> 以下路径均指 **【Ceph 节点】**（后端服务器）本机；形态 B 的【Web 服务器】上只有 `--dir` 指定的静态文件目录，没有配置、用户库、keyring 和审计日志。
+
 | 用途 | 路径 |
 | --- | --- |
 | 安装目录 | `/opt/ceph-console`（`--dir` 可改） |
@@ -327,6 +386,8 @@ curl -H "X-Console-Token: <token>" http://192.168.27.134:8780/api/probe
 ---
 
 ## 常用运维
+
+> 以下命令均在 **【Ceph 节点】** 执行。其中 `curl` 也可从任意能访问 8780 的【本地终端】发起，把 `127.0.0.1` 换成后端 IP 即可。
 
 ```bash
 systemctl status ceph-console          # 服务状态

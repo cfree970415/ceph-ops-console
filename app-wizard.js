@@ -234,7 +234,11 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
   case 'toggle':{var k2=el.getAttribute('data-key'),ks=k2.split('.'),o=state;for(var i=0;i<ks.length-1;i++)o=o[ks[i]];o[ks[ks.length-1]]=!o[ks[ks.length-1]];render();break;}
   case 'mode':
    if(v==='live'){enterLive();}
-   else{state.mode='demo';state.auth=authReset();state.auth.required=false;render();renderAuth();toast('已切换到离线演示','w');}
+   else if(v==='demo'){
+    /* Keep the session id in sessionStorage: enterLive() can resume it
+       silently when the user switches back to LIVE. */
+    state.mode='demo';state.auth=authReset();state.auth.required=false;
+    state.settings.allowWrite=false;render();renderAuth();toast('已切换到离线演示','w');}
    break;
   case 'wizard':startWizard(id,el.getAttribute('data-intent')||'replace');break;
   case 'w-intent':if(w){w.intent=v;renderWizard();}break;

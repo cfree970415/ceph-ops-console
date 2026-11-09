@@ -109,8 +109,24 @@ function changePassword(){
  }).catch(function(e){show(e.message||'修改失败，请稍后重试',true);});
 }
 function enterLive(){
- state.mode='live';state.auth=authReset();state.auth.required=true;
- render();renderAuth();toast('请填写后端地址并登录','w');
+ /* Clicking the LIVE button while already live and signed in must be a no-op.
+    Resetting state.auth here used to log the user out and re-open the login
+    screen (Settings -> run mode -> LIVE 对接集群). */
+ if(state.mode==='live'&&state.auth.authenticated){
+  toast('当前已连接后端 · '+esc(state.auth.user||'')+'，无需重新登录','ok');
+  return;
+ }
+ var sid=state.auth.session||'';
+ if(!sid){try{sid=sessionStorage.getItem('cc_session')||'';}catch(e){}}
+ state.mode='live';state.auth=authReset();state.auth.required=true;state.auth.session=sid;
+ render();
+ if(!sid){renderAuth();toast('请填写后端地址并登录','w');return;}
+ /* Try to resume the saved session before showing the login form, so a
+    DEMO -> LIVE round trip does not force a password re-entry. */
+ apiFetch('GET','/api/session').then(function(r){
+  if(r.authenticated){applySession(r);signedIn();}
+  else{renderAuth();toast('会话已失效，请重新登录','w');}
+ }).catch(function(){renderAuth();toast('连接失败，请检查后端地址与服务状态','w');});
 }
 function signedIn(){
  render();renderAuth();
@@ -397,7 +413,9 @@ function authAction(act,el){
   case 'auth-tab':state.auth.tab=el.getAttribute('data-value');state.auth.error='';renderAuth();return;
   case 'auth-login':doLogin();return;
   case 'auth-demo':state.mode='demo';state.auth=authReset();state.auth.required=false;
-   state.apiBase='';state.link.apiBase='';render();renderAuth();
+   /* Keep apiBase: a cross-server frontend must be able to switch back to
+      LIVE without retyping the backend address. */
+   state.settings.allowWrite=false;render();renderAuth();
    toast('已进入离线演示模式，数据不来自集群','w');return;
   default:return;
  }

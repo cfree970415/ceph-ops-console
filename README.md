@@ -99,20 +99,22 @@ flowchart LR
 
 ## 快速开始
 
-本节涉及 4 类机器，先认清角色再看命令。**所有 `deploy.sh` 命令都在 Linux 服务器上执行；本地工作机不部署任何服务。**
+源码已托管在 **https://github.com/cfree970415/ceph-ops-console**，各台 Linux 服务器自行 `git clone` 即可，无需从本机传文件。先认清 4 类机器：**所有 `deploy.sh` 命令都在 Linux 服务器上执行；本地工作机不部署任何服务。**
 
 | 标签 | 机器 | 作用 | 何时需要 |
 | --- | --- | --- | --- |
-| 【本地终端】 | 放源码的工作机（Windows 亦可） | 执行 `scp` 传文件、离线打开 DEMO 看界面 | 始终 |
-| 【Ceph 节点】 | Ceph 管理节点 / 后端服务器，示例 `192.168.27.134`；Linux，具备 `ceph` CLI 与 admin keyring，能跑通 `ceph -s` | 运行 `ceph-console.py`、下发 ceph 命令、写审计与日志 | 始终 |
-| 【Web 服务器】 | 另一台 Linux，仅形态 B 使用 | 只托管静态页面，不装 Python 后端、不碰集群 | 仅形态 B |
+| 【本地终端】 | 你的工作机（Windows 亦可） | 离线打开 DEMO 评审界面；内网无法访问 GitHub 时用来下载并拷贝源码 | 可选 |
+| 【Ceph 节点】 | Ceph 管理节点 / 后端服务器，示例 `192.168.27.134`；Linux，具备 `ceph` CLI 与 admin keyring，能跑通 `ceph -s` | 执行 `git clone` 获取源码、运行 `ceph-console.py`、下发 ceph 命令、写审计与日志 | 始终 |
+| 【Web 服务器】 | 另一台 Linux，仅形态 B 使用 | 同样 `git clone` 源码，但只托管静态页面，不装 Python 后端、不碰集群 | 仅形态 B |
 | 【浏览器】 | 任意能访问上述服务器的电脑 | 登录、查看告警、点击一键踢盘 / 换盘 | 始终 |
+
+> 下文统一假定源码 clone 在 `~/ceph-ops-console`；每条命令都写成 `cd ~/ceph-ops-console && ...`，可单独复制执行。
 
 **步骤 × 执行位置速查**
 
 | 步骤 | 在哪敲命令 | 作用落到哪台机器 |
 | --- | --- | --- |
-| 0 准备文件 | 【本地终端】执行 `scp` | 文件复制到【Ceph 节点】`/tmp/`；形态 B 还要再传一份到【Web 服务器】 |
+| 0 获取源码 | 【Ceph 节点】执行 `git clone`；形态 B 还要在【Web 服务器】再 clone 一次 | 源码分别落到两台机器的 `~/ceph-ops-console/` |
 | 1 预览体检 | 【Ceph 节点】 | 只读，不改任何系统 |
 | 2 形态 A 安装 | 【Ceph 节点】 | 前端 + 后端 + 服务都在这台 |
 | 3.1 形态 B 后端 | 【Ceph 节点】 | 只装 API 服务 |
@@ -123,33 +125,33 @@ flowchart LR
 
 > 关键：**无论从哪台机器点按钮，真正执行 `ceph ...` 的都是【Ceph 节点】上的 `ceph-console.py`**。【浏览器】与【Web 服务器】只负责发 HTTP 请求。
 
-### 0. 准备文件 · 【本地终端】
+### 0. 获取源码 · 【Ceph 节点】 / 【Web 服务器】
 
-> **执行位置**：在【本地终端】敲 `scp`，把 7 个文件送到【Ceph 节点】的 `/tmp/`（把 IP 换成你的实际管理节点地址）。
+> **执行位置**：源码已在 GitHub，由**目标 Linux 服务器自己 `git clone`**，不再需要本机 `scp` 传文件。形态 A 只需在【Ceph 节点】clone；形态 B 需在【Ceph 节点】和【Web 服务器】各 clone 一次。
 
-```bash
-# 在【本地终端】执行，当前目录为仓库根目录
-scp ceph-console.py ceph-dashboard.html \
-    app-core.js app-views.js app-wizard.js app-live.js deploy.sh \
-    root@192.168.27.134:/tmp/
-```
-
-若采用形态 B，同一批文件还要**从【本地终端】再传一份到【Web 服务器】**：
-
-```bash
-# 在【本地终端】执行（仅形态 B 需要）
-scp ceph-console.py ceph-dashboard.html \
-    app-core.js app-views.js app-wizard.js app-live.js deploy.sh \
-    root@<web-server>:/tmp/
-```
-
-### 1. 先预览，再安装 · 【Ceph 节点】
-
-> **执行位置**：【Ceph 节点】（文件已在上一步传到 `/tmp/`）。不加 `--install` 时只做体检与预览，**不会改动系统**。
+**形态 A / 形态 B 的后端 · 【Ceph 节点】**：
 
 ```bash
 # 在【Ceph 节点】执行
-cd /tmp && bash deploy.sh --local --host 192.168.27.134 --port 8780
+cd ~ && git clone https://github.com/cfree970415/ceph-ops-console.git
+```
+
+**形态 B 的前端 · 【Web 服务器】**（另一台机器，同样操作）：
+
+```bash
+# 在【Web 服务器】执行（仅形态 B 需要）
+cd ~ && git clone https://github.com/cfree970415/ceph-ops-console.git
+```
+
+> **内网离线环境**：若目标服务器访问不了 GitHub，可在【本地终端】`git clone` 后把整个目录拷过去（`scp -r ceph-ops-console/ root@<host>:~/`），或在能上网的机器下载仓库 zip 再解压；后续把 `~/ceph-ops-console` 换成实际目录即可。仓库里的 7 个运行文件就是全部依赖，无需编译、无需联网安装。
+
+### 1. 先预览，再安装 · 【Ceph 节点】
+
+> **执行位置**：【Ceph 节点】（源码已在上一步 clone 到 `~/ceph-ops-console`）。不加 `--install` 时只做体检与预览，**不会改动系统**。
+
+```bash
+# 在【Ceph 节点】执行
+cd ~/ceph-ops-console && bash deploy.sh --local --host 192.168.27.134 --port 8780
 ```
 
 ### 2. 形态 A：Ceph 管理节点一键启动（推荐先这样验证） · 【Ceph 节点】
@@ -158,7 +160,7 @@ cd /tmp && bash deploy.sh --local --host 192.168.27.134 --port 8780
 
 ```bash
 # 在【Ceph 节点】执行：只读 keyring + 默认 DRY-RUN，安全接入现有集群
-cd /tmp && sudo bash deploy.sh --local --host 192.168.27.134 \
+cd ~/ceph-ops-console && sudo bash deploy.sh --local --host 192.168.27.134 \
   --keyring readonly --install
 ```
 
@@ -174,15 +176,15 @@ cd /tmp && sudo bash deploy.sh --local --host 192.168.27.134 \
 
 ```bash
 # 在【Ceph 节点】执行
-cd /tmp && sudo bash deploy.sh --local --mode backend \
+cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode backend \
   --host 192.168.27.134 --port 8780 --install
 ```
 
 **3.2 前端 · 【Web 服务器】**（另一台机器，只放静态文件）：
 
 ```bash
-# 在【Web 服务器】执行（需先按步骤 0 把文件传到这台机器的 /tmp/）
-cd /tmp && sudo bash deploy.sh --local --mode frontend \
+# 在【Web 服务器】执行（需先按步骤 0 在这台机器上 git clone）
+cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode frontend \
   --backend-url http://192.168.27.134:8780 \
   --cors-origin http://<web-server> \
   --dir /var/www/ceph-console --install
@@ -204,7 +206,7 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 ```bash
 # 在【Ceph 节点】执行
-cd /tmp && sudo bash deploy.sh --local --host 192.168.27.134 \
+cd ~/ceph-ops-console && sudo bash deploy.sh --local --host 192.168.27.134 \
   --keyring full --allow-write --install
 ```
 
@@ -212,7 +214,7 @@ cd /tmp && sudo bash deploy.sh --local --host 192.168.27.134 \
 
 ```bash
 # 在【Ceph 节点】执行
-cd /tmp && sudo bash deploy.sh --local --mode backend \
+cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode backend \
   --host 192.168.27.134 --port 8780 \
   --keyring full --allow-write --install
 ```
@@ -221,7 +223,7 @@ cd /tmp && sudo bash deploy.sh --local --mode backend \
 
 ### 5. 离线预览 DEMO · 【本地终端】
 
-> **执行位置**：【本地终端】直接双击 `ceph-dashboard.html`。不连接任何服务器、不需要 Linux，仅供评审界面与流程，数据为本地模拟。
+> **执行位置**：【本地终端】`git clone` 仓库后直接双击 `ceph-dashboard.html`。不连接任何服务器、不需要 Linux，仅供评审界面与流程，数据为本地模拟。
 
 ---
 
@@ -396,8 +398,8 @@ journalctl -u ceph-console -f         # 实时日志
 tail -f /var/log/ceph-console/audit.jsonl   # 审计
 curl -H "X-Console-Token: <token>" http://127.0.0.1:8780/api/state
 
-sudo bash deploy.sh --uninstall            # 卸载（保留配置）
-sudo bash deploy.sh --uninstall --purge    # 彻底卸载
+cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall            # 卸载（保留配置）
+cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall --purge    # 彻底卸载
 ```
 
 ---
@@ -425,6 +427,8 @@ REST 通道是 mgr dashboard 的只读代理；OSD 写操作需要 `cli` 后端�
 ---
 
 ## 目录结构
+
+以下即 `git clone` 得到的仓库内容。`deploy.sh` 会把其中 7 个运行文件复制到安装目录（默认 `/opt/ceph-console`），仓库本身保留在 `~/ceph-ops-console` 供升级、重装与卸载使用。
 
 ```
 .

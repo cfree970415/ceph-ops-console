@@ -1,0 +1,25 @@
+# WorkBuddy session data (never publish)
+.workbuddy/
+
+# Runtime / generated state (contains credentials or cluster data)
+users.json
+config.json
+env
+audit.jsonl
+*.keyring
+*.log
+console.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

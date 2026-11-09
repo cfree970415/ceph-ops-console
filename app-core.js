@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.0.3-20261109';
+var UI_BUILD='1.0.4-20261109';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -120,13 +120,13 @@ function donut(p,color,label){var r=44,c=2*Math.PI*r;
  return '<svg width="118" height="118" viewBox="0 0 118 118"><circle cx="59" cy="59" r="'+r+'" fill="none" stroke="var(--panel3)" stroke-width="11"/><circle cx="59" cy="59" r="'+r+'" fill="none" stroke="'+color+'" stroke-width="11" stroke-linecap="round" stroke-dasharray="'+c.toFixed(1)+'" stroke-dashoffset="'+(c*(1-p/100)).toFixed(1)+'" transform="rotate(-90 59 59)"/><text x="59" y="55" text-anchor="middle" fill="var(--text)" font-size="20" font-weight="700">'+p+'%</text><text x="59" y="72" text-anchor="middle" fill="var(--faint)" font-size="10">'+esc(label||'')+'</text></svg>';}
 
 /* ---- shell ---- */
-var NAV=[{cap:'监控'},{v:'overview',t:'集群概览',i:'grid'},{v:'alerts',t:'告警中心',i:'bell',badge:function(){return state.alerts.filter(function(a){return a.status==='active'&&a.sev==='critical';}).length;}},{cap:'存储资源'},{v:'osds',t:'OSD / 磁盘',i:'disk'},{v:'pools',t:'存储池',i:'layers'},{v:'hosts',t:'主机与 MON',i:'server'},{cap:'运维'},{v:'audit',t:'变更审计',i:'history'},{v:'deploy',t:'部署与对接',i:'rocket'},{v:'settings',t:'系统设置',i:'settings'}];
+var NAV=[{cap:'监控'},{v:'overview',t:'集群概览',i:'grid'},{v:'alerts',t:'告警中心',i:'bell',badge:function(){if(liveNoData())return 0;return state.alerts.filter(function(a){return a.status==='active'&&a.sev==='critical';}).length;}},{cap:'存储资源'},{v:'osds',t:'OSD / 磁盘',i:'disk'},{v:'pools',t:'存储池',i:'layers'},{v:'hosts',t:'主机与 MON',i:'server'},{cap:'运维'},{v:'audit',t:'变更审计',i:'history'},{v:'deploy',t:'部署与对接',i:'rocket'},{v:'settings',t:'系统设置',i:'settings'}];
 /* LIVE without a valid /api/state response must never render the built-in
    demo fixtures. All cluster views are replaced by an explicit diagnostic
    page instead of showing fabricated numbers as if they were real. */
 function liveNoData(){return state.mode==='live'&&!!state.link&&!state.link.stateOk;}
 var CLUSTER_VIEWS=['overview','alerts','osds','pools','hosts'];
-function activeAlerts(){return state.alerts.filter(function(a){return a.status!=='resolved';});}
+function activeAlerts(){if(liveNoData())return [];return state.alerts.filter(function(a){return a.status!=='resolved';});}
 function healthInfo(){
  if(liveNoData())return {t:'UNKNOWN',cl:'',dot:'off',txt:'数据未就绪'};
  if(state.mode==='live'&&state.cluster.health&&state.cluster.health.indexOf('HEALTH_')===0){
@@ -150,9 +150,49 @@ function renderTop(){var H=healthInfo(),c=state.cluster,
   '<span class="pill '+H.cl+'"><span class="dot '+H.dot+'"></span>'+H.t+'</span><span class="pill '+(state.mode==='live'?'ok':'acc')+'">'+ic(state.mode==='live'?'link':'db',13)+' '+(state.mode==='live'?'LIVE':'DEMO')+'</span>'+
   (state.settings.allowWrite?'':'<span class="pill warn">'+ic('shield',13)+' DRY-RUN</span>')+'<span class="tiny mono">'+dt(state.lastRefresh).slice(11)+'</span>'+
   '<button class="ib" data-act="refresh" title="刷新">'+ic('refresh')+'</button><button class="ib" data-act="theme" title="切换主题">'+ic(state.theme==='dark'?'sun':'moon')+'</button>';}
-function render(){document.documentElement.setAttribute('data-theme',state.theme);renderNav();renderTop();
- var f={overview:vOverview,alerts:vAlerts,osds:vOsds,pools:vPools,hosts:vHosts,audit:vAudit,deploy:vDeploy,settings:vSettings}[state.view];
- document.getElementById('content').innerHTML=f();}
+/* ---- keep unsaved form input across re-renders ----
+   The auto-refresh rebuilds #content with innerHTML. Without a snapshot every
+   input (old/new password, token, thresholds, login fields) was silently
+   wiped while the user was still typing. */
+function formKey(el){return el.id||el.getAttribute('data-bind')||el.getAttribute('name')||'';}
+function formBusy(){
+ var a=document.activeElement;
+ if(!a||!/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))return false;
+ return !!a.value;
+}
+function snapshotForm(root){
+ var out=[],els=root?root.querySelectorAll('input,textarea,select'):[],i,e,r;
+ for(i=0;i<els.length;i++){
+  e=els[i];r={k:formKey(e),tag:e.tagName,type:(e.type||'').toLowerCase(),
+   val:e.value,checked:e.checked===true,focus:document.activeElement===e};
+  if(!r.k)continue;
+  if(r.focus){try{r.ss=e.selectionStart;r.se=e.selectionEnd;}catch(err){}}
+  out.push(r);
+ }
+ return out;
+}
+function restoreForm(root,snap){
+ if(!root||!snap||!snap.length)return;
+ var map={},i,els,e,s,k,focus=null;
+ for(i=0;i<snap.length;i++)map[snap[i].k]=snap[i];
+ els=root.querySelectorAll('input,textarea,select');
+ for(i=0;i<els.length;i++){
+  e=els[i];k=formKey(e);s=k?map[k]:null;
+  if(!s||e.tagName!==s.tag||(e.type||'').toLowerCase()!==s.type)continue;
+  try{e.value=s.val;}catch(err){}
+  if(s.type==='checkbox'||s.type==='radio')e.checked=s.checked;
+  if(s.focus)focus={el:e,ss:s.ss,se:s.se};
+ }
+ if(focus){try{focus.el.focus();
+  if(focus.ss!=null&&focus.el.setSelectionRange)focus.el.setSelectionRange(focus.ss,focus.se);
+ }catch(err){}}
+}
+function render(){document.documentElement.setAttribute('data-theme',state.theme);
+ var f={overview:vOverview,alerts:vAlerts,osds:vOsds,pools:vPools,hosts:vHosts,audit:vAudit,deploy:vDeploy,settings:vSettings}[state.view],
+     content=document.getElementById('content'),snap=snapshotForm(content);
+ renderNav();renderTop();
+ content.innerHTML=f();
+ restoreForm(content,snap);}
 function pageH(t,s,right){return '<div class="page-h"><div><h2>'+t+'</h2><p>'+s+'</p></div><div class="btn-row">'+(right||'')+'</div></div>';}
 function card(title,body,right,noPad){return '<div class="card"><div class="card-h"><h3>'+title+'</h3><div class="sp"></div>'+(right||'')+'</div><div class="'+(noPad===false?'':'card-b')+'">'+body+'</div></div>';}
 
@@ -200,10 +240,7 @@ function noDataPage(){
  return pageH(pending?'正在同步集群状态':'集群数据未就绪','LIVE 控制台 · 后端未返回真实集群状态',
    '<button class="btn" data-act="diag-retry">'+ic('refresh',14)+' 重新同步</button>')+
   '<div class="card"><div class="card-b">'+
-  '<div class="warnbox" style="margin-bottom:14px">'+ic('alert')+'<div><b>'+
-  (pending?'正在同步集群状态，暂不展示任何数据':'这里没有显示任何集群数据，也不是演示数据')+'</b><br>'+
-  (pending?'登录成功后会先拉取 <span class="mono">/api/state</span>；为避免把占位数值误当成真实集群状态，同步完成前概览 / 告警 / OSD / 存储池 / 主机页面全部暂停展示。':'为避免把占位数值误当成真实集群状态，LIVE 模式下未取到 <span class="mono">/api/state</span> 有效响应时，概览 / 告警 / OSD / 存储池 / 主机页面全部暂停展示；同步成功后自动恢复。')+
-  '</div></div>'+
+  '<div class="warnbox" style="margin-bottom:14px">'+ic('alert')+'<div><b>暂未链接任何存储集群，链接并同步成功后自动恢复。</b></div></div>'+
   rows+btns+'<div class="hr"></div>'+diagHtml+cmdCard+
   '<div class="note" style="margin-top:12px">只想体验界面和流程可点「切换到 DEMO 演示」——DEMO 会明确标注，且不会向后端下发任何写操作。</div>'+
   '</div></div>';

@@ -39,6 +39,7 @@ function renderAuth(){
  var root=document.getElementById('auth-root');if(!root)return;
  if(state.mode!=='live'||state.auth.authenticated){root.innerHTML='';root.style.display='none';return;}
  root.style.display='block';
+ var __authSnap=snapshotForm(root);
  var a=state.auth,pw=a.tab==='password';
  var box='<div class="auth-wrap"><div class="auth-card">'+
   '<div class="auth-brand"><div class="brand-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 2c3.5 0 6 2.6 6 6.2v1.3c0 1.6.7 3.1 1.9 4.1 1.2 1 1.9 2.5 1.9 4.1 0 2.9-2.3 5.3-5.2 5.3H7.4C4.5 23 2.2 20.6 2.2 17.7c0-1.6.7-3.1 1.9-4.1A5.4 5.4 0 0 0 6 9.5V8.2C6 4.6 8.5 2 12 2z"/><path d="M12 2v6M6 12h12"/></svg></div>'+
@@ -62,6 +63,7 @@ function renderAuth(){
   '<div style="margin-top:10px;text-align:center;font-size:11px;color:var(--faint)">UI 构建 '+esc(UI_BUILD)+'</div>'+
   '</div></div>';
  root.innerHTML=box;
+ restoreForm(root,__authSnap);
 }
 function authPayload(){
  if(state.auth.tab==='token'){var t=document.getElementById('auth-token');return {token:t?t.value.trim():''};}
@@ -181,7 +183,7 @@ function startRefresh(){
   if(state.mode!=='live'){state.lastRefresh=Date.now();
    state.metrics.cap=state.metrics.cap.slice(1).concat([state.metrics.cap[23]+0.06]);
    state.cluster.iops=Math.round(17000+Math.random()*3500);
-   if(!state.wizard&&!state.quick)render();return;}
+   if(!state.wizard&&!state.quick&&!formBusy())render();return;}
   if(!state.auth.authenticated)return;
   syncState();
   apiFetch('GET','/api/isolation').then(function(r){state.isolation=r.data||null;}).catch(function(){});
@@ -191,6 +193,7 @@ function startRefresh(){
 /* ---------- wrap shell render: never show demo data before login ---------- */
 var __baseRender=render;
 render=function(){
+ var __content=document.getElementById('content'),__formSnap=snapshotForm(__content);
  if(state.mode==='live'&&!state.auth.authenticated){
   document.documentElement.setAttribute('data-theme',state.theme);
   var n=document.getElementById('nav'),t=document.getElementById('topbar'),
@@ -198,13 +201,14 @@ render=function(){
   if(n)n.innerHTML='';if(f)f.innerHTML='';
   if(t)t.innerHTML='<div class="crumb">Ceph Ops Console<small>等待登录</small></div>';
   if(c)c.innerHTML='<div class="empty">'+ic('lock',34)+'<div>正在连接后端，请先登录</div></div>';
-  return;}
+  restoreForm(c,__formSnap);return;}
  __baseRender();
  /* A signed-in LIVE console that has no valid /api/state must not fall back
     to the built-in demo fixtures on any cluster view. */
  if(state.auth.authenticated&&liveNoData()&&CLUSTER_VIEWS.indexOf(state.view)>=0){
   var box=document.getElementById('content');if(box)box.innerHTML=noDataPage();
  }
+ restoreForm(document.getElementById('content'),__formSnap);
 };
 /* Ask the backend why ceph status cannot be read. Read-only, no side effects. */
 function runDiag(){

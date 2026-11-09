@@ -84,19 +84,22 @@ function syncState(){
   if(c.fsid)state.cluster.fsid=c.fsid;
   if(err)console.warn('backend state:',err);
   if(d.profile)state.profile=d.profile;
-  if(d.osds&&d.osds.length)state.osds=d.osds.map(function(o){
+  /* An empty array from the backend is a real answer ("no alerts / no OSDs").
+     Only replacing on non-empty arrays used to leave the built-in demo
+     fixtures behind, e.g. a fabricated red "2" badge on 告警中心. */
+  if(!err&&Array.isArray(d.osds))state.osds=d.osds.map(function(o){
    return {id:o.id,host:o.host||'',dev:o.dev||'',type:o.type||'SSD',size:o.size||0,used:o.used||0,
     up:o.up!==false,inn:o.inn!==false,pgs:o.pgs||0,weight:o.weight||1,smart:o.smart||'OK',serial:o.serial||''};});
-  if(d.alerts&&d.alerts.length)state.alerts=d.alerts.map(function(a){
+  if(!err&&Array.isArray(d.alerts))state.alerts=d.alerts.map(function(a){
    return {id:a.id||uid(),sev:a.sev||'warning',code:a.code||'HEALTH_CHECK',title:a.title||a.code||'告警',
     msg:a.msg||'',src:a.src||'ceph',osd:a.osd==null?null:a.osd,since:a.since||Date.now(),status:a.status||'active',count:a.count||1};});
-  if(d.pools&&d.pools.length)state.pools=d.pools;
-  if(d.hosts&&d.hosts.length)state.hosts=d.hosts;
-  state.lastRefresh=Date.now();if(!state.wizard)render();
+  if(!err&&Array.isArray(d.pools))state.pools=d.pools;
+  if(!err&&Array.isArray(d.hosts))state.hosts=d.hosts;
+  state.lastRefresh=Date.now();if(!state.wizard&&!formBusy())render();
  }).catch(function(e){
   if(state.link){state.link.stateOk=false;state.link.stateError=(e&&e.message)||'请求失败';
    state.link.stateHttp=(e&&e.status)||0;state.link.stateAt=Date.now();}
-  if(state.auth.authenticated&&!state.wizard)render();
+  if(state.auth.authenticated&&!state.wizard&&!formBusy())render();
   toast('同步集群状态失败：'+((e&&e.message)||'未知错误'),'e');});}
 function startWizard(id,intent){var n=id==null?7:Number(id),o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[7];
  state.wizard={step:1,osdId:o.id,host:o.host,dev:o.dev,intent:intent||'replace',phrase:'',confirmed:false,checks:null,plan:null,
@@ -283,5 +286,5 @@ function boot(){
  if(state.mode==='live')syncState();
  setInterval(function(){if(!state.autoRefresh)return;
   if(state.mode==='demo'){state.lastRefresh=Date.now();state.metrics.cap=state.metrics.cap.slice(1).concat([state.metrics.cap[23]+0.06]);state.cluster.iops=Math.round(17000+Math.random()*3500);
-   if(!state.wizard)render();}else{syncState();}},15000);}
+   if(!state.wizard&&!formBusy())render();}else{syncState();}},15000);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();

@@ -58,6 +58,7 @@ function renderAuth(){
    '<div>'+ic('shield',13)+' 会话 8 小时 · HttpOnly Cookie</div><div>'+ic('network',13)+' 支持前后端分离部署</div>'+
    '<div>'+ic('db',13)+' 不影响 Ceph 原生 Dashboard</div><div>'+ic('terminal',13)+' 默认 DRY-RUN</div></div>'+
   '<div style="margin-top:14px;text-align:center"><button class="btn gho sm" data-act="auth-demo">不连接后端，进入离线演示</button></div>'+
+  '<div style="margin-top:10px;text-align:center;font-size:11px;color:var(--faint)">UI 构建 '+esc(UI_BUILD)+'</div>'+
   '</div></div>';
  root.innerHTML=box;
 }
@@ -152,10 +153,10 @@ function liveBoot(){
  var sid='';try{sid=sessionStorage.getItem('cc_session')||'';}catch(e){}
  var choseDemo=false;try{choseDemo=sessionStorage.getItem('cc_demo')==='1';}catch(e){}
  var httpPage=/^https?:$/.test(location.protocol||'');
- /* DEMO is now an explicit user choice (or a local file:// preview). Any page
-    served over HTTP, bootstrapped by the backend, pointed at a backend, or
-    holding a saved session starts as the real console and asks for login. */
- state.mode=(choseDemo||wantDemo)?'demo':((b||state.apiBase||sid||httpPage)?'live':'demo');
+ /* A saved session means the user really signed in: it outranks any remembered
+    DEMO choice, so a logged-in admin can never land on the demo shell again.
+    DEMO only wins via an explicit ?demo=1 URL or when no session exists. */
+ state.mode=wantDemo?'demo':(sid?'live':(choseDemo?'demo':((b||state.apiBase||httpPage)?'live':'demo')));
  render();renderAuth();
  if(state.mode==='live'){
   if(sid)state.auth.session=sid;

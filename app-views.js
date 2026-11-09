@@ -186,7 +186,12 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
    '<div class="fgrp"><label class="fld">degraded PG 阈值</label><input class="inp" type="number" data-bind="settings.pgDegraded" value="'+s.pgDegraded+'"></div>'+
    '<div class="fgrp"><label class="fld">慢请求阈值（ms）</label><input class="inp" type="number" data-bind="settings.slowOps" value="'+s.slowOps+'"></div></div>'+
    '<div class="hint">阈值保存在浏览器会话内；生产环境由后端读取 /etc/ceph-console/config.json 并周期评估。</div>')+
-  card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.0</b></div><div class="stat-line"><span>前端依赖</span><b class="mono t">0（纯原生 HTML/CSS/JS）</b></div>'+
+  card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.2</b></div>'+
+   '<div class="stat-line"><span>前端构建</span><b class="mono t">'+esc(UI_BUILD)+'</b></div>'+
+   '<div class="stat-line"><span>当前运行模式</span><b class="mono '+(state.mode==='live'?'t':'tw')+'">'+(state.mode==='live'?'LIVE 真实控制台':'DEMO 离线演示')+'</b></div>'+
+   '<div class="stat-line"><span>登录状态</span><b class="mono '+(state.auth.authenticated?'t':'tw')+'">'+(state.auth.authenticated?esc(state.auth.user)+' · 已登录':'未登录')+'</b></div>'+
+   '<div class="stat-line"><span>集群数据同步</span><b class="mono '+((state.link&&state.link.stateOk)?'t':'tw')+'">'+(state.mode==='demo'?'演示数据':((state.link&&state.link.stateOk)?'已同步':'未取到数据'))+'</b></div>'+
+   '<div class="stat-line"><span>前端依赖</span><b class="mono t">0（纯原生 HTML/CSS/JS）</b></div>'+
    '<div class="stat-line"><span>后端依赖</span><b class="mono t">0（Python 3.6+ 标准库）</b></div><div class="stat-line"><span>支持 Ceph</span><b class="mono">12.x ~ 19.x</b></div>'+
    '<div class="stat-line"><span>支持 Linux</span><b class="mono">systemd / SysV · 主流发行版</b></div><div class="hr"></div>'+
    '<div class="note">所有图表为原生 SVG 绘制，无 CDN、无外部字体，可直接放进内网离线环境。页面既可用浏览器直接打开体验 DEMO，也可由后端托管为 LIVE 控制台。</div>')+'</div>'+

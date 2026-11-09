@@ -29,6 +29,7 @@
 - [部署参数速查](#部署参数速查)
 - [卸载](#卸载)
 - [常用运维](#常用运维)
+- [升级已部署实例](#升级已部署实例)
 - [常见问题](#常见问题)
 - [目录结构](#目录结构)
 
@@ -93,7 +94,7 @@ flowchart LR
 | 运行时 | Python **3.6+ 标准库**，无 pip 包、无编译、无需联网 |
 | 浏览器 | 现代浏览器（原生 ES5+ JS / SVG，无需构建、无 CDN 依赖） |
 
-> 后端仅面向 Linux 部署。由后端或任意 HTTP 服务器托管的页面**默认就是 LIVE 控制台**——打开先要求登录，用 admin 登录后进入真实数据视图（顶栏显示 `LIVE · …`）。只有两种情况会进入 **DEMO 模式**（本地模拟数据、不连接集群）：本地 `file://` 双击打开 `ceph-dashboard.html`，或在页面里**主动点**「运行模式 → DEMO 演示」/ 登录页「不连接后端，进入离线演示」。这个选择会被记住，刷新页面仍停留在 DEMO，点「LIVE 对接集群」即可切回。HTTP 页面想直接看演示，也可在地址后加 `?demo=1`。
+> 后端仅面向 Linux 部署。由后端或任意 HTTP 服务器托管的页面**默认就是 LIVE 控制台**——打开先要求登录，用 admin 登录后进入真实数据视图（顶栏显示 `LIVE · …`）。只有两种情况会进入 **DEMO 模式**（本地模拟数据、不连接集群）：本地 `file://` 双击打开 `ceph-dashboard.html`，或在页面里**主动点**「运行模式 → DEMO 演示」/ 登录页「不连接后端，进入离线演示」。**只要浏览器里存在有效登录会话，刷新一律回到 LIVE 控制台**（登录态优先，不会被 DEMO 覆盖）；未登录时该选择会暂时保留，点「LIVE 对接集群」可切回并自动恢复会话。想一直停在演示，在地址后加 `?demo=1`。设置页「关于」与登录页底部会显示前端构建号，便于确认加载的是哪版代码。
 
 ---
 
@@ -429,10 +430,53 @@ curl -H "X-Console-Token: <token>" http://127.0.0.1:8780/api/state
 
 ---
 
+## 升级已部署实例
+
+**GitHub 上的更新不会自动同步到运行目录。** `deploy.sh --install` 是把仓库文件**复制**到 `/opt/ceph-console`（形态 B 前端为 `/var/www/ceph-console`）；之后 `git pull` 只更新 `~/ceph-ops-console`，服务仍在读旧文件。所以每次拉完代码都要做一次同步，否则浏览器看到的还是旧逻辑。
+
+### 形态 A / 形态 B 的后端 ·【Ceph 节点】
+
+```bash
+cd ~/ceph-ops-console && git pull
+sudo install -m 0644 ceph-console.py ceph-dashboard.html \
+  app-core.js app-views.js app-wizard.js app-live.js /opt/ceph-console/
+sudo systemctl restart ceph-console
+```
+
+### 形态 B 的前端 ·【Web 服务器】
+
+```bash
+cd ~/ceph-ops-console && git pull
+sudo install -m 0644 ceph-dashboard.html \
+  app-core.js app-views.js app-wizard.js app-live.js /var/www/ceph-console/
+sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.html
+```
+
+> 安装时自定义过 `--dir` 就换成实际目录；前端没有服务，不需要重启。
+
+### 10 秒确认是否真的更新了
+
+```bash
+grep -c 'Logging in as admin' /opt/ceph-console/app-live.js    # 新版 = 1，旧版 = 0
+curl -s http://127.0.0.1:8780/app-live.js | grep -c 'UI 构建'   # 新版 = 1
+```
+
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.0.2-20261109`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+
+同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
+
+---
+
 ## 常见问题
 
-**Q：页面显示 DEMO / 没有真实数据？**
-用 admin 登录成功后一定是 LIVE 控制台。若仍显示 DEMO，只可能是：本地 `file://` 双击打开，或之前点过「DEMO 演示」/「不连接后端，进入离线演示」（该选择会记住，刷新仍为 DEMO）。点设置页「运行模式 → LIVE 对接集群」即可切回，已保存的会话会自动恢复，通常无需重新输密码。分离部署时确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
+**Q：登录 admin 后页面还是 DEMO？**
+先按这个顺序排查：
+
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.0.2-20261109`。不是这个号（或没有这一行）就是**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+2. **构建号正确但仍 DEMO**：确认是 HTTP 页面而非本地 `file://` 双击、URL 没带 `?demo=1`，然后点设置页「运行模式 → LIVE 对接集群」；已保存的会话会自动恢复，通常无需重新输密码。
+3. 只要浏览器里存在有效登录会话，刷新就一定会回到 LIVE，DEMO 选择不会压过登录态。
+
+分离部署时还要确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
 
 **Q：顶栏显示「LIVE · 等待后端数据」？**
 说明登录成功但 `GET /api/state` 尚未取到集群数据，此时界面不会用演示数据冒充真实状态。检查后端主机 `ceph -s` 是否可执行、keyring 权限是否足够，以及 `GET /api/probe` 的能力探测结果；同步成功后顶栏会自动变成 `LIVE · <集群名>`。

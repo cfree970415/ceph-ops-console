@@ -98,7 +98,7 @@ flowchart LR
 
 ## 快速开始
 
-源码：**https://github.com/cfree970415/ceph-ops-console**。**两种形态二选一，选一个按下面的步骤从头做到尾即可**（服务默认端口 8780）。
+源码仓库：[cfree970415/ceph-ops-console](https://github.com/cfree970415/ceph-ops-console)。**两种形态二选一，选一个按下面的步骤从头做到尾即可**（服务默认端口 8780）。
 
 - 【Ceph 节点】—— Ceph 管理节点（示例 `192.168.27.134`），有 `ceph` CLI，是真正下发命令的机器。
 - 【Web 服务器】—— 仅形态 B 需要的另一台 Linux，只放静态页面。

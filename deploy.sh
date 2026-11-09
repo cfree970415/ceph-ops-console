@@ -87,13 +87,14 @@ Usage:  sudo bash deploy.sh [options]
 Examples:
   # Preview only (no changes):
   bash deploy.sh --local --host 192.168.27.134 --port 8780
-  # Install with a read-only keyring (recommended first step):
-  sudo bash deploy.sh --local --host 192.168.27.134 --keyring readonly --install
-  # Enable real OSD operations after the DRY-RUN observation period:
-  sudo bash deploy.sh --local --host 192.168.27.134 --keyring full --allow-write --install
+  # One-click install on the Ceph admin node (real OSD ops enabled):
+  sudo bash deploy.sh --local --host 192.168.27.134 --allow-write --install
   # Split deployment: UI on a separate web server, backend on the Ceph node:
   sudo bash deploy.sh --local --mode frontend --dir /var/www/ceph-console \
     --backend-url http://192.168.27.134:8780 --install
+  # Uninstall (add --purge to also remove config, keyring and logs):
+  sudo bash deploy.sh --uninstall
+  sudo bash deploy.sh --uninstall --purge
 EOF
 }
 

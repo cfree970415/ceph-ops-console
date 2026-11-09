@@ -27,6 +27,7 @@
 - [配置与文件位置](#配置与文件位置)
 - [后端 API](#后端-api)
 - [部署参数速查](#部署参数速查)
+- [卸载](#卸载)
 - [常用运维](#常用运维)
 - [常见问题](#常见问题)
 - [目录结构](#目录结构)
@@ -168,6 +169,7 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 - **安全开关**：安装命令里的 `--allow-write` 让一键踢盘 / 换盘真实下发；去掉它则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。
 - **内网访问不了 GitHub**：在能上网的机器 `git clone` 后 `scp -r ceph-ops-console/ root@<host>:~/`（或下载仓库 zip 解压），把命令里的 `~/ceph-ops-console` 换成实际目录即可。仓库内 7 个运行文件就是全部依赖，无需编译或联网安装。
+- **不想用了**：卸载见 [卸载](#卸载)，一条命令停服务并删安装目录，可选 `--purge` 连配置、keyring、日志一起清理。
 
 ---
 
@@ -325,15 +327,64 @@ curl -H "X-Console-Token: <token>" http://192.168.27.134:8780/api/probe
 | `--no-auth` | 关闭 | 禁用登录（不推荐） |
 | `--no-firewall` / `--no-service` | 关闭 | 跳过防火墙 / 服务注册 |
 | `--install-deps` | 关闭 | 尝试安装 python3 / ceph-common |
-| `--uninstall` / `--purge` | — | 卸载 / 连同配置、keyring、日志一起删除 |
+| `--uninstall` / `--purge` | — | 卸载 / 连同配置、keyring、日志一起删除，详见 [卸载](#卸载) |
 
 完整帮助：`bash deploy.sh --help`
 
 ---
 
+## 卸载
+
+> 卸载只清理本程序装在这台机器上的东西：**不动 Ceph 集群数据、不改 `ceph.conf` 与 mgr 模块、不影响原生 Ceph Dashboard**；`~/ceph-ops-console` 源码仓库也会保留，随时可重装。
+> 必须加 `sudo` —— 脚本卸载时会静默忽略权限不足导致的失败，不用 sudo 看似执行成功、实际没删干净。
+
+### 形态 A ·【Ceph 节点】一台机器
+
+```bash
+# 在【Ceph 节点】执行：保留配置卸载（用户库、token、审计日志留着，便于重装）
+cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall
+
+# 在【Ceph 节点】执行：彻底卸载（连配置、keyring、日志一起删）
+cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall --purge
+```
+
+### 形态 B · 两台机器各卸一次
+
+```bash
+# 在【Ceph 节点】执行（后端服务）
+cd ~/ceph-ops-console && sudo bash deploy.sh --mode backend --uninstall --purge
+
+# 在【Web 服务器】执行（前端静态文件）
+cd ~/ceph-ops-console && sudo bash deploy.sh --mode frontend --uninstall --no-firewall
+```
+
+> 前端卸载带 `--mode frontend` 后脚本会自动定位到 `/var/www/ceph-console`；若安装时自定义过 `--dir`，**卸载必须带同样的 `--dir`**。同理，安装时改过 `--port` 就要带同样的 `--port`，否则防火墙放行规则删不掉。前端安装本就不建服务、不改防火墙，故补 `--no-firewall` 避免误删同名规则。
+
+### 卸载会删什么
+
+| 项目 | `--uninstall` | `--uninstall --purge` |
+| --- | --- | --- |
+| 停止并禁用 `ceph-console` 服务、删除 systemd unit / init.d 脚本 | 删除 | 删除 |
+| 安装目录（形态 A / 后端为 `/opt/ceph-console`，前端为 `/var/www/ceph-console`） | 删除 | 删除 |
+| 防火墙 `8780/tcp` 放行规则 | 删除 | 删除 |
+| `/etc/ceph-console/`（`config.json`、`users.json`、`env`） | 保留 | 删除 |
+| `/var/log/ceph-console/`（含 `audit.jsonl` 审计） | 保留 | 删除 |
+| `/etc/ceph/ceph.client.ceph-console.keyring` 文件 | 保留 | 删除 |
+
+### 卸载不会删的（需要手动处理）
+
+- **Ceph 集群里的 `client.ceph-console` 认证账号**：脚本只删本机 keyring 文件，不执行 `ceph auth del`。确认永不再用、也不打算重装时，在【Ceph 节点】执行 `ceph auth del client.ceph-console`；提前删除反而能避免重装时 caps 不匹配。
+- **形态 B 自己配的 nginx / Apache 站点配置**：脚本只删静态文件目录，虚拟主机配置需手动移除。
+- **`~/ceph-ops-console` 源码仓库**：保留，供重装或升级使用。
+- **Ceph 集群本身**：OSD、存储池、`ceph.conf`、mgr 模块、原生 Dashboard 均不受影响。
+
+卸载后校验：`systemctl status ceph-console` 应提示找不到服务，`ls /opt/ceph-console` 应不存在。
+
+---
+
 ## 常用运维
 
-> 以下命令均在 **【Ceph 节点】** 执行。其中 `curl` 也可从任意能访问 8780 的【本地终端】发起，把 `127.0.0.1` 换成后端 IP 即可。
+> 以下命令均在 **【Ceph 节点】** 执行。其中 `curl` 也可从任意能访问 8780 的【本地终端】发起，把 `127.0.0.1` 换成后端 IP 即可。卸载请见 [卸载](#卸载)。
 
 ```bash
 systemctl status ceph-console          # 服务状态
@@ -341,9 +392,6 @@ systemctl restart ceph-console        # 重启
 journalctl -u ceph-console -f         # 实时日志
 tail -f /var/log/ceph-console/audit.jsonl   # 审计
 curl -H "X-Console-Token: <token>" http://127.0.0.1:8780/api/state
-
-cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall            # 卸载（保留配置）
-cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall --purge    # 彻底卸载
 ```
 
 ---

@@ -93,6 +93,21 @@ function doLogout(){
  state.token='';state.quick=null;state.profile=null;state.isolation=null;
  state.auth=authReset();render();renderAuth();toast('已退出登录','ok');
 }
+/* ---------- change the signed-in account's password ---------- */
+function changePassword(){
+ var $=function(id){return document.getElementById(id);},msg=$('pw-msg');
+ var show=function(text,bad){if(msg)msg.innerHTML='<span class="'+(bad?'td':'t')+'">'+esc(text)+'</span>';};
+ if(state.mode!=='live'||!state.auth.authenticated){show('请先连接后端并登录',true);return;}
+ var old=$('pw-old')?$('pw-old').value:'',nw=$('pw-new')?$('pw-new').value:'',nw2=$('pw-new2')?$('pw-new2').value:'';
+ if(!old){show('请输入当前密码',true);return;}
+ if(nw.length<8){show('新密码至少 8 位',true);return;}
+ if(nw!==nw2){show('两次输入的新密码不一致',true);return;}
+ show('正在修改…',false);
+ apiFetch('POST','/api/password',{old_password:old,new_password:nw,confirm_password:nw2}).then(function(r){
+  ['pw-old','pw-new','pw-new2'].forEach(function(id){var el=$(id);if(el)el.value='';});
+  show(r.message||'密码已更新',false);toast('密码修改成功','ok');
+ }).catch(function(e){show(e.message||'修改失败，请稍后重试',true);});
+}
 function enterLive(){
  state.mode='live';state.auth=authReset();state.auth.required=true;
  render();renderAuth();toast('请填写后端地址并登录','w');
@@ -166,6 +181,7 @@ renderTop=function(){
  if(state.mode==='demo')h='<button class="btn sm" data-act="show-login">'+ic('link',13)+' 连接后端</button>'+h;
  else if(state.auth.authenticated)h='<span class="pill '+(state.auth.allowWrite?'ok':'warn')+'">'+ic('shield',13)+' '+
    esc(state.auth.user)+' · '+(state.auth.role==='admin'?'管理员':'只读')+(state.auth.allowWrite?'':' · DRY-RUN')+'</span>'+
+   '<button class="ib" data-act="nav" data-view="settings" title="系统设置 · 修改密码">'+ic('settings',15)+'</button>'+
    '<button class="ib" data-act="logout" title="退出登录">'+ic('lock')+'</button>'+h;
  bar.innerHTML+=h;
 };
@@ -391,6 +407,7 @@ onAct=function(act,el){
  if(act.indexOf('auth-')===0)return authAction(act,el);
  if(act.indexOf('q-')===0)return quickAction(act,el);
  if(act==='logout')return doLogout();
+ if(act==='change-password')return changePassword();
  if(act==='show-login')return enterLive();
  if(act==='overlay'){
   if(state.quick&&(state.quick.phase==='running'||state.quick.phase==='paused')){

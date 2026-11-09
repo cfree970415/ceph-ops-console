@@ -187,6 +187,38 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 > `--no-auth` 可关闭登录，但**不推荐**：任何能访问该端口的人都能读取集群数据。
 
+### 修改 admin 密码
+
+**页面修改（日常用这个）**：登录 → 顶栏齿轮图标或左侧「系统设置」→「账号与密码」卡片 → 填当前密码、新密码、确认新密码 → 点「修改密码」。支持所有本地账号（含 `viewer`），改的是自己当前登录的账号。
+
+| 规则 | 说明 |
+| --- | --- |
+| 校验 | 必须提供正确的当前密码；新密码至少 8 位、最多 128 位、不能与当前密码相同、不能带首尾空白 |
+| 限速 | 当前密码连续输错同样计入登录限速（300 秒 5 次），防暴力猜解 |
+| 存储 | 原子写入 `users.json`（`0600`），只存 PBKDF2-SHA256 哈希；明文不落盘、不进日志、不出现在接口返回里 |
+| 会话 | 改成功后**同一账号的其他登录会话立即失效**，当前会话保持有效；审计写一条 `PASSWORD_CHANGE` |
+| 权限 | 必须是用账号密码登录的会话；仅持 `X-Console-Token` 的服务令牌不能改密 |
+
+**忘记密码 / 账号被锁（无需登录、无需重启服务）**：在【Ceph 节点】执行，脚本会用不回显方式提示输入两次新密码：
+
+```bash
+# 在【Ceph 节点】执行
+sudo python3 ~/ceph-ops-console/ceph-console.py \
+  --set-password admin --users-file /etc/ceph-console/users.json
+```
+
+脚本化场景可用环境变量传入（注意明文会留在 shell 历史里，执行后请清理）：
+
+```bash
+read -rs -p "New admin password: " PW; echo
+sudo env CEPH_CONSOLE_NEW_PASSWORD="$PW" python3 ~/ceph-ops-console/ceph-console.py \
+  --set-password admin --users-file /etc/ceph-console/users.json
+unset PW
+```
+
+> 后端**每次登录都会重新读取** `users.json`，所以改完无需重启服务。若希望所有已登录会话立即失效，`systemctl restart ceph-console` 即可（会话只存内存）。
+> 重跑 `deploy.sh --install` **不会覆盖已修改的密码**：未带 `--password` 时保留现有用户库（包括新增的其他账号），只有显式传 `--password` 才重置。
+
 ---
 
 ## 一键踢盘 / 一键换盘
@@ -283,6 +315,7 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 | GET | `/api/session` | 当前会话、角色、写能力 |
 | POST | `/api/login` | 账号密码登录 |
 | POST | `/api/logout` | 登出 |
+| POST | `/api/password` | 修改当前登录账号密码：需会话 + `old_password` + `new_password` + `confirm_password` |
 | GET | `/api/probe` | Ceph 版本 / 编排器 / 能力探测结果 |
 | GET | `/api/state` | 集群实时状态（20 秒缓存） |
 | GET | `/api/plan` | 当前版本可用能力 |
@@ -320,7 +353,7 @@ curl -H "X-Console-Token: <token>" http://192.168.27.134:8780/api/probe
 | `--allow-write` | 关闭 | **允许真实 OSD 操作（危险）** |
 | `--backend` | `cli` | `cli` 完整 / `rest` 只读代理 |
 | `--rest-url` / `--rest-token` | — | mgr dashboard REST 通道 |
-| `--user` / `--password` | `admin` / 自动生成 | 登录账号；密码推荐用 `CEPH_CONSOLE_PASSWORD` |
+| `--user` / `--password` | `admin` / 自动生成 | 登录账号；密码推荐用 `CEPH_CONSOLE_PASSWORD`。**重装时不带 `--password` 会保留现有密码**，见 [修改 admin 密码](#修改-admin-密码) |
 | `--backend-url` | — | `frontend` 模式下写入的后端 API 地址 |
 | `--cors-origin` | `*` | 允许的 UI 来源，逗号分隔 |
 | `--token` | 自动生成 | 服务 API token |
@@ -413,8 +446,15 @@ REST 通道是 mgr dashboard 的只读代理；OSD 写操作需要 `cli` 后端�
 **Q：端口被占用 / 安装被拒绝？**
 部署脚本会在安装前检查常用 dashboard 端口，换一个 `--port` 即可，不会去改动原生 Dashboard。
 
-**Q：忘记初始密码？**
-用 `CEPH_CONSOLE_PASSWORD=新密码 sudo bash deploy.sh --local ... --install` 重装以重建用户库，或直接重新生成 `users.json`。
+**Q：忘记 admin 初始密码 / 想修改密码？**
+页面修改见 [修改 admin 密码](#修改-admin-密码)（系统设置 → 账号与密码）。忘记密码时在【Ceph 节点】离线重置，无需重装、无需停服务：
+
+```bash
+sudo python3 ~/ceph-ops-console/ceph-console.py \
+  --set-password admin --users-file /etc/ceph-console/users.json
+```
+
+注意：**重跑 `deploy.sh --install` 且不带 `--password` 现在会保留现有密码**，别再指望重装能重置；要重置请显式带 `--password`。
 
 ---
 

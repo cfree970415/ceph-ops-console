@@ -47,6 +47,8 @@ SESSION_TTL = 8 * 3600
 LOGIN_WINDOW = 300
 LOGIN_MAX_FAIL = 5
 PBKDF2_ROUNDS = 120000
+PASSWORD_MIN_LEN = 8
+PASSWORD_MAX_LEN = 128
 
 CODENAMES = {12: "Luminous", 13: "Mimic", 14: "Nautilus", 15: "Octopus",
              16: "Pacific", 17: "Quincy", 18: "Reef", 19: "Squid", 20: "Tentacle"}
@@ -122,6 +124,42 @@ def load_users(path):
         return users if isinstance(users, dict) else {}
     except Exception:
         return {}
+
+
+def save_users(path, users):
+    """Atomically write the user store; never leave a world-readable file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, 0o700)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"users": users}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+    return True
+
+
+def password_error(new, confirm=None):
+    """Reject weak / malformed new passwords. Never echoes the password."""
+    if not isinstance(new, str) or len(new) < PASSWORD_MIN_LEN:
+        return "新密码至少 %d 位" % PASSWORD_MIN_LEN
+    if len(new) > PASSWORD_MAX_LEN:
+        return "新密码不能超过 %d 位" % PASSWORD_MAX_LEN
+    if not new.strip() or new.strip() != new:
+        return "新密码不能为空、也不能带首尾空白"
+    if confirm is not None and new != confirm:
+        return "两次输入的新密码不一致"
+    return ""
 
 
 def login_allowed(remote):
@@ -930,6 +968,56 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True}, 200,
                           {"Set-Cookie": "cc_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
 
+    def api_password(self, body):
+        """Change the password of the signed-in account.
+
+        Requires a real login session (a raw service token cannot change a
+        password), the current password, and a valid new password. Other live
+        sessions of the same account are invalidated so a stolen session cannot
+        outlive the change. Passwords are never logged or included in the reply.
+        """
+        s = self._session()
+        if s is None:
+            return self._json({"error": "请用账号密码登录后修改密码（服务令牌不支持改密）"}, 403)
+        name = s["user"]
+        users = load_users(self.cfg.users_file)
+        rec = users.get(name)
+        if not isinstance(rec, dict) or "hash" not in rec:
+            return self._json({"error": "当前账号不在本地用户库中，无法修改密码"}, 403)
+        remote = self._client()
+        if not login_allowed(remote):
+            return self._json({"error": "尝试次数过多，请几分钟后再试"}, 429)
+        old = str(body.get("old_password", "") or "")
+        new = str(body.get("new_password", "") or "")
+        if not verify_password(old, rec):
+            note_login_fail(remote)
+            audit("PASSWORD_CHANGE", name, "-", "REJECTED", "bad current password", remote, name)
+            return self._json({"error": "当前密码不正确"}, 403)
+        confirm = body.get("confirm_password", None)
+        err = password_error(new, None if confirm is None else str(confirm))
+        if err:
+            return self._json({"error": err}, 400)
+        if verify_password(new, rec):
+            return self._json({"error": "新密码不能与当前密码相同"}, 400)
+        note_login_ok(remote)
+        fresh = hash_password(new)
+        fresh["role"] = rec.get("role", "viewer")
+        users[name] = fresh
+        try:
+            save_users(self.cfg.users_file, users)
+        except Exception as e:
+            return self._json({"error": "写入用户库失败：%s" % e}, 500)
+        sid = self._session_token()
+        dropped = 0
+        for tok, item in list(SESSIONS.items()):
+            if item.get("user") == name and tok != sid:
+                SESSIONS.pop(tok, None)
+                dropped += 1
+        audit("PASSWORD_CHANGE", name, "-", "OK",
+              "password updated; %d other session(s) invalidated" % dropped, remote, name)
+        return self._json({"ok": True, "user": name,
+                           "message": "密码已更新，其他登录会话已失效"})
+
     def api_session_info(self):
         s = self._session()
         if not s:
@@ -1065,6 +1153,8 @@ class Handler(BaseHTTPRequestHandler):
                                            if manual else None)})
 
     def api_post(self, path, body):
+        if path == "/api/password":
+            return self.api_password(body)
         if path == "/api/plan":
             intent = str(body.get("intent", "replace"))
             oid = body.get("osd_id")
@@ -1171,12 +1261,62 @@ def parse_args(argv):
     p.add_argument("--cors-origin", default="",
                    help="allowed UI origin(s), comma separated; default * for intranet")
     p.add_argument("--print-profile", action="store_true", help="print probe result and exit")
+    p.add_argument("--set-password", default="", metavar="USER",
+                   help="offline: reset USER's password and exit (reads CEPH_CONSOLE_NEW_PASSWORD, "
+                        "or prompts twice); no service restart needed")
     return p.parse_args(argv)
+
+
+def cli_set_password(user, users_file):
+    """Offline reset for a forgotten password, without touching the cluster.
+
+    The new password may be supplied via CEPH_CONSOLE_NEW_PASSWORD for scripted
+    use; otherwise it is read twice from the terminal with echo disabled. The
+    backend loads users.json on every login, so no restart is required.
+    """
+    import getpass
+    user = (user or "").strip()
+    if not user:
+        print("a username is required", file=sys.stderr)
+        return 2
+    new = os.environ.get("CEPH_CONSOLE_NEW_PASSWORD", "")
+    if not new:
+        try:
+            new = getpass.getpass("New password for %s: " % user)
+            again = getpass.getpass("Repeat new password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("aborted", file=sys.stderr)
+            return 2
+        if new != again:
+            print("passwords do not match", file=sys.stderr)
+            return 2
+    err = password_error(new)
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    users = load_users(users_file)
+    old = users.get(user) or {}
+    if isinstance(old, dict) and "hash" in old and verify_password(new, old):
+        print("new password must differ from the current one", file=sys.stderr)
+        return 2
+    fresh = hash_password(new)
+    fresh["role"] = old.get("role", "admin") if isinstance(old, dict) else "admin"
+    users[user] = fresh
+    try:
+        save_users(users_file, users)
+    except Exception as e:
+        print("failed to write %s: %s" % (users_file, e), file=sys.stderr)
+        return 1
+    print("password for %s updated in %s (PBKDF2 hash, 0600)" % (user, users_file))
+    print("no restart needed; existing browser sessions stay valid until they expire")
+    return 0
 
 
 def main(argv):
     args = parse_args(argv)
     cfg = Config(args)
+    if args.set_password:
+        return cli_set_password(args.set_password, cfg.users_file)
     probe = Probe(cfg)
     if args.print_profile:
         print(json.dumps(probe.as_dict(), ensure_ascii=False, indent=2))

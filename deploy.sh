@@ -74,6 +74,7 @@ Usage:  sudo bash deploy.sh [options]
   --user NAME         Login username (default: admin)
   --password STR      Login password; env CEPH_CONSOLE_PASSWORD is safer.
                       Auto-generated when omitted and printed once at the end.
+                      Re-running --install without it keeps the current password.
   --backend-url URL   Backend API URL for --mode frontend, e.g. http://IP:8780
   --cors-origin LIST  Allowed UI origins (default *; comma separated to restrict)
   --no-auth           Disable login (NOT recommended)
@@ -350,30 +351,42 @@ chmod 0755 "$DIR/ceph-console.py"
 ok "files installed to $DIR"
 
 # ---- login credentials (PBKDF2 hash only, never plaintext on disk) ----
+# Re-running --install must NOT wipe a password the operator changed in the UI.
+# Only an explicit --password (or a brand new install) rewrites the store.
 GENERATED_PASS=0
+KEEP_USERS=0
 if [ -z "$ADMIN_PASS" ]; then
-  if command -v openssl >/dev/null 2>&1; then
-    ADMIN_PASS="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)"
-  elif [ -r /dev/urandom ]; then
-    ADMIN_PASS="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16)"
+  if [ -f "$USERS_FILE" ] && grep -q "\"$ADMIN_USER\"" "$USERS_FILE" 2>/dev/null; then
+    KEEP_USERS=1
   else
-    ADMIN_PASS="cc$(date +%s | tail -c 9)"
+    if command -v openssl >/dev/null 2>&1; then
+      ADMIN_PASS="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)"
+    elif [ -r /dev/urandom ]; then
+      ADMIN_PASS="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16)"
+    else
+      ADMIN_PASS="cc$(date +%s | tail -c 9)"
+    fi
+    GENERATED_PASS=1
   fi
-  GENERATED_PASS=1
 fi
 if [ "$NO_AUTH" -eq 1 ]; then
   warn "--no-auth: login is DISABLED; anyone reaching port $PORT can read cluster data"
+elif [ "$KEEP_USERS" -eq 1 ]; then
+  chmod 0600 "$USERS_FILE"
+  ok "existing user store kept: $ADMIN_USER password unchanged ($USERS_FILE)"
 else
   "$PY" - "$DIR/ceph-console.py" "$USERS_FILE" "$ADMIN_USER" "$ADMIN_PASS" <<'PYEOF'
-import importlib.util, json, os, sys
+import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-rec = mod.hash_password(sys.argv[4])
-doc = {"users": {sys.argv[3]: dict(rec, role="admin")}}
-with open(sys.argv[2], "w") as f:
-    json.dump(doc, f, ensure_ascii=False, indent=2)
-os.chmod(sys.argv[2], 0o600)
+try:
+    with open(sys.argv[2]) as f:
+        users = json.load(f).get("users", {}) or {}
+except Exception:
+    users = {}
+users[sys.argv[3]] = dict(mod.hash_password(sys.argv[4]), role="admin")
+mod.save_users(sys.argv[2], users)
 PYEOF
   chmod 0600 "$USERS_FILE"
   ok "login user store created ($USERS_FILE, mode 0600, PBKDF2-SHA256)"
@@ -550,14 +563,22 @@ say ""
 say "${C_B}==================== DEPLOYED ====================${C_0}"
 say "  Console URL : ${C_OK}http://${HOST}:${PORT}/${C_0}"
 if [ "$NO_AUTH" -eq 0 ]; then
-  say "  Login       : ${C_B}${ADMIN_USER}${C_0} / ${C_B}${ADMIN_PASS}${C_0}"
-  if [ "$GENERATED_PASS" -eq 1 ]; then
-    say "                (auto-generated, shown only once - save it now)"
+  if [ "$KEEP_USERS" -eq 1 ]; then
+    say "  Login       : ${C_B}${ADMIN_USER}${C_0} / (unchanged - existing password kept)"
+    say "                change it in Settings, or pass --password to reset"
+  else
+    say "  Login       : ${C_B}${ADMIN_USER}${C_0} / ${C_B}${ADMIN_PASS}${C_0}"
+    if [ "$GENERATED_PASS" -eq 1 ]; then
+      say "                (auto-generated, shown only once - save it now)"
+    fi
   fi
 else
   say "  Login       : DISABLED (--no-auth) - not recommended"
 fi
 say "  API URL     : http://${HOST}:${PORT}  (use with ?api= when the UI is on another server)"
+if [ "$NO_AUTH" -eq 0 ]; then
+  say "  Password    : Settings page, or: sudo python3 $DIR/ceph-console.py --set-password $ADMIN_USER --users-file $USERS_FILE"
+fi
 say "  API probe   : curl -H \"X-Console-Token: ${TOKEN}\" http://${HOST}:${PORT}/api/probe"
 say "  Mode        : $([ "$ALLOW_WRITE" -eq 1 ] && echo 'REAL EXECUTION' || echo 'DRY-RUN (no cluster changes)')"
 say "  Deploy mode : $MODE"

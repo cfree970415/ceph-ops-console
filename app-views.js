@@ -155,7 +155,15 @@ function vDeploy(){var cm=genCmds(),d=state.deploy,p=liveProfile();
    '<div style="margin-top:14px">'+isolationCard()+'</div>';}
 
 /* ---- settings ---- */
-function vSettings(){var s=state.settings;
+function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='live'&&a.authenticated;
+ var pwdBody=canPw?
+  '<div class="stat-line"><span>当前账号</span><b class="mono">'+esc(a.user)+' · '+(a.role==='admin'?'管理员':'只读')+'</b></div>'+
+  '<div class="fgrp" style="margin-top:10px"><label class="fld">当前密码</label><input class="inp" id="pw-old" type="password" autocomplete="current-password" placeholder="输入当前登录密码"></div>'+
+  '<div class="grid g2" style="gap:10px"><div class="fgrp"><label class="fld">新密码（至少 8 位）</label><input class="inp" id="pw-new" type="password" autocomplete="new-password" placeholder="不能与当前密码相同"></div>'+
+  '<div class="fgrp"><label class="fld">确认新密码</label><input class="inp" id="pw-new2" type="password" autocomplete="new-password" placeholder="再输入一次"></div></div>'+
+  '<div id="pw-msg" class="hint" style="margin-top:8px"></div>'+
+  '<div class="btn-row" style="margin-top:12px"><button class="btn pri" data-act="change-password">'+ic('lock',14)+' 修改密码</button></div>':
+  '<div class="warnbox">'+ic('lock')+'<div>请先连接后端、用账号密码登录后，才能修改 <b class="mono">admin</b> 密码。离线演示模式不涉及真实账号。</div></div>';
  var connInfo='<div class="stat-line"><span>后端地址</span><b class="mono">'+esc(backendBase()||'同源 / 离线演示')+'</b></div>'+
   '<div class="stat-line"><span>登录状态</span><b class="'+(state.auth.authenticated?'t':'tw')+'">'+
    (state.auth.authenticated?esc(state.auth.user)+' · '+(state.auth.role==='admin'?'管理员':'只读'):'未登录 / 演示模式')+'</b></div>'+
@@ -181,4 +189,12 @@ function vSettings(){var s=state.settings;
   card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.0</b></div><div class="stat-line"><span>前端依赖</span><b class="mono t">0（纯原生 HTML/CSS/JS）</b></div>'+
    '<div class="stat-line"><span>后端依赖</span><b class="mono t">0（Python 3.6+ 标准库）</b></div><div class="stat-line"><span>支持 Ceph</span><b class="mono">12.x ~ 19.x</b></div>'+
    '<div class="stat-line"><span>支持 Linux</span><b class="mono">systemd / SysV · 主流发行版</b></div><div class="hr"></div>'+
-   '<div class="note">所有图表为原生 SVG 绘制，无 CDN、无外部字体，可直接放进内网离线环境。页面既可用浏览器直接打开体验 DEMO，也可由后端托管为 LIVE 控制台。</div>')+'</div>';}
+   '<div class="note">所有图表为原生 SVG 绘制，无 CDN、无外部字体，可直接放进内网离线环境。页面既可用浏览器直接打开体验 DEMO，也可由后端托管为 LIVE 控制台。</div>')+'</div>'+
+  '<div class="grid g2" style="margin-top:14px">'+
+  card('账号与密码 · 修改登录密码',pwdBody,'<span class="tag info">PBKDF2</span>')+
+  card('密码策略与找回','<div class="stat-line"><span>存储方式</span><b class="mono t">PBKDF2-SHA256 · 120000 轮 + 随机 salt</b></div>'+
+   '<div class="stat-line"><span>明文 / 日志</span><b class="mono t">不保存、不记录</b></div>'+
+   '<div class="stat-line"><span>修改后</span><b class="mono">同账号其他会话立即失效</b></div><div class="hr"></div>'+
+   '<div class="note">忘记密码或账号被锁时，可在【Ceph 节点】离线重置，无需登录、无需重启服务（不回显、输入两次）：</div>'+
+   cmdBox('pw-cli','离线重置命令',"sudo python3 ~/ceph-ops-console/ceph-console.py --set-password admin --users-file /etc/ceph-console/users.json"))+
+  '</div>';}

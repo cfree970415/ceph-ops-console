@@ -74,6 +74,7 @@ function syncState(){
  if(state.mode!=='live')return Promise.resolve();
  return API.call('GET','/api/state').then(function(r){
   var d=r.data||{},c=d.cluster||{};
+  if(state.link)state.link.stateOk=!c.error;
   ['health','version','codename','deploy'].forEach(function(k){if(c[k])state.cluster[k]=c[k];});
   ['total','used','osds','osdsUp','osdsIn','mons','monInQuorum','pgs','pools','iops','throughput'].forEach(function(k){
    if(typeof c[k]==='number'&&c[k]>0)state.cluster[k]=c[k];});
@@ -89,7 +90,7 @@ function syncState(){
   if(d.pools&&d.pools.length)state.pools=d.pools;
   if(d.hosts&&d.hosts.length)state.hosts=d.hosts;
   state.lastRefresh=Date.now();if(!state.wizard)render();
- }).catch(function(e){toast('同步集群状态失败：'+e.message,'e');});}
+ }).catch(function(e){if(state.link)state.link.stateOk=false;toast('同步集群状态失败：'+e.message,'e');});}
 function startWizard(id,intent){var n=id==null?7:Number(id),o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[7];
  state.wizard={step:1,osdId:o.id,host:o.host,dev:o.dev,intent:intent||'replace',phrase:'',confirmed:false,checks:null,plan:null,
   logs:[],progress:0,running:false,done:false,aborted:false,newOsdId:null,remote:null};
@@ -235,10 +236,13 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
   case 'mode':
    if(v==='live'){enterLive();}
    else if(v==='demo'){
-    /* Keep the session id in sessionStorage: enterLive() can resume it
-       silently when the user switches back to LIVE. */
+    /* DEMO is an explicit choice; remember it across refreshes. Keep the
+       session id in sessionStorage so enterLive() can resume it silently
+       when the user switches back to LIVE. */
+    try{sessionStorage.setItem('cc_demo','1');}catch(e){}
     state.mode='demo';state.auth=authReset();state.auth.required=false;
-    state.settings.allowWrite=false;render();renderAuth();toast('已切换到离线演示','w');}
+    state.settings.allowWrite=false;if(state.link)state.link.stateOk=false;
+    render();renderAuth();toast('已切换到离线演示','w');}
    break;
   case 'wizard':startWizard(id,el.getAttribute('data-intent')||'replace');break;
   case 'w-intent':if(w){w.intent=v;renderWizard();}break;

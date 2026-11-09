@@ -5,7 +5,7 @@
 /* ---------- extended state ---------- */
 state.auth={required:false,authenticated:false,user:'',role:'viewer',allowWrite:false,
             readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false};
-state.link={apiBase:''};
+state.link={apiBase:'',stateOk:false};
 state.quick=null;
 state.isolation=null;
 
@@ -66,6 +66,9 @@ function authPayload(){
  var u=document.getElementById('auth-user'),p=document.getElementById('auth-pass');
  return {username:u?u.value.trim():'',password:p?p.value:''};}
 function applySession(r){
+ /* Logging in as admin (or any real account) always means the live console.
+    The demo shell is only reachable by explicitly choosing DEMO. */
+ state.mode='live';try{sessionStorage.removeItem('cc_demo');}catch(e){}
  state.auth.authenticated=true;state.auth.user=r.user||'admin';state.auth.role=r.role||'viewer';
  state.auth.allowWrite=!!r.allow_write&&state.auth.role==='admin';
  state.auth.readOnly=!!r.read_only;state.auth.backend=r.backend||'cli';
@@ -89,8 +92,8 @@ function doLogin(){
 }
 function doLogout(){
  apiFetch('POST','/api/logout',{}).catch(function(){});
- try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');}catch(e){}
- state.token='';state.quick=null;state.profile=null;state.isolation=null;
+ try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');sessionStorage.removeItem('cc_demo');}catch(e){}
+ state.token='';state.quick=null;state.profile=null;state.isolation=null;state.link.stateOk=false;
  state.auth=authReset();render();renderAuth();toast('已退出登录','ok');
 }
 /* ---------- change the signed-in account's password ---------- */
@@ -109,6 +112,7 @@ function changePassword(){
  }).catch(function(e){show(e.message||'修改失败，请稍后重试',true);});
 }
 function enterLive(){
+ try{sessionStorage.removeItem('cc_demo');}catch(e){}
  /* Clicking the LIVE button while already live and signed in must be a no-op.
     Resetting state.auth here used to log the user out and re-open the login
     screen (Settings -> run mode -> LIVE 对接集群). */
@@ -141,14 +145,19 @@ function liveBoot(){
  if(window.__CC_LIVE_BOOTED__)return;window.__CC_LIVE_BOOTED__=true;
  var b=window.__CEPH_BOOT__||null,q=new URLSearchParams(location.search),saved='';
  try{saved=localStorage.getItem('cc_api_base')||'';}catch(e){}
- var apiParam=q.get('api');
+ var apiParam=q.get('api'),wantDemo=q.get('demo')==='1';
  state.apiBase=apiParam?apiParam.replace(/\/+$/,''):(b?'':saved);
  state.link.apiBase=state.apiBase;
  state.auth.required=!!(b&&b.authRequired)||!!state.apiBase;
- state.mode=(b||state.apiBase)?'live':'demo';
+ var sid='';try{sid=sessionStorage.getItem('cc_session')||'';}catch(e){}
+ var choseDemo=false;try{choseDemo=sessionStorage.getItem('cc_demo')==='1';}catch(e){}
+ var httpPage=/^https?:$/.test(location.protocol||'');
+ /* DEMO is now an explicit user choice (or a local file:// preview). Any page
+    served over HTTP, bootstrapped by the backend, pointed at a backend, or
+    holding a saved session starts as the real console and asks for login. */
+ state.mode=(choseDemo||wantDemo)?'demo':((b||state.apiBase||sid||httpPage)?'live':'demo');
  render();renderAuth();
  if(state.mode==='live'){
-  var sid='';try{sid=sessionStorage.getItem('cc_session')||'';}catch(e){}
   if(sid)state.auth.session=sid;
   apiFetch('GET','/api/session').then(function(r){
    if(r.authenticated){applySession(r);signedIn();}
@@ -413,9 +422,12 @@ function authAction(act,el){
   case 'auth-tab':state.auth.tab=el.getAttribute('data-value');state.auth.error='';renderAuth();return;
   case 'auth-login':doLogin();return;
   case 'auth-demo':state.mode='demo';state.auth=authReset();state.auth.required=false;
+   /* DEMO is an explicit choice: remember it so a page refresh does not
+      silently drop the user back into the live login screen. */
+   try{sessionStorage.setItem('cc_demo','1');}catch(e){}
    /* Keep apiBase: a cross-server frontend must be able to switch back to
       LIVE without retyping the backend address. */
-   state.settings.allowWrite=false;render();renderAuth();
+   state.settings.allowWrite=false;state.link.stateOk=false;render();renderAuth();
    toast('已进入离线演示模式，数据不来自集群','w');return;
   default:return;
  }

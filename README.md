@@ -9,8 +9,7 @@
 - 支持「管理节点一体化启动」和「前端与后端分离部署」两种形态；
 - 后端仅依赖 Python 3.6+ 标准库，前端零 CDN、零构建、可离线运行。
 
-> ⚠️ 所有写操作默认 **DRY-RUN**：只生成命令并写入审计，不会下发到集群。
-> 真实执行必须显式开启，详见 [一键踢盘 / 一键换盘](#一键踢盘--一键换盘)。
+> ⚠️ 快速开始的安装命令带 `--allow-write`，装完即可**真实下发**踢盘 / 换盘命令；去掉该参数则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。执行闸门与风险控制见 [一键踢盘 / 一键换盘](#一键踢盘--一键换盘)。
 
 ---
 
@@ -99,131 +98,76 @@ flowchart LR
 
 ## 快速开始
 
-源码已托管在 **https://github.com/cfree970415/ceph-ops-console**，各台 Linux 服务器自行 `git clone` 即可，无需从本机传文件。先认清 4 类机器：**所有 `deploy.sh` 命令都在 Linux 服务器上执行；本地工作机不部署任何服务。**
+源码：**https://github.com/cfree970415/ceph-ops-console**。**两种形态二选一，选一个按下面的步骤从头做到尾即可**（服务默认端口 8780）。
 
-| 标签 | 机器 | 作用 | 何时需要 |
-| --- | --- | --- | --- |
-| 【本地终端】 | 你的工作机（Windows 亦可） | 离线打开 DEMO 评审界面；内网无法访问 GitHub 时用来下载并拷贝源码 | 可选 |
-| 【Ceph 节点】 | Ceph 管理节点 / 后端服务器，示例 `192.168.27.134`；Linux，具备 `ceph` CLI 与 admin keyring，能跑通 `ceph -s` | 执行 `git clone` 获取源码、运行 `ceph-console.py`、下发 ceph 命令、写审计与日志 | 始终 |
-| 【Web 服务器】 | 另一台 Linux，仅形态 B 使用 | 同样 `git clone` 源码，但只托管静态页面，不装 Python 后端、不碰集群 | 仅形态 B |
-| 【浏览器】 | 任意能访问上述服务器的电脑 | 登录、查看告警、点击一键踢盘 / 换盘 | 始终 |
+- 【Ceph 节点】—— Ceph 管理节点（示例 `192.168.27.134`），有 `ceph` CLI，是真正下发命令的机器。
+- 【Web 服务器】—— 仅形态 B 需要的另一台 Linux，只放静态页面。
+- 【浏览器】—— 任意能访问上述服务器的电脑。
 
-> 下文统一假定源码 clone 在 `~/ceph-ops-console`；每条命令都写成 `cd ~/ceph-ops-console && ...`，可单独复制执行。
+> 每个命令块都标了执行机器；源码统一 clone 到 `~/ceph-ops-console`，整段复制即可。
 
-**步骤 × 执行位置速查**
+### 形态 A：管理节点一体化（推荐）
 
-| 步骤 | 在哪敲命令 | 作用落到哪台机器 |
-| --- | --- | --- |
-| 0 获取源码 | 【Ceph 节点】执行 `git clone`；形态 B 还要在【Web 服务器】再 clone 一次 | 源码分别落到两台机器的 `~/ceph-ops-console/` |
-| 1 预览体检 | 【Ceph 节点】 | 只读，不改任何系统 |
-| 2 形态 A 安装 | 【Ceph 节点】 | 前端 + 后端 + 服务都在这台 |
-| 3.1 形态 B 后端 | 【Ceph 节点】 | 只装 API 服务 |
-| 3.2 形态 B 前端 | 【Web 服务器】 | 只放静态页面 |
-| 3.3 访问页面 | 【浏览器】 | 形态 A 访问【Ceph 节点】；形态 B 访问【Web 服务器】 |
-| 4 开启真实执行 | 后端服务所在的【Ceph 节点】 | 命令最终由这台机器下发到集群 |
-| 5 离线 DEMO | 【本地终端】 | 不连接任何服务器 |
+页面、API 后端、服务全部跑在【Ceph 节点】一台机器上。
 
-> 关键：**无论从哪台机器点按钮，真正执行 `ceph ...` 的都是【Ceph 节点】上的 `ceph-console.py`**。【浏览器】与【Web 服务器】只负责发 HTTP 请求。
-
-### 0. 获取源码 · 【Ceph 节点】 / 【Web 服务器】
-
-> **执行位置**：源码已在 GitHub，由**目标 Linux 服务器自己 `git clone`**，不再需要本机 `scp` 传文件。形态 A 只需在【Ceph 节点】clone；形态 B 需在【Ceph 节点】和【Web 服务器】各 clone 一次。
-
-**形态 A / 形态 B 的后端 · 【Ceph 节点】**：
+**第 1 步 ·【Ceph 节点】拉取源码并安装**
 
 ```bash
 # 在【Ceph 节点】执行
 cd ~ && git clone https://github.com/cfree970415/ceph-ops-console.git
+
+cd ~/ceph-ops-console && sudo bash deploy.sh --local \
+  --host 192.168.27.134 --allow-write --install
 ```
 
-**形态 B 的前端 · 【Web 服务器】**（另一台机器，同样操作）：
+安装结束时终端会打印访问地址、登录账号、初始密码、API token 与审计路径。**初始密码只显示一次，请立即保存。**
+
+**第 2 步 ·【浏览器】访问**
+
+```
+http://192.168.27.134:8780/
+```
+
+登录后即可查看告警、执行一键踢盘 / 换盘。
+
+### 形态 B：前后端分离
+
+后端在【Ceph 节点】，前端在【Web 服务器】，两台机器都要 clone。
+
+**第 1 步 ·【Ceph 节点】装后端**
 
 ```bash
-# 在【Web 服务器】执行（仅形态 B 需要）
+# 在【Ceph 节点】执行
 cd ~ && git clone https://github.com/cfree970415/ceph-ops-console.git
-```
 
-> **内网离线环境**：若目标服务器访问不了 GitHub，可在【本地终端】`git clone` 后把整个目录拷过去（`scp -r ceph-ops-console/ root@<host>:~/`），或在能上网的机器下载仓库 zip 再解压；后续把 `~/ceph-ops-console` 换成实际目录即可。仓库里的 7 个运行文件就是全部依赖，无需编译、无需联网安装。
-
-### 1. 先预览，再安装 · 【Ceph 节点】
-
-> **执行位置**：【Ceph 节点】（源码已在上一步 clone 到 `~/ceph-ops-console`）。不加 `--install` 时只做体检与预览，**不会改动系统**。
-
-```bash
-# 在【Ceph 节点】执行
-cd ~/ceph-ops-console && bash deploy.sh --local --host 192.168.27.134 --port 8780
-```
-
-### 2. 形态 A：Ceph 管理节点一键启动（推荐先这样验证） · 【Ceph 节点】
-
-> **执行位置**：【Ceph 节点】一台机器搞定，静态页面、API 后端、systemd 服务全在这台。
-
-```bash
-# 在【Ceph 节点】执行：只读 keyring + 默认 DRY-RUN，安全接入现有集群
-cd ~/ceph-ops-console && sudo bash deploy.sh --local --host 192.168.27.134 \
-  --keyring readonly --install
-```
-
-安装结束时，**【Ceph 节点】的终端**会打印访问地址、登录账号、初始密码、API token 与审计路径。初始密码只显示一次，请立即保存。
-
-> **访问位置**：在【浏览器】打开 `http://192.168.27.134:8780/` → 登录 → 概览页显示真实集群状态（页面本身由【Ceph 节点】托管）。
-
-### 3. 形态 B：前后端分离部署 · 【Ceph 节点】 + 【Web 服务器】
-
-> 形态 A 与形态 B **二选一**，不要在同一台机器上重复安装。
-
-**3.1 后端 · 【Ceph 节点】**（只跑 API 服务，必须能访问 Ceph 集群）：
-
-```bash
-# 在【Ceph 节点】执行
 cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode backend \
-  --host 192.168.27.134 --port 8780 --install
+  --host 192.168.27.134 --allow-write --install
 ```
 
-**3.2 前端 · 【Web 服务器】**（另一台机器，只放静态文件）：
+**第 2 步 ·【Web 服务器】装前端**
 
 ```bash
-# 在【Web 服务器】执行（需先按步骤 0 在这台机器上 git clone）
+# 在【Web 服务器】执行
+cd ~ && git clone https://github.com/cfree970415/ceph-ops-console.git
+
 cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode frontend \
   --backend-url http://192.168.27.134:8780 \
   --cors-origin http://<web-server> \
   --dir /var/www/ceph-console --install
 ```
 
-**3.3 访问 · 【浏览器】**：用 URL 参数指定后端（需 URL 编码），也可在登录页直接填写后端地址：
+**第 3 步 ·【浏览器】访问**
 
 ```
 http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 ```
 
-> 【Web 服务器】只返回静态页面，浏览器带着 `?api=` 直接向【Ceph 节点】的 8780 端口发 API 请求，因此 **8780 需对浏览器可达**，且 `--cors-origin` 要放行前端站点。
+> 浏览器需能访问【Ceph 节点】的 8780 端口，`--cors-origin` 要放行前端站点；后端安装输出的初始密码同样只显示一次。
 
-### 4. 开启真实执行（可选，需谨慎） · 【Ceph 节点】
+### 补充
 
-> **执行位置**：`ceph-console.py` 跑在哪台，就在哪台改 —— 形态 A 与形态 B 都是【Ceph 节点】（后端服务器），**【Web 服务器】不用动**。
-
-形态 A：
-
-```bash
-# 在【Ceph 节点】执行
-cd ~/ceph-ops-console && sudo bash deploy.sh --local --host 192.168.27.134 \
-  --keyring full --allow-write --install
-```
-
-形态 B（保持 `--mode backend`，不要在后端节点上重装一份前端）：
-
-```bash
-# 在【Ceph 节点】执行
-cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode backend \
-  --host 192.168.27.134 --port 8780 \
-  --keyring full --allow-write --install
-```
-
-> 也可只改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后重启服务（`systemctl restart ceph-console`）；但若当初用的是 `--keyring readonly`，keyring 只有 `allow r` 权限，必须重跑 `--keyring full` 提权，否则 ceph 会返回权限不足。
-
-### 5. 离线预览 DEMO · 【本地终端】
-
-> **执行位置**：【本地终端】`git clone` 仓库后直接双击 `ceph-dashboard.html`。不连接任何服务器、不需要 Linux，仅供评审界面与流程，数据为本地模拟。
+- **安全开关**：安装命令里的 `--allow-write` 让一键踢盘 / 换盘真实下发；去掉它则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。
+- **内网访问不了 GitHub**：在能上网的机器 `git clone` 后 `scp -r ceph-ops-console/ root@<host>:~/`（或下载仓库 zip 解压），把命令里的 `~/ceph-ops-console` 换成实际目录即可。仓库内 7 个运行文件就是全部依赖，无需编译或联网安装。
 
 ---
 
@@ -268,7 +212,7 @@ cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode backend \
 **四道闸门，缺一不可真正下发命令：**
 
 1. 服务端启动参数 `--allow-write`（由 `deploy.sh --allow-write` 传入）；
-2. keyring 具备写能力（`--keyring full`，非 `readonly` / `--read-only`）；
+2. 专用 keyring 具备写能力（安装默认 `--keyring full`）；
 3. 登录角色为 `admin`，且请求带 `allow_write: true`；
 4. 请求体携带正确的 `confirm_phrase`（格式 `osd.<ID>`）。
 
@@ -301,7 +245,7 @@ cd ~/ceph-ops-console && sudo bash deploy.sh --local --mode backend \
 
 ## 安全设计
 
-- 默认 DRY-RUN + 四重写开关（见上）；
+- 不加 `--allow-write` 时默认 DRY-RUN，加后才真实执行；四重写开关（见上）；
 - 参数强校验：`osd_id` 整数、`/dev/...` 设备路径白名单、主机名白名单；
 - `subprocess` 使用 argv 数组，禁用 shell 拼接；
 - `jsonl` 全量审计（`/var/log/ceph-console/audit.jsonl`），含来源 IP 与操作用户；
@@ -370,7 +314,7 @@ curl -H "X-Console-Token: <token>" http://192.168.27.134:8780/api/probe
 | `--host` | — | 访问地址用的 IP 或主机名 |
 | `--port` | `8780` | 服务端口 |
 | `--dir` | `/opt/ceph-console` | 安装目录 |
-| `--keyring` | `full` | `full` 可写 / `readonly` 只读 / `none` 复用现有 keyring |
+| `--keyring` | `full` | 专用账号权限，默认即可，无需改动 |
 | `--allow-write` | 关闭 | **允许真实 OSD 操作（危险）** |
 | `--backend` | `cli` | `cli` 完整 / `rest` 只读代理 |
 | `--rest-url` / `--rest-token` | — | mgr dashboard REST 通道 |
@@ -413,7 +357,7 @@ cd ~/ceph-ops-console && sudo bash deploy.sh --uninstall --purge    # 彻底卸�
 确认后端主机可读取 ceph 配置与 keyring（`ceph -s` 可执行）、`client.ceph-console` 权限充足，并查看 `GET /api/probe` 返回的能力探测结果。
 
 **Q：点了一键踢盘但集群没变化？**
-这是预期行为 —— 默认 DRY-RUN。确认命令序列后按「快速开始」第 4 步开启 `--keyring full --allow-write`。
+先确认服务是否处于 DRY-RUN：按快速开始安装时带了 `--allow-write`，应已开启真实执行；检查 `/api/session` 是否返回 `allow_write: true`、登录角色是否为 admin。若当初去掉了 `--allow-write`，改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console` 即可，无需重装。
 
 **Q：`rest` 后端为什么不能换盘？**
 REST 通道是 mgr dashboard 的只读代理；OSD 写操作需要 `cli` 后端与 ceph CLI。

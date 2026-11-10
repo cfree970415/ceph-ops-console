@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.0.5-20261110';
+var UI_BUILD='1.0.6-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -87,6 +87,8 @@ var state={
   {id:uid(),ts:T-9*3600000,user:'admin@ops',act:'OSD_OUT',target:'osd.23',cmd:'ceph orch osd rm 23',result:'DRY-RUN',note:'演示模式，未下发真实命令'},
   {id:uid(),ts:T-27*3600000,user:'svc-deploy',act:'CONFIG',target:'alert rule',cmd:'-',result:'OK',note:'nearfull 阈值由 90% 调整为 85%'}],
  metrics:{cap:Array.from({length:24},function(_,i){return 62+i*0.42+Math.sin(i/2.4)*1.4;}),iops:Array.from({length:24},function(_,i){return 11+Math.sin(i/1.7)*4+((i*13)%7);})},
+ /* LIVE 模式下由 /api/state 的每次同步真实累积，不使用演示曲线 */
+ ioReal:{iops:false,thr:false},samples:{iops:[],cap:[]},lastStateTs:0,
  filters:{alertSev:'all',alertStatus:'all',alertQ:'',osdStatus:'all',osdQ:''},
  settings:{nearfull:85,full:95,downMin:10,pgDegraded:1,slowOps:1000,webhook:'',notifyWebhook:true,notifyMail:false,notifyWecom:false,notifyDing:false,deployMode:'auto',forceVersion:'auto',allowWrite:false,confirm:true},
  deploy:{host:'192.168.27.134',user:'root',port:'8780',dir:'/opt/ceph-console',keytype:'full',restUrl:''},
@@ -101,6 +103,27 @@ function faultOsd(){
  return state.osds[0]||null;}
 /* First OSD that is marked OUT: the one-click "in" target. */
 function inOsd(){return state.osds.filter(function(o){return !o.inn;})[0]||null;}
+
+/* ---- real sample buffers (LIVE only) ----
+   /api/state 只给当前快照，没有历史。趋势图由前端按同步间隔累积真实样本
+   （带时间戳，便于算出真实跨度），样本不足时明确显示「采集中」，
+   绝不回落到内置演示曲线。 */
+function pushSample(arr,v,t,cap){
+ if(typeof v!=='number'||!isFinite(v))return;
+ arr.push({v:v,t:t||Date.now()});
+ if(arr.length>(cap||60))arr.splice(0,arr.length-cap);
+}
+function seriesOf(arr){return arr.map(function(p){return p.v;});}
+function sampleSpan(arr){
+ if(arr.length<2)return '0 秒';
+ var s=Math.max(0,Math.round((arr[arr.length-1].t-arr[0].t)/1000));
+ return s>=120?Math.round(s/60)+' 分钟':(s>=60?(s/60).toFixed(1)+' 分钟':s+' 秒');
+}
+function resetSamples(){state.samples={iops:[],cap:[]};state.ioReal={iops:false,thr:false};state.lastStateTs=0;}
+function chartEmpty(txt){
+ return '<div style="height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;'+
+  'border:1px dashed var(--border);border-radius:8px;color:var(--faint);font-size:11px;line-height:1.6;text-align:center;padding:0 14px">'+
+  ic('activity',22)+'<div>'+txt+'</div></div>';}
 
 /* ---- API layer ---- */
 var API={token:function(){return state.token||sessionStorage.getItem('cc_token')||'';},
@@ -260,8 +283,40 @@ function vOverview(){if(liveNoData())return noDataPage();
   {l:'活跃告警',i:'bell',v:String(active.length),s:'<b class="td">'+crit+' 严重</b> · '+(active.length-crit)+' 其他'}];
  var kh=K.map(function(k){return '<div class="card kpi"><div class="kpi-l">'+ic(k.i,14)+k.l+'</div><div class="kpi-v">'+k.v+'</div><div class="kpi-s">'+k.s+'</div>'+(k.bar!=null?'<div class="bar"><i style="width:'+k.bar+'%;background:'+k.color+'"></i></div>':'')+'</div>';}).join('');
  var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div><div style="margin-top:8px;color:var(--faint)">原始容量 '+bytes(c.total)+' · 副本 3<br>逻辑可用约 '+bytes((c.total-c.used)/3)+'</div></div></div>');
- var trend=card('近 24 小时容量使用率','<div style="font-size:11px;color:var(--muted);margin-bottom:6px">当前 <b class="mono" style="color:var(--accent2)">'+state.metrics.cap[23].toFixed(1)+'%</b> · 24h 增长 +'+(state.metrics.cap[23]-state.metrics.cap[0]).toFixed(1)+' pt</div>'+spark(state.metrics.cap,'var(--accent)',true)+'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)"><span>-24h</span><span>-18h</span><span>-12h</span><span>-6h</span><span>现在</span></div>','<span class="tag info">容量趋势</span>');
- var io=card('集群 IO 性能','<div class="grid g2" style="gap:10px;margin-bottom:14px"><div><div class="tiny">IOPS</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+c.iops.toLocaleString()+'</div></div><div><div class="tiny">吞吐</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+bytes(c.throughput)+'<small>/s</small></div></div></div>'+spark(state.metrics.iops,'var(--info)',true)+'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)"><span>-24h</span><span>现在</span></div>');
+ var live=state.mode==='live';
+ var capS=live?state.samples.cap.slice(-24):state.metrics.cap;
+ var ioS=live?state.samples.iops.slice(-24):state.metrics.iops;
+ var capV=live?seriesOf(capS):capS;
+ var ioV=live?seriesOf(ioS):ioS;
+ var capCur=capV.length?capV[capV.length-1]:null;
+ var capDelta=capV.length>=2?(capV[capV.length-1]-capV[0]):null;
+ var capSpan=live?sampleSpan(capS):'24 小时';
+ var ioSpan=live?sampleSpan(ioS):'24 小时';
+ /* 标题、副标题和坐标轴都必须如实反映数据来源：DEMO 就是 DEMO，
+    LIVE 只有攒到 2 个真实样本才画线，绝不用演示曲线兜底。 */
+ var trendSub=live
+  ?(capV.length>=2?'当前 <b class="mono" style="color:var(--accent2)">'+capCur.toFixed(1)+'%</b> · 最近 '+capSpan+' '+(capDelta>=0?'+':'')+capDelta.toFixed(2)+' pt · '+capV.length+' 个真实样本'
+    :'已采集 <b class="mono">'+capV.length+'</b> 个真实样本，至少 2 个点后绘制曲线')
+  :'当前 <b class="mono" style="color:var(--accent2)">'+state.metrics.cap[23].toFixed(1)+'%</b> · 24h 增长 +'+(state.metrics.cap[23]-state.metrics.cap[0]).toFixed(1)+' pt';
+ var trendAxis=live?'<span>'+capSpan+'前</span><span>现在</span>':'<span>-24h</span><span>-18h</span><span>-12h</span><span>-6h</span><span>现在</span>';
+ var trend=card(live?'容量使用率（本地真实采样）':'近 24 小时容量使用率',
+  '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">'+trendSub+'</div>'+
+  (capV.length>=2?spark(capV,'var(--accent)',true):chartEmpty('等待真实采样（每 15 秒同步一次，服务端缓存窗口内的重复样本自动跳过）'))+
+  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+trendAxis+'</div>',
+  live?'<span class="tag info">真实采样</span>':'<span class="tag mute">DEMO 模拟曲线</span>');
+ var iopsTxt=live?(state.ioReal.iops?c.iops.toLocaleString():'—'):c.iops.toLocaleString();
+ var thrTxt=live?(state.ioReal.thr?bytes(c.throughput)+'<small>/s</small>':'—'):bytes(c.throughput)+'<small>/s</small>';
+ var ioSub=live
+  ?(ioV.length>=2?'最近 '+ioSpan+' · '+ioV.length+' 个真实样本'
+    :(state.ioReal.iops?'已采集 <b class="mono">'+ioV.length+'</b> 个真实样本，至少 2 个点后绘制曲线'
+      :'后端 /api/state 未返回 IOPS / 吞吐字段，无法绘制真实曲线'))
+  :'DEMO 模拟曲线（非集群真实数据）';
+ var io=card('集群 IO 性能',
+  '<div class="grid g2" style="gap:10px;margin-bottom:14px"><div><div class="tiny">IOPS</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+iopsTxt+'</div></div><div><div class="tiny">吞吐</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+thrTxt+'</div></div></div>'+
+  (ioV.length>=2?spark(ioV,'var(--info)',true):chartEmpty(state.ioReal.iops?'等待真实采样（每 15 秒同步一次）':'后端未返回 IOPS / 吞吐字段'))+
+  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)"><span>'+(live?ioSpan+'前':'-24h')+'</span><span>现在</span></div>'+
+  '<div class="note" style="margin-top:8px">'+ioSub+'</div>',
+  live?'<span class="tag info">真实采样</span>':'<span class="tag mute">DEMO 模拟曲线</span>');
  var pg=card('PG 与 MON 状态','<div class="stat-line"><span>PG 总数</span><b class="mono">'+c.pgs.toLocaleString()+'</b></div><div class="stat-line"><span>active + clean</span><b class="mono t">4084</b></div><div class="stat-line"><span>undersized / degraded</span><b class="mono tw">12</b></div><div class="stat-line"><span>MON 法定人数</span><b class="mono t">'+c.monInQuorum+' / '+c.mons+'</b></div><div class="stat-line"><span>存储池</span><b class="mono">'+c.pools+'</b></div><div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy)+'</b></div>');
  var fq=faultOsd();
  var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>检测到待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'，可从平台直接一键处置。</div></div>'+

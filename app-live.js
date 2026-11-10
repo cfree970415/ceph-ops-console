@@ -129,6 +129,8 @@ function enterLive(){
  }
  var sid=state.auth.session||'';
  if(!sid){try{sid=sessionStorage.getItem('cc_session')||'';}catch(e){}}
+ /* A different session may point at a different cluster: never reuse samples. */
+ resetSamples();
  state.mode='live';state.auth=authReset();state.auth.required=true;state.auth.session=sid;
  render();
  if(!sid){renderAuth();toast('请填写后端地址并登录','w');return;}
@@ -460,6 +462,7 @@ function authAction(act,el){
    try{sessionStorage.setItem('cc_demo','1');}catch(e){}
    /* Keep apiBase: a cross-server frontend must be able to switch back to
       LIVE without retyping the backend address. */
+   resetSamples();
    state.settings.allowWrite=false;state.link.stateOk=false;render();renderAuth();
    toast('已进入离线演示模式，数据不来自集群','w');return;
   default:return;
@@ -469,10 +472,11 @@ var __baseOnAct=onAct;
 onAct=function(act,el){
  if(act.indexOf('auth-')===0)return authAction(act,el);
  if(act.indexOf('q-')===0)return quickAction(act,el);
- if(act==='diag-retry'){syncState().then(function(){render();});return;}
+ if(act==='diag-retry'){syncState(true).then(function(){render();});return;}
  if(act==='diag-run'){runDiag();return;}
  if(act==='diag-demo'){
   try{sessionStorage.setItem('cc_demo','1');}catch(e){}
+  resetSamples();
   state.mode='demo';state.auth=authReset();state.auth.required=false;
   state.settings.allowWrite=false;if(state.link)state.link.stateOk=false;
   state.view='overview';render();renderAuth();toast('已切换到离线演示','w');return;}

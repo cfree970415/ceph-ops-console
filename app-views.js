@@ -186,7 +186,7 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
    '<div class="fgrp"><label class="fld">degraded PG 阈值</label><input class="inp" type="number" data-bind="settings.pgDegraded" value="'+s.pgDegraded+'"></div>'+
    '<div class="fgrp"><label class="fld">慢请求阈值（ms）</label><input class="inp" type="number" data-bind="settings.slowOps" value="'+s.slowOps+'"></div></div>'+
    '<div class="hint">阈值保存在浏览器会话内；生产环境由后端读取 /etc/ceph-console/config.json 并周期评估。</div>')+
-  card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.5</b></div>'+
+  card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.6</b></div>'+
    '<div class="stat-line"><span>前端构建</span><b class="mono t">'+esc(UI_BUILD)+'</b></div>'+
    '<div class="stat-line"><span>当前运行模式</span><b class="mono '+(state.mode==='live'?'t':'tw')+'">'+(state.mode==='live'?'LIVE 真实控制台':'DEMO 离线演示')+'</b></div>'+
    '<div class="stat-line"><span>登录状态</span><b class="mono '+(state.auth.authenticated?'t':'tw')+'">'+(state.auth.authenticated?esc(state.auth.user)+' · 已登录':'未登录')+'</b></div>'+

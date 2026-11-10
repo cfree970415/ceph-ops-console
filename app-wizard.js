@@ -78,9 +78,9 @@ function preflightItems(w){var o=state.osds.filter(function(x){return x.id===w.o
 /* ---------- wizard ---------- */
 var WSTEPS=['选择 OSD 与意图','自动预检','二次确认','执行与观察','完成'];
 /* Pull real cluster data from the Linux backend (LIVE mode only). */
-function syncState(){
+function syncState(force){
  if(state.mode!=='live')return Promise.resolve();
- return API.call('GET','/api/state').then(function(r){
+ return API.call('GET','/api/state'+(force?'?refresh=1':'')).then(function(r){
   var d=r.data||{},c=d.cluster||{},err=c.error||d.error||'';
   /* HTTP 200 is not enough: the REST proxy only returns a summary, so a
      payload without capacity / OSD counters must not be treated as usable
@@ -93,8 +93,22 @@ function syncState(){
   if(state.link){state.link.stateOk=!err;state.link.stateError=err?String(err):'';
    state.link.stateHttp=200;state.link.stateAt=Date.now();}
   ['health','version','codename','deploy'].forEach(function(k){if(c[k])state.cluster[k]=c[k];});
-  ['total','used','osds','osdsUp','osdsIn','mons','monInQuorum','pgs','pools','iops','throughput'].forEach(function(k){
+  ['total','used','osds','osdsUp','osdsIn','mons','monInQuorum','pgs','pools'].forEach(function(k){
    if(typeof c[k]==='number'&&c[k]>0)state.cluster[k]=c[k];});
+  /* IOPS / 吞吐允许为 0（空闲集群），必须逐字段判断并记录后端是否真的给了，
+     否则前端会拿演示值 18420 / 2.6 GiB 冒充真实数据。 */
+  if(!err&&typeof c.iops==='number'&&isFinite(c.iops)){state.cluster.iops=c.iops;state.ioReal.iops=true;}
+  if(!err&&typeof c.throughput==='number'&&isFinite(c.throughput)){state.cluster.throughput=c.throughput;state.ioReal.thr=true;}
+  /* 趋势图只累积真实样本；同一份缓存（ts 未变）不重复记点，
+     否则 15 秒轮询 + 20 秒服务端缓存会画出假台阶。 */
+  var cached=!!(r.ts&&state.lastStateTs===r.ts);
+  state.lastStateTs=r.ts||0;
+  if(!err&&!cached){
+   var ts=r.ts?r.ts*1000:Date.now();
+   if(state.ioReal.iops)pushSample(state.samples.iops,c.iops,ts,60);
+   var capPct=(typeof c.total==='number'&&c.total>0&&typeof c.used==='number')?Math.round(c.used/c.total*1000)/10:null;
+   if(capPct!=null)pushSample(state.samples.cap,capPct,ts,60);
+  }
   if(c.fsid)state.cluster.fsid=c.fsid;
   if(err)console.warn('backend state:',err);
   if(d.profile)state.profile=d.profile;
@@ -236,7 +250,7 @@ function osdMark(id,inn){
  done(true,'');
 }
 function testConn(){if(state.mode==='demo'){toast('当前为 DEMO 模式；切换到 LIVE 并部署后端后可测试连接','w');return;}
- API.call('GET','/api/probe').then(function(r){state.profile=r.profile||r;state.lastRefresh=Date.now();render();syncState();toast('连接成功 · '+esc((state.profile.version||'未知')+' / '+(state.profile.orchestrator||'')),'ok');})
+ API.call('GET','/api/probe').then(function(r){state.profile=r.profile||r;state.lastRefresh=Date.now();render();syncState(true);toast('连接成功 · '+esc((state.profile.version||'未知')+' / '+(state.profile.orchestrator||'')),'ok');})
  .catch(function(e){toast('连接失败：'+e.message,'e');});}
 function exportAudit(){var lines=state.audit.map(function(a){return JSON.stringify({ts:dt(a.ts),user:a.user,action:a.act,target:a.target,command:a.cmd,result:a.result,note:a.note});}).join('\n');
  var blob=new Blob([lines+'\n'],{type:'application/x-ndjson'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='ceph-console-audit.jsonl';a.click();URL.revokeObjectURL(u);toast('审计日志已导出','ok');}
@@ -281,6 +295,7 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
        session id in sessionStorage so enterLive() can resume it silently
        when the user switches back to LIVE. */
     try{sessionStorage.setItem('cc_demo','1');}catch(e){}
+    resetSamples();
     state.mode='demo';state.auth=authReset();state.auth.required=false;
     state.settings.allowWrite=false;if(state.link)state.link.stateOk=false;
     render();renderAuth();toast('已切换到离线演示','w');}

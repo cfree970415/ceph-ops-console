@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -419,7 +419,7 @@ def read_cluster(cfg, probe):
             "monInQuorum": len(_g(monmap, "quorum") or []),
             "pgs": _g(pgmap, "num_pgs") or 0,
             "used": raw_used, "total": raw_total,
-            "iops": _g(pgmap, "read_op_per_sec") or 0,
+            "iops": (_g(pgmap, "read_op_per_sec") or 0) + (_g(pgmap, "write_op_per_sec") or 0),
             "throughput": (_g(pgmap, "read_bytes_sec") or 0) + (_g(pgmap, "write_bytes_sec") or 0),
             "deploy": probe.orchestrator}
 
@@ -1110,6 +1110,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        # ?refresh=1 bypasses the 20s /api/state cache (manual "重新同步"),
+        # so the IO / capacity trend gets a genuinely fresh sample.
+        self._fresh = "refresh=1" in (self.path or "")
         if path == "/api/session":
             return self.api_session_info()
         if path.startswith("/api/"):
@@ -1153,10 +1156,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "data": diag_info(self.cfg, self.probe)})
         if path == "/api/state":
             now = time.time()
-            if _STATE_CACHE["data"] is None or now - _STATE_CACHE["ts"] > 20:
+            force = bool(getattr(self, "_fresh", False))
+            if force or _STATE_CACHE["data"] is None or now - _STATE_CACHE["ts"] > 20:
                 _STATE_CACHE["data"] = read_state(self.cfg, self.probe, self.settings)
                 _STATE_CACHE["ts"] = now
-            return self._json({"ok": True, "data": _STATE_CACHE["data"], "ts": int(now)})
+            # ts 是缓存生成时间，不是响应时间：前端据此跳过缓存窗口内的
+            # 重复样本，避免趋势图出现假台阶。
+            return self._json({"ok": True, "data": _STATE_CACHE["data"],
+                               "ts": int(_STATE_CACHE["ts"]), "served_at": int(now)})
         if path.startswith("/api/osd/") and path.endswith("/meta"):
             try:
                 oid = int(path.split("/")[3].replace("osd.", ""))

@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.16-20261110';
+var UI_BUILD='1.1.17-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -213,6 +213,12 @@ function healthInfo(){
   /* ceph status 说 OK，但这一轮 health detail 没取到：告警明细未核实，
      不能凭一次成功/失败就把结论改成「一切正常」。 */
   if(state.alertsOk===false)return {t:'HEALTH_OK?',cl:'warn',dot:'warn',txt:'健康明细未核实'};
+  /* ceph 已经报 OK，但本地还有未处置的告警：要么刚做过 OUT/IN 还在观察期，
+     要么距最后一次出现不足 60 秒。此时仍显示黄色，等确认后再变绿。
+     否则 IN 一下、Ceph 还没来得及报 PG_DEGRADED 的那几十秒，界面就像被治好了。
+     已确认 / 已静音的告警不算，那是处置过的。 */
+  var live=state.alerts.filter(function(x){return x.status==='active';}).length;
+  if(live)return {t:'HEALTH_OK?',cl:'warn',dot:'warn',txt:live+' 项告警待核实'};
   return {t:'HEALTH_OK',cl:'ok',dot:'ok',txt:'集群健康'};
  }
  var a=activeAlerts(),c=a.filter(function(x){return x.sev==='critical'&&x.status==='active';}).length;
@@ -334,11 +340,11 @@ function noDataPage(){
 /* ---- view: overview ---- */
 function vOverview(){if(liveNoData())return noDataPage();
  var c=state.cluster,H=healthInfo(),up=pct(c.used,c.total),active=activeAlerts(),crit=active.filter(function(a){return a.sev==='critical';}).length;
- var K=[{l:'集群健康',i:'activity',v:H.t.replace('HEALTH_',''),s:'<b class="'+(H.cl==='err'?'td':H.cl==='warn'?'tw':'t')+'">'+H.txt+'</b> · '+esc(c.codename)+' '+esc(c.version)},
+ var K=[{l:'集群健康',i:'activity',v:H.t.replace('HEALTH_',''),vc:H.cl==='err'?'var(--danger)':H.cl==='warn'?'var(--warn)':'',s:'<b class="'+(H.cl==='err'?'td':H.cl==='warn'?'tw':'t')+'">'+H.txt+'</b> · '+esc(c.codename)+' '+esc(c.version)},
   {l:'已用容量',i:'db',v:bytes(c.used),s:'共 '+bytes(c.total)+' · <b>'+up+'%</b> 已用',bar:up,color:up>85?'var(--warn)':'var(--ok)'},
   {l:'OSD 状态',i:'disk',v:c.osdsUp+'<small>/ '+c.osds+'</small>',s:'<b class="tw">'+(c.osds-c.osdsUp)+' 个 down</b> · '+(c.osds-c.osdsIn)+' 个 out',bar:pct(c.osdsUp,c.osds),color:'var(--warn)'},
   {l:'活跃告警',i:'bell',v:String(active.length),s:'<b class="td">'+crit+' 严重</b> · '+(active.length-crit)+' 其他'}];
- var kh=K.map(function(k){return '<div class="card kpi"><div class="kpi-l">'+ic(k.i,14)+k.l+'</div><div class="kpi-v">'+k.v+'</div><div class="kpi-s">'+k.s+'</div>'+(k.bar!=null?'<div class="bar"><i style="width:'+k.bar+'%;background:'+k.color+'"></i></div>':'')+'</div>';}).join('');
+ var kh=K.map(function(k){return '<div class="card kpi"><div class="kpi-l">'+ic(k.i,14)+k.l+'</div><div class="kpi-v"'+(k.vc?' style="color:'+k.vc+'"':'')+'>'+k.v+'</div><div class="kpi-s">'+k.s+'</div>'+(k.bar!=null?'<div class="bar"><i style="width:'+k.bar+'%;background:'+k.color+'"></i></div>':'')+'</div>';}).join('');
  var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div></div></div>');
  var live=true;
  /* 趋势只有一种数据来源：真实采样。优先后端 /api/history（每分钟落盘，

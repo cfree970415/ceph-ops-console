@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.16"
+VERSION = "1.1.17"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -61,6 +61,13 @@ ALERT_SILENCE_DEFAULT = 60        # minutes
 # 一个 check 连续多少次采集都看不到，才判定「已恢复」。单次采集抖动
 # （MON 忙、命令超时，尤其是刚做完 OUT/IN 之后）不该把还在的告警标成恢复。
 ALERT_MISS_LIMIT = 2
+# 只看次数不够：刚刚 OUT/IN 完，Ceph 有几十秒的窗口还没开始报 PG_DEGRADED
+# （OSD 已经 in、回填尚未启动），此时 health detail 是空的，两轮刷新就能凑够
+# 次数，界面看起来像「IN 一下就把告警治好了」。所以再加两道时间闸：
+#   * 距最后一次看到该 check 至少 ALERT_CONFIRM_AGE 秒；
+#   * 真实写操作后 ALERT_WRITE_GRACE 秒内一律不判恢复，原状态照旧。
+ALERT_CONFIRM_AGE = 60
+ALERT_WRITE_GRACE = 180
 SESSION_TTL = 8 * 3600
 LOGIN_WINDOW = 300
 LOGIN_MAX_FAIL = 5
@@ -1235,6 +1242,18 @@ _ALERT_LOADED = {"done": False, "path": ""}
 # MON 忙时若直接返回空列表，前端会把整屏告警清掉、健康还会显示 OK。
 # 失败时沿用这份快照，并通过 alertsOk=false 让前端知道数据是陈旧的。
 _ALERT_LAST = {"rows": [], "ok": False, "err": "", "ts": 0}
+# 最近一次真实写操作（osd in/out/kick/replace/init）的观察截止时间。
+# 写操作会改变集群状态，Ceph 的 health check 有滞后期：这段时间里「health
+# detail 里没有这条」不能当成「已经恢复」，否则一次 IN 就能把告警整屏刷绿。
+_WRITE_GRACE_UNTIL = 0
+
+
+def alert_write_grace(seconds=None):
+    """记一次真实写操作，随后一窗口内不把任何告警判为已恢复。"""
+    global _WRITE_GRACE_UNTIL
+    sec = ALERT_WRITE_GRACE if seconds is None else int(seconds)
+    _WRITE_GRACE_UNTIL = int(time.time()) + max(0, sec)
+    return _WRITE_GRACE_UNTIL
 
 
 def alert_state_path(cfg):
@@ -1470,6 +1489,8 @@ def _alert_rows(now_s):
                      "status": _alert_live_status(item, now_s),
                      "count": int(item.get("count") or 1),
                      "by": item.get("by") or "",
+                     "pending": bool(item.get("pending")),
+                     "hold": int(item.get("hold") or 0),
                      "until": int(item.get("until") or 0)})
     stat_rank = {"active": 0, "acked": 1, "silenced": 2, "resolved": 3}
     sev_rank = {"critical": 0, "warning": 1, "info": 2}
@@ -1558,9 +1579,11 @@ def read_alerts(cfg, settings, osds=None):
                     item["status"] = ("silenced" if int(item.get("until") or 0) > now_s
                                       else "active")
                     changed = True
-                if int(item.get("miss") or 0):
+                if int(item.get("miss") or 0) or item.get("pending"):
                     # 又看到了：把「连续缺席」计数清零，避免下次抖动直接判恢复。
                     item["miss"] = 0
+                    item["pending"] = False
+                    item["hold"] = 0
                     changed = True
                 item["last"] = now_ms
                 item["sev"] = sev
@@ -1572,19 +1595,28 @@ def read_alerts(cfg, settings, osds=None):
                     item["osdIds"] = osd_ids or item.get("osdIds") or []
                     item["hosts"] = hosts or item.get("hosts") or []
                     item["devs"] = devs or item.get("devs") or []
-        # 已经不在 health detail 里的：连续确认若干次才标恢复，过了保留期再删掉。
+        # 已经不在 health detail 里的：次数 + 时间双重确认后才标恢复。
+        # 只在「次数够」且「最后一次看到它已经是 ALERT_CONFIRM_AGE 之前」且
+        # 「不在写操作观察期」时才下结论，否则保持原状态并标 pending（核实中）。
+        grace_left = max(0, int(_WRITE_GRACE_UNTIL) - now_s)
         for key in list(_ALERT_STATE.keys()):
             if key in seen:
                 continue
             item = _ALERT_STATE[key]
             if (item.get("status") or "") != "resolved":
                 miss = int(item.get("miss") or 0) + 1
-                if miss < ALERT_MISS_LIMIT:
-                    # 只缺席一次（命令抖动、MON 忙）不下结论，保持原状态。
-                    item["miss"] = miss
+                item["miss"] = miss
+                seen_age = max(0, (now_ms - int(item.get("last") or now_ms)) // 1000)
+                hold = max(ALERT_CONFIRM_AGE - seen_age, grace_left, 0)
+                if miss < ALERT_MISS_LIMIT or hold > 0:
+                    # 观测时间不够、或刚做过写操作：不改状态，挂上「核实中」。
+                    item["pending"] = True
+                    item["hold"] = int(hold)
                     changed = True
                     continue
                 item["miss"] = 0
+                item["pending"] = False
+                item["hold"] = 0
                 item["status"] = "resolved"
                 item["resolvedAt"] = now_ms
                 item["last"] = now_ms
@@ -3021,6 +3053,9 @@ class Handler(BaseHTTPRequestHandler):
             # 否则前端会拿 20 秒内的旧快照把刚改的 up/in 覆盖回去。
             _STATE_CACHE["data"] = None
             _STATE_CACHE["ts"] = 0
+            # 观察期：刚改过集群状态，health check 有滞后期，这段时间里
+            # 「health detail 暂时没这条」不等于「已经恢复」。
+            alert_write_grace()
         target = "osd.%d" % oid if oid is not None else dev
         audit("OSD_%s" % intent.upper(), target, " ; ".join(commands),
               "DRY-RUN" if dry else "EXECUTED",
@@ -3178,6 +3213,9 @@ class Handler(BaseHTTPRequestHandler):
                     # 否则前端点完按钮几秒后又被旧快照翻回原状态。
                     _STATE_CACHE["data"] = None
                     _STATE_CACHE["ts"] = 0
+                    # 同时开一个观察期：这段时间 health detail 里暂时看不到的
+                    # 告警不判恢复（IN 之后 Ceph 往往要几十秒才开始报 PG_DEGRADED）。
+                    alert_write_grace()
                 audit("OSD_%s" % action.upper(), "osd.%d" % oid, cmd_str(argv), res, err[:200],
                       self._client(), self._user())
                 return self._json({"ok": rc == 0, "result": res, "daemon": daemon,

@@ -3,7 +3,7 @@
 'use strict';
 
 /* ---------- extended state ---------- */
-state.auth={required:false,authenticated:false,user:'',role:'viewer',allowWrite:false,
+state.auth={required:false,authenticated:false,user:'',role:'viewer',allowWrite:false,writeCapability:false,
             readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false};
 state.link={apiBase:'',stateOk:false,stateError:'',stateHttp:0,stateAt:0,
             diag:null,diagBusy:false,diagError:''};
@@ -72,6 +72,8 @@ function applySession(r){
  if(state.link){state.link.stateError='';state.link.stateHttp=0;state.link.diag=null;}
  state.auth.authenticated=true;state.auth.user=r.user||'admin';state.auth.role=r.role||'viewer';
  state.auth.allowWrite=!!r.allow_write&&state.auth.role==='admin';
+ /* write_capability = 服务端是否带 --allow-write；allow_write 是设置页总开关生效后的结果。 */
+ state.auth.writeCapability=!!r.write_capability;
  state.auth.readOnly=!!r.read_only;state.auth.backend=r.backend||'cli';
  state.auth.error='';state.auth.busy=false;
  if(r.session){state.auth.session=r.session;try{sessionStorage.setItem('cc_session',r.session);}catch(e){}}

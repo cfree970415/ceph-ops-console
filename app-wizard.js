@@ -153,11 +153,14 @@ function syncState(force){
   if(Array.isArray(c.mgrStandbys))state.cluster.mgrStandbys=c.mgrStandbys;
   if(typeof c.mgrAvailable==='boolean')state.cluster.mgrAvailable=c.mgrAvailable;
   if(c.fsid)state.cluster.fsid=c.fsid;
-  /* 告警阈值以后端配置为准，避免前端演示默认值 85/95 冒充真实设置。 */
+  /* 告警阈值与安全策略以后端配置为准，避免前端演示默认值冒充真实设置。
+     allow_write 由后端持久化（默认 false），不能因为服务端带 --allow-write 就显示成已开。 */
   if(!err&&d.settings){
    if(typeof d.settings.nearfull==='number')state.settings.nearfull=d.settings.nearfull;
    if(typeof d.settings.full==='number')state.settings.full=d.settings.full;
    if(typeof d.settings.downMin==='number')state.settings.downMin=d.settings.downMin;
+   if(typeof d.settings.allow_write==='boolean')state.settings.allowWrite=d.settings.allow_write;
+   if(typeof d.settings.confirm==='boolean')state.settings.confirm=d.settings.confirm;
   }
   if(err)console.warn('backend state:',err);
   if(d.profile)state.profile=d.profile;
@@ -333,6 +336,51 @@ function setBind(path,val,el){var ks=path.split('.'),o=state;
   else render();}
  if(path.indexOf('deploy.')===0||path==='token'){var d=document.getElementById('cmd-1');if(d){var cm=genCmds();[['cmd-1',cm.scp],['cmd-2',cm.run],['cmd-3',cm.rest],['cmd-4',cm.check]].forEach(function(x){var n=document.getElementById(x[0]);if(n){var btn=n.querySelector('[data-act="copy"]');n.textContent=x[1];if(btn)n.appendChild(btn);}});}}
  if(path==='wizard.phrase'||path==='wizard.confirmed'){var b=document.querySelector('[data-act="w-exec"]');var w2=state.wizard;if(b&&w2)b.disabled=!(w2.phrase==='osd.'+w2.osdId&&w2.confirmed);}}
+/* ---------- 安全策略：改开关必须先验密码 ----------
+   会话不能替代密码：这一步是「二次授权」，防止有人用别人没锁屏的浏览器
+   把真实写操作打开。验证在后端做（/api/security），前端只负责收集密码。 */
+function secToggle(key,next){
+ if(!state.auth.authenticated){toast('请先用账号密码登录，再修改安全策略','e');return;}
+ if(state.auth.role!=='admin'){toast('只有 admin 角色可以修改安全策略','e');return;}
+ var isWrite=key==='settings.allowWrite';
+ var label=isWrite?'允许真实写操作':'危险操作二次确认';
+ var on=next==='1';
+ var effect=isWrite?(on?'开启后向导与一键操作会真实下发到集群。':'关闭后全程 DRY-RUN，命令只生成不下发。')
+                   :(on?'踢盘 / 换盘 / 建池前必须手工输入 OSD 编号或池名。':'此后不再要求输入确认短语，点击即执行。');
+ openModal(modalHead('修改安全策略',label)+
+  '<div class="modal-b">'+
+  '<div class="warnbox" style="margin-bottom:14px">'+ic('lock')+'<div>'+
+   esc(label)+' 将改为 <b>'+(on?'开启':'关闭')+'</b>。'+esc(effect)+
+   '<br>修改需要输入 <b class="mono">'+esc(state.auth.user||'admin')+'</b> 的密码，并写入审计日志。</div></div>'+
+  '<div class="fgrp"><label class="fld">当前账号密码</label>'+
+   '<input class="inp" id="sec-pw" type="password" autocomplete="current-password" placeholder="输入 '+esc(state.auth.user||'admin')+' 的密码"></div>'+
+  '<div id="sec-msg" class="hint" style="margin-top:8px"></div></div>'+
+  '<div class="modal-f"><div class="sp"></div><button class="btn" data-act="modal-close">取消</button>'+
+  '<button class="btn pri" data-act="sec-apply" data-key="'+key+'" data-value="'+next+'">'+ic('lock',14)+' 验证并保存</button></div>','sm');
+ setTimeout(function(){var el=document.getElementById('sec-pw');if(el)el.focus();},60);
+}
+function secApply(key,next){
+ var pw=document.getElementById('sec-pw'),msg=document.getElementById('sec-msg');
+ var val=pw?pw.value:'';
+ if(!val){if(msg){msg.className='hint e';msg.textContent='请输入密码';}if(pw)pw.focus();return;}
+ var body={password:val};
+ if(key==='settings.allowWrite')body.allow_write=next==='1';else body.confirm=next==='1';
+ var btn=document.querySelector('[data-act="sec-apply"]');if(btn)btn.disabled=true;
+ apiFetch('POST','/api/security',body).then(function(r){
+  var st=(r&&r.settings)||{};
+  if(typeof st.allow_write==='boolean'){
+   state.settings.allowWrite=st.allow_write;
+   state.auth.allowWrite=st.allow_write&&state.auth.role==='admin';
+   state.auth.writeCapability=!!r.capability;
+  }
+  if(typeof st.confirm==='boolean')state.settings.confirm=st.confirm;
+  closeModal();render();
+  toast('已保存：'+(key==='settings.allowWrite'?'允许真实写操作':'危险操作二次确认')+(next==='1'?' 开启':' 关闭'),'ok');
+ }).catch(function(err){
+  if(btn)btn.disabled=false;
+  if(msg){msg.className='hint e';msg.textContent=(err&&err.message)||'修改失败';}
+ });
+}
 function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data-value'),w=state.wizard;
  switch(act){
   case 'nav':
@@ -342,6 +390,8 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
     loadAudit(true).then(function(){render();});return;}
    render();break;
   case 'theme':state.theme=state.theme==='dark'?'light':'dark';render();break;
+  case 'sec-toggle':secToggle(el.getAttribute('data-key'),el.getAttribute('data-value'));break;
+  case 'sec-apply':secApply(el.getAttribute('data-key'),el.getAttribute('data-value'));break;
   case 'refresh':state.lastRefresh=Date.now();if(state.mode==='live')testConn();else render();toast('已刷新','ok');break;
   case 'modal-close':closeModal();break;
   case 'overlay':case 'w-close':return;

@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.14"
+VERSION = "1.1.15"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -92,6 +92,8 @@ class Config(object):
         self.ceph_name = args.ceph_name or ""
         self.ceph_keyring = args.ceph_keyring or ""
         self.dir = args.dir or HERE
+        self.conf_path = (getattr(args, "config_file", "") or
+                          os.environ.get("CEPH_CONSOLE_CONFIG", "") or CONF_PATH)
         self.users_file = getattr(args, "users_file", "") or os.environ.get("CEPH_CONSOLE_USERS", "") or USERS_PATH
         self.history_file = getattr(args, "history_file", "") or os.environ.get("CEPH_CONSOLE_HISTORY", "") or HISTORY_PATH
         self.auth_required = not bool(getattr(args, "no_auth", False) or
@@ -1256,6 +1258,101 @@ def alert_state_load(cfg):
         pass
 
 
+def save_conf(path, data):
+    """把设置写回 config.json：原子替换 + 0600。返回 (ok, error)。
+
+    安全策略（allow_write / confirm）改动要能跨重启保留，所以必须落盘；
+    写失败要让调用方回滚内存值，不能出现「页面显示已开、重启又变回去」。
+    """
+    tmp = path + ".tmp"
+    try:
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        if hasattr(os, "replace"):
+            os.replace(tmp, path)
+        else:
+            os.rename(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True, ""
+    except (IOError, OSError, ValueError) as e:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False, str(e)
+
+
+def conf_path(cfg):
+    """安全策略写到哪个文件：默认 /etc/ceph-console/config.json，
+    --config-file / CEPH_CONSOLE_CONFIG 可覆盖（测试与非标准安装用）。"""
+    return getattr(cfg, "conf_path", "") or CONF_PATH
+
+
+def security_update(cfg, settings, user, role, body, remote=""):
+    """校验并落盘「修改安全策略」。返回 (http_status, payload)。
+
+    独立成模块函数是为了能脱离 HTTP 层测试。要点：
+    - 只认 admin，且必须是真实登录会话（服务令牌没有 user）；
+    - 必须重新输入该账号密码，失败计入登录失败节流，避免成为暴力破解旁路；
+    - allow_write 只有在进程本身带 --allow-write 时才允许打开，否则返回 409
+      说明「开了也不会下发」，不制造已开启的假象；
+    - 先改内存再落盘，落盘失败回滚内存，不出现「页面显示已开、重启又变回去」。
+    """
+    if not user:
+        return 403, {"error": "请用账号密码登录后修改安全策略（服务令牌不支持）"}
+    if role != "admin":
+        return 403, {"error": "只有 admin 角色可以修改安全策略"}
+    users = load_users(cfg.users_file)
+    rec = users.get(user)
+    if not isinstance(rec, dict) or "hash" not in rec:
+        return 403, {"error": "当前账号不在本地用户库中，无法修改安全策略"}
+    if not login_allowed(remote):
+        return 429, {"error": "尝试次数过多，请几分钟后再试"}
+    if not verify_password(str(body.get("password", "") or ""), rec):
+        note_login_fail(remote)
+        audit("SECURITY_SETTING", "-", "-", "REJECTED", "bad password", remote, user)
+        return 403, {"error": "密码不正确"}
+    note_login_ok(remote)
+    want = {}
+    for key in ("allow_write", "confirm"):
+        if key in body:
+            val = body.get(key)
+            if not isinstance(val, bool):
+                return 400, {"error": "%s 必须是布尔值" % key}
+            want[key] = val
+    if not want:
+        return 400, {"error": "没有需要修改的项"}
+    if want.get("allow_write") is True:
+        if not cfg.allow_write:
+            return 409, {"error": "服务端以 DRY-RUN 启动（缺少 --allow-write），"
+                                  "此开关打开也不会下发命令；请先用 --allow-write 重启服务"}
+        if getattr(cfg, "read_only", False) or cfg.backend != "cli":
+            return 409, {"error": "当前为只读 keyring 或 REST 后端，无法开启真实写操作"}
+    old = dict((k, settings.get(k)) for k in ("allow_write", "confirm"))
+    settings.update(want)
+    path = conf_path(cfg)
+    ok, err = save_conf(path, settings)
+    if not ok:
+        settings.update(old)
+        audit("SECURITY_SETTING", "-", "-", "FAIL", "写入配置失败：%s" % err, remote, user)
+        return 500, {"error": "写入 %s 失败：%s" % (path, err)}
+    audit("SECURITY_SETTING", ",".join(sorted(want.keys())), "-", "OK",
+          json.dumps(want, ensure_ascii=False), remote, user)
+    return 200, {"ok": True,
+                 "settings": {"allow_write": settings.get("allow_write") is True,
+                              "confirm": settings.get("confirm", True) is not False},
+                 "capability": bool(cfg.allow_write),
+                 "read_only": bool(getattr(cfg, "read_only", False)),
+                 "path": path}
+
+
 def alert_state_save(cfg):
     path = _ALERT_LOADED["path"] or alert_state_path(cfg)
     tmp = path + ".tmp"
@@ -1887,9 +1984,12 @@ def read_state(cfg, probe, settings):
             "alerts": read_alerts(cfg, settings, osds), "pools": pools,
             "hosts": read_hosts(cfg, cluster), "profile": probe.as_dict(),
             # 阈值来自后端配置文件，前端不再用自己的演示默认值 85/95。
+            # 安全策略随状态下发：页面开关只显示真实值，默认 DRY-RUN + 二次确认开。
             "settings": {"nearfull": settings.get("nearfull"),
                          "full": settings.get("full"),
-                         "downMin": settings.get("downMin")}}
+                         "downMin": settings.get("downMin"),
+                         "allow_write": settings.get("allow_write") is True,
+                         "confirm": settings.get("confirm", True) is not False}}
 
 
 # --------------------------------------------------------------------------
@@ -2490,6 +2590,39 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _write_allowed(self):
+        """真实下发能力的两个服务端条件（不含身份判断）。
+
+        1. `--allow-write` / `CEPH_CONSOLE_ALLOW_WRITE=1` 给了进程写权限；
+        2. 设置页的「允许真实写操作」总开关为开。
+           该开关默认关闭，且只有 admin 输入自己的密码才能改（/api/security）。
+        只满足第 1 条时仍然全程 DRY-RUN，避免「装了带 --allow-write 就默认能动手」。
+        """
+        return bool(self.cfg.allow_write) and self.settings.get("allow_write") is True
+
+    def _confirm_required(self):
+        """危险操作二次确认（默认开）。关闭后仍需 admin + 写开关，只是不再要求
+        手工输入 OSD 编号 / 池名。"""
+        return self.settings.get("confirm", True) is not False
+
+    def _security_update(self, body):
+        """修改安全策略：必须 admin 会话 + 重新输入该账号的密码。
+
+        这是一次「二次授权」：会话本身不能替代密码，避免有人用别人没锁屏的
+        浏览器把真实写操作打开。两项设置持久化在 config.json（0600）。
+        """
+        s = self._session()
+        status, payload = security_update(self.cfg, self.settings,
+                                          s["user"] if s else "",
+                                          s.get("role", "") if s else "",
+                                          body, self._client())
+        if status == 200:
+            _STATE_CACHE["data"] = None
+            _STATE_CACHE["ts"] = 0
+            # 返回「本次请求视角」的最终可写状态：服务端能力 + 总开关 + 身份。
+            payload["allow_write"] = self._write_allowed() and self._can_write()
+        return self._json(payload, status)
+
     def _user(self):
         s = self._session()
         return s["user"] if s else "service-token"
@@ -2534,7 +2667,9 @@ class Handler(BaseHTTPRequestHandler):
             sid, self.cfg.session_ttl)
         audit("LOGIN", user, "-", "OK", "role=%s backend=%s" % (role, self.cfg.backend), remote)
         return self._json({"ok": True, "session": sid, "user": user, "role": role,
-                           "auth_required": True, "allow_write": self.cfg.allow_write,
+                           "auth_required": True,
+                           "allow_write": self._write_allowed() and role == "admin",
+                           "write_capability": bool(self.cfg.allow_write),
                            "read_only": self.cfg.read_only, "backend": self.cfg.backend,
                            "expires_in": self.cfg.session_ttl}, 200, {"Set-Cookie": cookie})
 
@@ -2604,7 +2739,8 @@ class Handler(BaseHTTPRequestHandler):
                                "service_name": "Ceph Ops Console", "version": VERSION})
         return self._json({"authenticated": True, "auth_required": True,
                            "user": s["user"], "role": s["role"],
-                           "allow_write": self.cfg.allow_write and s["role"] == "admin",
+                           "allow_write": self._write_allowed() and s["role"] == "admin",
+                           "write_capability": bool(self.cfg.allow_write),
                            "read_only": self.cfg.read_only, "backend": self.cfg.backend,
                            "expires_at": int(s["expires"]), "version": VERSION})
 
@@ -2735,7 +2871,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             oid = validate_target(oid, host, dev)
             expected = "osd.%d" % oid
-        if phrase != expected:
+        # 关闭「危险操作二次确认」后不再要求手工输入短语；写开关与 admin 身份仍必查。
+        if self._confirm_required() and phrase != expected:
             return self._json({"error": "confirm_phrase mismatch (expected %s)" % expected}, 403)
         # A viewer may rehearse the whole flow in DRY-RUN, but may never ask
         # for real execution. Server-side --allow-write is a second gate.
@@ -2756,7 +2893,7 @@ class Handler(BaseHTTPRequestHandler):
             plan, pending, pause = post, [], False
         else:
             plan, pending, pause = full, [], False
-        allow = bool(body.get("allow_write")) and self.cfg.allow_write and self._can_write()
+        allow = bool(body.get("allow_write")) and self._write_allowed() and self._can_write()
         if intent == "init" and allow:
             # 安全闸：不允许把已经在用的盘当新盘初始化（zap 是不可逆的）。
             used = set(osd_used_devices(self.cfg)[0].values())
@@ -2834,13 +2971,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.cfg.backend != "cli":
             return self._json({"error": "REST backend is read-only; deploy CLI backend for pool operations"}, 403)
         spec = validate_pool_spec(body)
-        if str(body.get("confirm_phrase", "") or "") != spec["name"]:
+        if self._confirm_required() and str(body.get("confirm_phrase", "") or "") != spec["name"]:
             return self._json({"error": "confirm_phrase mismatch (expected %s)" % spec["name"]}, 403)
         # 重名会让 create 直接失败，也可能误以为「建好了」；提前挡住并说清楚。
         if spec["name"] in pool_names(self.cfg):
             return self._json({"error": "存储池 %s 已存在，请换一个名称" % spec["name"]}, 400)
         plan = build_pool_plan(self.cfg, self.probe, spec)
-        allow = bool(body.get("allow_write")) and self.cfg.allow_write and self._can_write()
+        allow = bool(body.get("allow_write")) and self._write_allowed() and self._can_write()
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
         verify = None
         if not dry:
@@ -2891,6 +3028,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_post(self, path, body):
         if path == "/api/alert/ack":
             return self._alert_ack(body)
+        if path == "/api/security":
+            return self._security_update(body)
         if path == "/api/password":
             return self.api_password(body)
         if path == "/api/pool/plan":
@@ -2902,7 +3041,7 @@ class Handler(BaseHTTPRequestHandler):
                                "exists": spec["name"] in pool_names(self.cfg),
                                "version": self.probe.version,
                                "orchestrator": self.probe.orchestrator,
-                               "allow_write": self.cfg.allow_write and self._can_write(),
+                               "allow_write": self._write_allowed() and self._can_write(),
                                "read_only": self.cfg.read_only})
         if path == "/api/pool/create":
             return self._pool_create(body)
@@ -2917,7 +3056,7 @@ class Handler(BaseHTTPRequestHandler):
                                "commands": plan_strings(plan),
                                "version": self.probe.version,
                                "orchestrator": self.probe.orchestrator,
-                               "allow_write": self.cfg.allow_write and self._can_write(),
+                               "allow_write": self._write_allowed() and self._can_write(),
                                "read_only": self.cfg.read_only})
         if path in ("/api/quick/kick", "/api/quick/replace", "/api/quick/in",
                     "/api/quick/init", "/api/execute"):
@@ -2945,7 +3084,8 @@ class Handler(BaseHTTPRequestHandler):
                 audit("OSD_%s" % action.upper(), "osd.%d" % oid, cmd_str(argv), "REJECTED", "read-only",
                       self._client(), self._user())
                 return self._json({"error": "write operations disabled"}, 403)
-            if self.cfg.allow_write and body.get("confirm_phrase") == "osd.%d" % oid:
+            if self._write_allowed() and (body.get("confirm_phrase") == "osd.%d" % oid
+                                          or not self._confirm_required()):
                 daemon = ""
                 if action == "in":
                     # 踢盘时停过守护进程：只做 osd in 会恢复权重但状态仍是 down。
@@ -3034,6 +3174,8 @@ def parse_args(argv):
     p.add_argument("--users-file", default="", help="JSON user store with PBKDF2 hashes")
     p.add_argument("--history-file", default="",
                    help="jsonl file for real capacity/IO samples (default %s)" % HISTORY_PATH)
+    p.add_argument("--config-file", default="",
+                   help="config.json holding alert thresholds and security policy (default %s)" % CONF_PATH)
     p.add_argument("--no-auth", action="store_true", help="disable login (NOT recommended)")
     p.add_argument("--session-ttl", default="", help="session lifetime in seconds (default 8h)")
     p.add_argument("--cors-origin", default="",
@@ -3104,10 +3246,15 @@ def main(argv):
     if args.print_profile:
         print(json.dumps(probe.as_dict(), ensure_ascii=False, indent=2))
         return 0
-    settings = {"nearfull": 85, "full": 95, "downMin": 10}
-    if os.path.isfile(CONF_PATH):
+    # 安全策略的出厂值：真实写操作默认关闭、危险操作二次确认默认开启。
+    # 两者持久化在 config.json，修改必须验证 admin 密码（见 /api/security）。
+    # 注意：即使以 --allow-write 启动，allow_write 仍默认 False —— 服务端能力
+    # 与「人是否授权本次真实下发」是两层闸门，后者只能由 admin 在页面上开。
+    settings = {"nearfull": 85, "full": 95, "downMin": 10,
+                "allow_write": False, "confirm": True}
+    if os.path.isfile(conf_path(cfg)):
         try:
-            with open(CONF_PATH, "r") as f:
+            with open(conf_path(cfg), "r") as f:
                 settings.update(json.load(f))
         except (IOError, ValueError):
             pass

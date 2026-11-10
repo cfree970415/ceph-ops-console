@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.14-20261110';
+var UI_BUILD='1.1.15-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -79,7 +79,7 @@ var state={
  deploy:{host:'',user:'root',port:'8780',dir:'/opt/ceph-console',keytype:'full',restUrl:''},
  profile:null,wizard:null,modal:null,
  /* 登录态：未登录时不渲染任何集群数值（由 app-live.js 的 render 包装处理）。 */
- auth:{required:true,authenticated:false,user:'',role:'viewer',allowWrite:false,
+ auth:{required:true,authenticated:false,user:'',role:'viewer',allowWrite:false,writeCapability:false,
   readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false},
  link:{apiBase:'',stateOk:false,stateError:'',stateHttp:0,stateAt:0,diag:null,diagBusy:false,diagError:''}};
 

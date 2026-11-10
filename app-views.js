@@ -221,13 +221,20 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
    (state.auth.authenticated?esc(state.auth.user)+' · '+(state.auth.role==='admin'?'管理员':'只读'):'未登录')+'</b></div>'+
   '<div class="stat-line"><span>执行模式</span><b class="mono '+(state.settings.allowWrite?'td':'t')+'">'+(state.settings.allowWrite?'EXECUTE 真实执行':'DRY-RUN 只生成命令')+'</b></div><div class="hr"></div>';
  var sw=function(k,l,d){var v=k.split('.').reduce(function(o,x){return o[x];},state);return '<div class="setrow"><div><div class="l">'+l+'</div><div class="d">'+d+'</div></div><button class="switch '+(v?'on':'')+'" data-act="toggle" data-key="'+k+'"></button></div>';};
+ /* 安全策略开关：改动必须重新输入当前登录账号的密码（后端 /api/security 复核）。
+    开关本身不发请求，点了先弹密码框，验证通过才落盘，避免「随手打开」。
+    服务端没带 --allow-write 时开关仍可点，但会在提示里说清打开也不会下发。 */
+ var swSec=function(key,label,desc,val,cap){
+  var extra=cap?'':'<div class="hint" style="margin-top:2px">'+ic('alert',12)+' 服务端以 DRY-RUN 启动（缺 --allow-write），此开关打开也不会下发命令。</div>';
+  return '<div class="setrow"><div><div class="l">'+label+' '+ic('lock',12)+'</div><div class="d">'+desc+'</div>'+extra+'</div>'+
+   '<button class="switch '+(val?'on':'')+'" data-act="sec-toggle" data-key="'+key+'" data-value="'+(val?'0':'1')+'" title="修改需要验证 admin 密码"></button></div>';};
  return pageH('系统设置','数据源、安全策略、告警阈值与版本适配')+'<div class="grid g2">'+
   card('连接与数据源',connInfo+
    '<div class="fgrp"><label class="fld">API 基地址（留空为同源）</label><input class="inp" data-bind="apiBase" value="'+esc(state.apiBase)+'" placeholder="http://192.168.27.134:8780"></div>'+
    '<div class="fgrp"><label class="fld">访问令牌 X-Console-Token</label><input class="inp" type="password" data-bind="token" value="'+esc(state.token)+'" placeholder="由部署脚本生成"></div>'+
    '<div class="btn-row"><button class="btn pri" data-act="test-conn">'+ic('link',14)+' 测试连接 / 重新探测</button></div><div class="hr"></div>'+sw('autoRefresh','自动刷新','每 15 秒拉取集群状态与告警'))+
-  card('安全策略',sw('settings.allowWrite','允许真实写操作','关闭时为 DRY-RUN：只生成命令与日志，不下发到 Ceph 集群。生产环境首次上线请保持关闭。')+
-   sw('settings.confirm','危险操作二次确认','踢盘 / 换盘 / 删除前必须手工输入 OSD 编号并勾选确认项。')+
+  card('安全策略',swSec('settings.allowWrite','允许真实写操作','关闭时为 DRY-RUN：只生成命令与日志，不下发到 Ceph 集群。默认关闭，开启需验证密码。',state.settings.allowWrite,state.auth.writeCapability!==false)+
+   swSec('settings.confirm','危险操作二次确认','开启时踢盘 / 换盘 / 建池前必须手工输入 OSD 编号或池名。默认开启，关闭需验证密码。',state.settings.confirm,true)+
    '<div class="fgrp" style="margin-top:14px"><label class="fld">强制版本覆盖（用于命令模板）</label><select class="inp" data-bind="settings.forceVersion">'+[['auto','自动探测（推荐）']].concat(CEPH_VERSIONS.map(function(v){return [v.v,v.v+' '+v.name];})).map(function(o){return '<option value="'+o[0]+'"'+(s.forceVersion===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select></div>'+
    '<div class="fgrp"><label class="fld">部署方式覆盖</label><select class="inp" data-bind="settings.deployMode">'+[['auto','自动探测'],['cephadm','cephadm / orchestrator'],['legacy','ceph-volume / 传统']].map(function(o){return '<option value="'+o[0]+'"'+(s.deployMode===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select></div>'+
    '')+'</div>'+

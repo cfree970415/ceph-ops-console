@@ -9,7 +9,7 @@
 - 支持「管理节点一体化启动」和「前端与后端分离部署」两种形态；
 - 后端仅依赖 Python 3.6+ 标准库，前端零 CDN、零构建、可离线运行。
 
-> ⚠️ 快速开始的安装命令带 `--allow-write`，装完即可**真实下发**踢盘 / 换盘命令；去掉该参数则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。执行闸门与风险控制见 [一键踢盘 / 换盘 / IN 盘](#一键踢盘--一键换盘--一键-in-盘)。
+> ⚠️ 快速开始的安装命令带 `--allow-write`，但**装完默认仍是 DRY-RUN**：需要在「系统设置 → 安全策略」里由 admin 输入自己的密码，打开「允许真实写操作」后才会真正下发。去掉 `--allow-write` 则无论开关如何都只生成命令（只写审计，不改集群）。执行闸门与风险控制见 [一键踢盘 / 换盘 / IN 盘](#一键踢盘--一键换盘--一键-in-盘)。
 
 ---
 
@@ -76,6 +76,21 @@
 | 主机：CPU / 内存 | 控制台所在节点读 `/proc/stat`、`/proc/meminfo`；其它节点用 `ssh <host>` 执行同一条只读命令（cephadm 的免密 key 直接复用），15 秒一次、失败 5 分钟内不再重试 | 该行 `未采集`，悬停显示 ssh 的真实报错 |
 | 变更审计 | `/var/log/ceph-console/audit.jsonl` | 空列表 |
 | 告警阈值 nearfull / full | `/etc/ceph-console/config.json`（随 `/api/state` 下发） | 默认 85 / 95 |
+| 安全策略 allow_write / confirm | `/etc/ceph-console/config.json`，改动走 `POST /api/security`（admin 密码复核）并写审计 | `false` / `true` |
+
+### 安全策略的默认值与修改方式
+
+| 设置 | 默认 | 含义 |
+| --- | --- | --- |
+| 允许真实写操作 | **关闭** | 关闭时全程 DRY-RUN：只生成命令 + 写审计，不下发。即使服务端带 `--allow-write` 也默认关闭 |
+| 危险操作二次确认 | **开启** | 踢盘 / 换盘 / 建池前必须手工输入 `osd.<ID>` 或池名；关闭后免输，但 admin 与写开关仍必查 |
+
+两个开关都在「系统设置 → 安全策略」，点了不会立即生效，而是弹出密码框要求输入**当前登录账号**的密码，由后端校验后才写入 `config.json`（0600）：
+
+- 只接受 `admin` 角色；`viewer` 与匿名请求一律 403；
+- 密码错误按登录失败同样节流（5 次后 429），不能当作绕过登录的旁路；
+- 服务端没有 `--allow-write` 时，打开「允许真实写操作」返回 409 并说明「打开也不会下发」，不会制造已开启的假象；
+- 每次改动记 `SECURITY_SETTING` 到审计日志。
 
 ### 主机 CPU / 内存怎么来的
 
@@ -209,7 +224,7 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 ### 补充
 
-- **安全开关**：安装命令里的 `--allow-write` 让一键踢盘 / 换盘真实下发；去掉它则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。
+- **安全开关**：`--allow-write` 只给进程写权限；装完默认仍是 DRY-RUN，需 admin 在「系统设置 → 安全策略」输密码打开总开关才会真实下发。不带 `--allow-write` 时该开关无法打开（后端返回 409 并说明原因）。
 - **内网访问不了 GitHub**：在能上网的机器 `git clone` 后 `scp -r ceph-ops-console/ root@<host>:~/`（或下载仓库 zip 解压），把命令里的 `~/ceph-ops-console` 换成实际目录即可。仓库内 7 个运行文件就是全部依赖，无需编译或联网安装。
 - **不想用了**：卸载见 [卸载](#卸载)，一条命令停服务并删安装目录，可选 `--purge` 连配置、keyring、日志一起清理。
 
@@ -318,14 +333,17 @@ unset PW
 
 后端按探测到的 Ceph 版本与编排器自动选择命令模板；人工换盘由 `stage=pre` / `stage=post` 两段执行，**不会假装自动完成物理换盘**。
 
-**四道闸门，缺一不可真正下发命令：**
+**五道闸门，缺一不可真正下发命令：**
 
 1. 服务端启动参数 `--allow-write`（由 `deploy.sh --allow-write` 传入）；
 2. 专用 keyring 具备写能力（安装默认 `--keyring full`）；
-3. 登录角色为 `admin`，且请求带 `allow_write: true`；
-4. 请求体携带正确的 `confirm_phrase`（OSD 操作为 `osd.<ID>`，创建存储池为池名）。
+3. **设置页「允许真实写操作」总开关为开**——默认关闭，开启 / 关闭都必须由 admin 重新输入自己的密码（`POST /api/security`），改动写入 `config.json` 与审计；
+4. 登录角色为 `admin`，且请求带 `allow_write: true`；
+5. 二次确认开着时（默认开），请求体需携带正确的 `confirm_phrase`（OSD 操作为 `osd.<ID>`，创建存储池为池名）。
 
 其余情况一律 DRY-RUN：返回完整命令列表、写入审计，但**不执行**。此外 OSD ID 强制整数校验、设备路径与主机名走白名单正则，所有外部命令以 argv 数组调用（不经 shell），避免命令注入。
+
+> 第 1 条是「进程有没有写权限」，第 3 条是「人授权了没有」。只给 `--allow-write` 不再等于能动手，避免一次安装命令就把生产集群置于可写状态。关掉「危险操作二次确认」后仍需第 1~4 条，只是不用再手输 OSD 编号。
 
 ---
 
@@ -403,7 +421,7 @@ EC 池把第二行换成 `... erasure <ec_profile>`，并跳过 `set size`。
 
 ## 安全设计
 
-- 不加 `--allow-write` 时默认 DRY-RUN，加后才真实执行；四重写开关（见上）；
+- 写操作要过五道闸门：`--allow-write`、keyring 写权限、设置页总开关（默认关、改需 admin 密码）、admin 角色、确认短语（可关闭）；
 - 参数强校验：`osd_id` 整数、`/dev/...` 设备路径白名单、主机名白名单；
 - `subprocess` 使用 argv 数组，禁用 shell 拼接；
 - `jsonl` 全量审计（`/var/log/ceph-console/audit.jsonl`），含来源 IP 与操作用户；
@@ -420,7 +438,7 @@ EC 池把第二行换成 `... erasure <ec_profile>`，并跳过 `set size`。
 | 用途 | 路径 |
 | --- | --- |
 | 安装目录 | `/opt/ceph-console`（`--dir` 可改） |
-| 配置文件 | `/etc/ceph-console/config.json` |
+| 配置文件 | `/etc/ceph-console/config.json`（告警阈值 + 安全策略 `allow_write` / `confirm`，0600；`--config-file` 可改路径） |
 | 用户库 | `/etc/ceph-console/users.json`（0600） |
 | 服务 token | `/etc/ceph-console/env`（0600） |
 | 专用 keyring | `/etc/ceph/ceph.client.ceph-console.keyring` |
@@ -482,7 +500,7 @@ curl -H "X-Console-Token: <token>" http://192.168.27.134:8780/api/probe
 | `--port` | `8780` | 服务端口 |
 | `--dir` | `/opt/ceph-console` | 安装目录 |
 | `--keyring` | `full` | 专用账号权限，默认即可，无需改动 |
-| `--allow-write` | 关闭 | **允许真实 OSD 操作（危险）** |
+| `--allow-write` | 关闭 | 给进程写权限。**不等于已开启真实执行**：还需在设置页由 admin 输密码打开总开关 |
 | `--backend` | `cli` | `cli` 完整 / `rest` 只读代理 |
 | `--rest-url` / `--rest-token` | — | mgr dashboard REST 通道 |
 | `--user` / `--password` | `admin` / 自动生成 | 登录账号；密码推荐用 `CEPH_CONSOLE_PASSWORD`。**重装时不带 `--password` 会保留现有密码**，见 [修改 admin 密码](#修改-admin-密码) |
@@ -589,10 +607,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 
 ```bash
 grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.6+ = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.14-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.15-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.14-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.15-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
@@ -641,7 +659,7 @@ journalctl -u ceph-console -n 50 --no-pager
 ## 常见问题
 
 **Q：登录 admin 后看到的还是旧数据 / 空页面？**
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.14-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.15-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但页面空白**：属于[登录后没有真实数据](#登录后没有真实数据)，点「运行后端自检」看 `ceph status` 的真实报错，不是模式问题。
 3. 分离部署时确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
 
@@ -658,7 +676,7 @@ journalctl -u ceph-console -n 50 --no-pager
 因为 `ceph osd down` 只改 osdmap 标记，OSD 守护进程还在跑时心跳会把它改回 `up`。1.1.4 起踢盘计划第一步就是停守护进程（cephadm `ceph orch daemon stop osd.<id>`，包安装 `systemctl stop ceph-osd@<id>`），并在执行后回读 `ceph osd dump` 复核。如果界面提示「未完全生效」，说明停服务那步失败（多半是后端进程不是 root、或 orch 未接管），按提示在集群节点手工执行一次停服务命令即可。
 
 **Q：点了一键踢盘但集群没变化？**
-先确认服务是否处于 DRY-RUN：按快速开始安装时带了 `--allow-write`，应已开启真实执行；检查 `/api/session` 是否返回 `allow_write: true`、登录角色是否为 admin。若当初去掉了 `--allow-write`，改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console` 即可，无需重装。
+按三层顺序查：① `/api/session` 的 `write_capability` 是否为 `true`（服务端有没有带 `--allow-write`）；② 同一个响应里的 `allow_write` 是否为 `true` —— 它才是「设置页总开关已开」的结果，**默认是 `false`**，需要 admin 在「系统设置 → 安全策略」里输入密码打开；③ 登录角色是否为 `admin`。缺 ① 时改 `/etc/ceph-console/env` 的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console`；缺 ② 去设置页打开开关，无需重启。
 
 **Q：新加的 OSD 在「OSD / 磁盘」页面看不到？**
 列表的成员取 `ceph osd dump` ∪ `ceph osd df` ∪ `ceph osd tree` 三源并集，只要 OSD 在任意一个里出现就会显示（容量等 `df` 还没统计的字段显示「未采集」，不会是 0 B）。如果仍然看不到，按顺序确认：

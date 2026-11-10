@@ -73,9 +73,22 @@
 | OSD：设备名 | `ceph osd metadata <id>` 的 `bluestore_bdev`（**唯一按 osd 查自身设备**的来源，cephadm raw 部署下只有它能看到 nvme namespace）→ `ceph-volume lvm list`（LVM 部署）→ `ceph device ls`（仅采信一对一记录）。同一设备被多个 OSD 引用时整组作废、改用 metadata 核对 | `未采集` |
 | OSD：序列号 | `ceph device ls` 的 `device_id`，仅当设备名与该 OSD 匹配时采纳（不会把控制器的 SN 复制给多个 namespace） | `未采集` |
 | OSD：SMART | 需要 cephadm / Prometheus 侧盘健康指标，控制台**不伪造 OK** | `未采集` |
-| 主机：CPU / 内存 | 控制台所在节点读 `/proc/stat`、`/proc/meminfo`（15 秒采样，缓存后复用）；其它节点需要 node_exporter，控制台不伪造 | 非控制台节点 `未采集` |
+| 主机：CPU / 内存 | 控制台所在节点读 `/proc/stat`、`/proc/meminfo`；其它节点用 `ssh <host>` 执行同一条只读命令（cephadm 的免密 key 直接复用），15 秒一次、失败 5 分钟内不再重试 | 该行 `未采集`，悬停显示 ssh 的真实报错 |
 | 变更审计 | `/var/log/ceph-console/audit.jsonl` | 空列表 |
 | 告警阈值 nearfull / full | `/etc/ceph-console/config.json`（随 `/api/state` 下发） | 默认 85 / 95 |
+
+### 主机 CPU / 内存怎么来的
+
+| `--host-metrics` | 行为 |
+| --- | --- |
+| `auto`（默认） | 控制台所在节点直接读 `/proc`；其它节点 `ssh` 过去读同一份 `/proc`，读不到就留空 |
+| `ssh` | 所有节点都走 ssh（含本机） |
+| `off` | 完全不采集，CPU / 内存列统一显示「未采集」 |
+
+- ssh 用 `BatchMode=yes` + `PubkeyAuthentication`，**没有免密 key 就直接失败**，不会卡在密码提示，也不会改读本机数据冒充。
+- cephadm 部署的 bootstrap 节点本来就有到各主机的免密 key（`ceph cephadm get-pub-key` 对应的那把），控制台以 root 运行即可直接复用；否则用 `--host-ssh-user` 指定用户。
+- 远端只执行一条**固定常量**命令（读 `/proc/stat` 两次差值 + `/proc/meminfo`），主机名来自 `ceph orch host ls` 且过白名单正则，不拼接任何用户输入。
+- 要长期监控整集群，仍建议接 node_exporter + Prometheus：控制台的 ssh 采样是「有几台看几台」的轻量方案，不做历史聚合。
 
 > 顶栏的集群标识用 `fsid` 前 8 位（Ceph 本身没有“集群名”字段），不再显示任何虚构名称。
 
@@ -549,10 +562,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 
 ```bash
 grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.6+ = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.9-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.10-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.9-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.10-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
@@ -601,9 +614,12 @@ journalctl -u ceph-console -n 50 --no-pager
 ## 常见问题
 
 **Q：登录 admin 后看到的还是旧数据 / 空页面？**
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.9-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.10-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但页面空白**：属于[登录后没有真实数据](#登录后没有真实数据)，点「运行后端自检」看 `ceph status` 的真实报错，不是模式问题。
 3. 分离部署时确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
+
+**Q：主机列表里 CPU / 内存显示「未采集」？**
+鼠标悬停会给出 ssh 的真实报错，按提示处理即可：`Permission denied (publickey)` 说明控制台所在机器没有到该节点的免密 key（在 bootstrap 节点上运行，或 `ssh-copy-id root@<ip>`）；`Connection timed out` 是 22 端口不通；`本机没有 ssh 客户端` 装 `openssh-client`。不需要这项数据可加 `--host-metrics off`，或接 node_exporter 换取历史曲线。
 
 **Q：顶栏显示「LIVE · 等待后端数据」/ 页面显示「集群数据未就绪」？**
 说明登录成功，但 `GET /api/state` 没拿到有效集群状态。此时**页面不会显示任何占位数值**：顶栏健康为 `UNKNOWN`，集群视图被诊断页替代。点「运行后端自检」看 `ceph status` 的实际报错，完整排查见 [登录后没有真实数据](#登录后没有真实数据)；同步成功后顶栏会自动变成 `LIVE · <集群名>`。

@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.9"
+VERSION = "1.1.10"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -583,6 +583,140 @@ def local_usage(ttl=15):
         mem = None
     _LOCAL_USAGE.update({"ts": now, "host": host, "ips": ips, "cpu": cpu, "mem": mem})
     return _LOCAL_USAGE
+
+
+def _is_local_node(name, ip):
+    """这台主机是不是运行控制台的机器（主机名或本机任一 IP 匹配）。"""
+    u = local_usage()
+    lh = (u.get("host") or "").split(".")[0].lower()
+    if name and lh and name.split(".")[0].lower() == lh:
+        return True
+    return bool(ip) and ip in (u.get("ips") or [])
+
+
+# 远端一条命令同时算 CPU%（两次 /proc/stat 差值）和内存水位。
+# 命令是常量；主机名只作为 ssh 的 argv 参数传入，不会被拼进 shell。
+_MET_CMD = (
+    "sn() { awk '/^cpu /{t=0;i=0;for(k=2;k<=NF;k++){t+=$k; if(k==5||k==6)i+=$k} "
+    "print t, i; exit}' /proc/stat; }; "
+    "a=$(sn); sleep 0.2; b=$(sn); "
+    "m=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print t+0, a+0}' /proc/meminfo); "
+    "echo \"CCMET $a $b $m\""
+)
+_HOST_MET = {}
+_HOST_MET_LOCK = threading.Lock()
+_MET_TTL = 15          # 采集成功缓存 15 秒
+_MET_RETRY = 300       # 失败后 5 分钟内不再尝试，避免每轮刷新都卡 ssh 超时
+
+
+def _parse_metrics(out):
+    # 远端只认自己打的标记行，避免登录 banner / motd 里的数字被当成采样值
+    line = ""
+    for ln in (out or "").splitlines():
+        if ln.startswith("CCMET"):
+            line = ln[5:]
+    if not line:
+        line = (out or "").strip()
+    line = line.strip()
+    nums = [x for x in re.split(r"\s+", line)
+            if re.match(r"^\d+(\.\d+)?$", x)]
+    if len(nums) < 6:
+        return None
+    t1, i1, t2, i2, mt, av = [float(x) for x in nums[:6]]
+    span = t2 - t1
+    cpu = None
+    if span > 0:
+        cpu = int(round(max(0.0, min(100.0, (1.0 - (i2 - i1) / span) * 100.0))))
+    mem = None
+    if mt > 0:
+        mem = int(round(max(0.0, min(100.0, (1.0 - av / mt) * 100.0))))
+    return {"cpu": cpu, "mem": mem}
+
+
+def remote_usage(cfg, target, timeout=6):
+    """ssh 到目标节点读 /proc，返回 ({cpu,mem}|None, err)。
+
+    cephadm 部署时 bootstrap 节点本来就有到各主机的免密 key，直接复用；
+    没有 key 就失败——失败即如实留空，不改用本地数据冒充。
+    """
+    user = getattr(cfg, "host_ssh_user", "root") or "root"
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", target or ""):
+        return None, "主机名不合法"
+    if shutil.which("ssh") is None:
+        return None, "本机没有 ssh 客户端"
+    dest = "%s@%s" % (user, target)
+    base = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+            "-o", "LogLevel=ERROR", "-o", "PreferredAuthentications=publickey"]
+    # accept-new 需要 OpenSSH 7.6+；老发行版（CentOS 7 是 7.4）会直接报错，
+    # 这种情况下退一次到不写 known_hosts 的只读抓取，别让整列变成未采集。
+    plans = [(base + ["-o", "StrictHostKeyChecking=accept-new", dest, _MET_CMD], True),
+             (base + ["-o", "StrictHostKeyChecking=no",
+                      "-o", "UserKnownHostsFile=/dev/null", dest, _MET_CMD], False)]
+    last = "ssh 失败"
+    for argv, primary in plans:
+        try:
+            rc, out, err = run(argv, timeout)
+        except Exception as e:
+            return None, str(e)
+        if rc == 0:
+            return _parse_metrics(out), ""
+        msg = (err or out or "ssh 失败").strip().splitlines()
+        last = (msg[-1] if msg else "ssh 失败")[:160]
+        if not primary or not re.search(r"accept-new|Bad configuration option|Unsupported option",
+                                        err or ""):
+            break
+    return None, last
+
+
+def host_usage(cfg, name, ip):
+    """返回 (cpu, mem, src, err)。本机读 /proc，其它节点走 ssh（--host-metrics）。"""
+    mode = getattr(cfg, "host_metrics", "auto") or "auto"
+    key = name or ip or "?"
+    now = time.time()
+    with _HOST_MET_LOCK:
+        cached = dict(_HOST_MET.get(key) or {})
+    if cached:
+        ttl = _MET_RETRY if cached.get("err") else _MET_TTL
+        if now - cached.get("ts", 0) < ttl:
+            return cached.get("cpu"), cached.get("mem"), cached.get("src", ""), cached.get("err", "")
+    if mode == "off":
+        res = {"ts": now, "cpu": None, "mem": None, "src": "", "err": "已关闭主机指标采集"}
+    elif _is_local_node(name, ip):
+        u = local_usage()
+        res = {"ts": now, "cpu": u.get("cpu"), "mem": u.get("mem"), "src": "local", "err": ""}
+    else:
+        m, err = remote_usage(cfg, ip or name)
+        res = {"ts": now, "cpu": (m or {}).get("cpu"), "mem": (m or {}).get("mem"),
+               "src": "ssh" if m else "", "err": err}
+    with _HOST_MET_LOCK:
+        _HOST_MET[key] = res
+    return res["cpu"], res["mem"], res["src"], res["err"]
+
+
+def fill_host_usage(cfg, hosts):
+    """给每台主机补 CPU / 内存，多节点并行 ssh，避免串行累加延迟。"""
+    if not hosts:
+        return hosts
+    results = {}
+
+    def work(h):
+        try:
+            results[h["name"]] = host_usage(cfg, h["name"], h.get("ip", ""))
+        except Exception as e:
+            results[h["name"]] = (None, None, "", str(e))
+
+    threads = []
+    for h in hosts:
+        t = threading.Thread(target=work, args=(h,))
+        t.daemon = True
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(9)
+    for h in hosts:
+        cpu, mem, src, err = results.get(h["name"], (None, None, "", ""))
+        h["cpu"], h["mem"], h["src"], h["err"] = cpu, mem, src, err
+    return hosts
 
 
 def read_cluster(cfg, probe):
@@ -1408,7 +1542,6 @@ def read_hosts(cfg, cluster=None):
     mgr_names = set(cl.get("mgrStandbys") or [])
     if cl.get("mgrActive"):
         mgr_names.add(cl["mgrActive"])
-    local = local_usage() if cfg.backend == "cli" else {"host": "", "ips": [], "cpu": None, "mem": None}
     out = []
     # `ceph osd tree` 是扁平列表，children 里放的是 id 而不是对象 —— 不建索引
     # 就数不到每个 host 下的 OSD，up 只能靠 children 个数冒充。
@@ -1429,13 +1562,6 @@ def read_hosts(cfg, cluster=None):
 
     seen = set()
 
-    def is_local(name, ip):
-        """只有控制台所在节点能用 /proc 采到 CPU / 内存，别的节点留空。"""
-        lh = (local.get("host") or "").split(".")[0].lower()
-        if name and lh and name.split(".")[0].lower() == lh:
-            return True
-        return bool(ip) and ip in (local.get("ips") or [])
-
     def walk(nodes):
         for n in nodes or []:
             if not isinstance(n, dict):
@@ -1453,17 +1579,13 @@ def read_hosts(cfg, cluster=None):
                     up = len([k for k in kids if str(k.get("status", "")).lower() == "up"])
                 else:
                     up = total
-                ip = addr_by_host.get(name, "")
-                mine = is_local(name, ip)
-                out.append({"name": name, "ip": ip,
+                out.append({"name": name, "ip": addr_by_host.get(name, ""),
                             "mons": name in mon_names, "mgr": name in mgr_names,
                             "osds": total, "up": up,
-                            "mem": local.get("mem") if mine else None,
-                            "cpu": local.get("cpu") if mine else None,
-                            "ver": ""})
+                            "mem": None, "cpu": None, "src": "", "err": "", "ver": ""})
             walk(kids_of(n))
     walk(doc.get("nodes", []) if isinstance(doc, dict) else doc)
-    return out
+    return fill_host_usage(cfg, out)
 
 
 def osd_meta(cfg, oid):
@@ -2639,6 +2761,11 @@ def parse_args(argv):
     p.add_argument("--session-ttl", default="", help="session lifetime in seconds (default 8h)")
     p.add_argument("--cors-origin", default="",
                    help="allowed UI origin(s), comma separated; default * for intranet")
+    p.add_argument("--host-metrics", choices=["auto", "ssh", "off"], default="auto",
+                   help="per-host CPU/mem source: auto (local /proc + ssh to other nodes) | "
+                        "ssh (ssh only) | off (do not collect)")
+    p.add_argument("--host-ssh-user", default="root",
+                   help="ssh user for --host-metrics (default root; cephadm key must be installed)")
     p.add_argument("--print-profile", action="store_true", help="print probe result and exit")
     p.add_argument("--set-password", default="", metavar="USER",
                    help="offline: reset USER's password and exit (reads CEPH_CONSOLE_NEW_PASSWORD, "

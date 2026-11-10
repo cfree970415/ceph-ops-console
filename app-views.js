@@ -142,13 +142,17 @@ function vPools(){var rows=state.pools.map(function(p){
    '<div class="stat-line"><span>恢复速率</span><b class="mono">'+rec+'</b></div>'+
    '<div class="stat-line"><span>数据来源</span><b class="mono">pgmap 实时</b></div>')+
   card('容量增长（真实采样）','<div class="stat-line"><span>采样跨度</span><b class="mono">'+(ct.span>0?spanText(ct.span*3600):'累积中')+'</b></div><div class="stat-line"><span>增长速率</span><b class="mono">'+gTxt+'</b></div><div class="stat-line"><span>预计达到 nearfull</span><b class="mono tw">'+etaTxt+'</b></div><div class="stat-line"><span>nearfull / full</span><b class="mono">'+state.settings.nearfull+'% / '+state.settings.full+'%</b></div>')+'</div>';}
+/* CPU / 内存的取样位置（本机 /proc 还是 ssh 到远端）只在悬停里说明。 */
+function srcTip(h,what){var where=h.src==='ssh'?'ssh 读取远端 /proc':'本机 /proc';
+ return what+' 来源：'+where+' · 15 秒更新';}
+function missTip(h,what){return what+' 未采集'+(h.err?'：'+h.err:'（需 ssh 免密到该节点，或改用 node_exporter）');}
 function vHosts(){var c=state.cluster;
  var rows=state.hosts.map(function(h){var cpu=(typeof h.cpu==='number')?h.cpu:null,mem=(typeof h.mem==='number')?h.mem:null;
   return '<tr><td class="mono"><b>'+esc(h.name)+'</b></td><td class="mono">'+esc(h.ip||'—')+'</td>'+
    '<td>'+(h.mons?'<span class="tag info">MON</span> ':'')+(h.mgr?'<span class="tag pur">MGR</span>':'')+(!h.mons&&!h.mgr?'<span class="tag mute">OSD</span>':'')+'</td>'+
    '<td class="mono '+(h.up<h.osds?'tw':'t')+'">'+h.up+' / '+h.osds+'</td>'+
-   '<td style="min-width:110px">'+(cpu==null?'<span class="tag mute" title="该节点 CPU 未采集：/proc 采样只覆盖运行控制台的节点，其它节点需 node_exporter">未采集</span>':'<div class="flex" style="gap:7px" title="/proc/stat 采样（仅控制台所在节点）"><div class="bar" style="flex:1;margin:0"><i style="width:'+cpu+'%;background:var(--info)"></i></div><span class="mono mini">'+cpu+'%</span></div>')+'</td>'+
-   '<td style="min-width:110px">'+(mem==null?'<span class="tag mute" title="该节点内存未采集：/proc 采样只覆盖运行控制台的节点，其它节点需 node_exporter">未采集</span>':'<div class="flex" style="gap:7px" title="/proc/meminfo 采样（仅控制台所在节点）"><div class="bar" style="flex:1;margin:0"><i style="width:'+mem+'%;background:'+(mem>80?'var(--warn)':'var(--ok)')+'"></i></div><span class="mono mini">'+mem+'%</span></div>')+'</td>'+
+   '<td style="min-width:110px">'+(cpu==null?'<span class="tag mute" title="'+esc(missTip(h,'CPU'))+'">未采集</span>':'<div class="flex" style="gap:7px" title="'+esc(srcTip(h,'cpu'))+'"><div class="bar" style="flex:1;margin:0"><i style="width:'+cpu+'%;background:var(--info)"></i></div><span class="mono mini">'+cpu+'%</span></div>')+'</td>'+
+   '<td style="min-width:110px">'+(mem==null?'<span class="tag mute" title="'+esc(missTip(h,'内存'))+'">未采集</span>':'<div class="flex" style="gap:7px" title="'+esc(srcTip(h,'mem'))+'"><div class="bar" style="flex:1;margin:0"><i style="width:'+mem+'%;background:'+(mem>80?'var(--warn)':'var(--ok)')+'"></i></div><span class="mono mini">'+mem+'%</span></div>')+'</td>'+
    '<td class="mono mini">'+esc(h.ver||c.version||'—')+'</td></tr>';}).join('');
  var monList=(c.monList||[]);
  var monTxt=monList.length?monList.map(function(m){return esc(m.name)+(m.inQuorum?'':'（离线）');}).join(' · '):'—';
@@ -158,7 +162,7 @@ function vHosts(){var c=state.cluster;
  var stbys=(c.mgrStandbys||[]);
  return pageH('主机与 MON','集群节点、服务角色与资源水位')+card('节点列表','<div class="tbl-wrap"><table><thead><tr><th>主机</th><th>地址</th><th>角色</th><th>OSD up</th><th>CPU</th><th>内存</th><th>Ceph 版本</th></tr></thead><tbody>'+rows+'</tbody></table></div>','',false)+
   '<div class="grid g3" style="margin-top:14px">'+card('MON 法定人数','<div class="stat-line"><span>MON 成员</span><b class="mono"'+(monTip?' title="'+esc(monTip)+'"':'')+'>'+monTxt+'</b></div><div class="stat-line"><span>法定人数</span><b class="mono '+((typeof c.monInQuorum==='number'&&typeof c.mons==='number'&&c.monInQuorum<c.mons)?'tw':'t')+'">'+qTxt+'</b></div><div class="stat-line"><span>leader</span><b class="mono">'+esc(c.monLeader||'—')+'</b></div>')+
-  card('MGR 服务','<div class="stat-line"><span>active</span><b class="mono">'+esc(c.mgrActive||'—')+'</b></div><div class="stat-line"><span>standby</span><b class="mono">'+(stbys.length?stbys.map(esc).join(' · '):'无')+'</b></div><div class="stat-line"><span>mgr 可用</span><b class="mono '+(c.mgrAvailable?'t':'tw')+'">'+(c.mgrAvailable?'是':'否 / 未上报')+'</b></div>')+
+  card('MGR 服务','<div class="stat-line"><span>active</span><b class="mono" title="当前对外提供服务的 mgr 守护进程（名称是 cephadm 的 主机名.随机后缀）">'+esc(c.mgrActive||'—')+'</b></div><div class="stat-line"><span>standby</span><b class="mono" title="热备守护进程，active 挂掉后接管；与 active 在同一台主机时不提供主机级冗余">'+(stbys.length?stbys.map(esc).join(' · '):'无')+'</b></div><div class="stat-line"><span>mgr 可用</span><b class="mono '+(c.mgrAvailable?'t':'tw')+'">'+(c.mgrAvailable?'是':'否 / 未上报')+'</b></div>')+
   card('集群标识','<div class="stat-line"><span>FSID</span><b class="mono mini">'+esc(c.fsid||'—')+'</b></div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc((c.version||'—')+' '+(c.codename||''))+'</b></div><div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy||'—')+'</b></div><div class="stat-line"><span>对象数</span><b class="mono">'+((typeof c.objects==='number')?c.objects.toLocaleString():'—')+'</b></div>')+'</div>';}
 function vAudit(){var rows=state.audit.slice().sort(function(a,b){return b.ts-a.ts;}).map(function(a){var c=a.result==='OK'?'ok':a.result==='DRY-RUN'?'warn':'err';
  return '<tr><td class="mono mini">'+dt(a.ts)+'</td><td class="mono">'+esc(a.user)+'</td><td><span class="tag '+(a.act.indexOf('OSD')>=0?'pur':'info')+'">'+esc(a.act)+'</span></td><td class="mono">'+esc(a.target)+'</td>'+

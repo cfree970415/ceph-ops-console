@@ -146,7 +146,8 @@ function syncState(force){
   if(!err&&Array.isArray(d.pools))state.pools=d.pools;
   if(!err&&Array.isArray(d.hosts))state.hosts=d.hosts.map(function(h){
    return {name:h.name||'',ip:h.ip||'',mons:!!h.mons,mgr:!!h.mgr,osds:h.osds||0,up:h.up||0,
-    mem:(typeof h.mem==='number')?h.mem:null,cpu:(typeof h.cpu==='number')?h.cpu:null,ver:h.ver||''};});
+    mem:(typeof h.mem==='number')?h.mem:null,cpu:(typeof h.cpu==='number')?h.cpu:null,
+    src:h.src||'',err:h.err||'',ver:h.ver||''};});
   state.lastRefresh=Date.now();
   /* 24h 趋势来自后端真实采样（/api/history），拿到后再重绘，保证曲线与数字一致。 */
   return Promise.all([loadHistory(false),loadAudit(false)]).then(function(){

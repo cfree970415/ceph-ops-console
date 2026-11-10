@@ -614,6 +614,8 @@ curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.15-20261110'
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
+> 从 1.1.15 起，旧 `config.json` 里没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需要 admin 到「设置 → 安全策略」输入密码重新打开一次。这是有意的默认值收紧，不是升级失败。
+
 ---
 
 ## 登录后没有真实数据

@@ -7,14 +7,14 @@ function modalHead(t,sub){return '<div class="modal-h">'+ic('terminal',18)+'<h3>
 
 /* ---------- detail modals ---------- */
 function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(id);})[0];if(!o)return;
- var p=pct(o.used,o.size),s=osdStatus(o);
+ var hasCap=o.size>0,p=pct(o.used,o.size),s=osdStatus(o);
  var body='<div class="grid g2"><div><div class="stat-line"><span>OSD ID</span><b class="mono">osd.'+o.id+'</b></div><div class="stat-line"><span>服务器</span><b class="mono">'+esc(o.host||'未采集')+(hostIp(o.host)?' · '+esc(hostIp(o.host)):'')+'</b></div>'+
   '<div class="stat-line"><span>设备</span><b class="mono">'+esc(o.dev||'未采集')+'</b></div><div class="stat-line"><span>序列号</span><b class="mono">'+esc(o.serial||'未采集')+'</b></div>'+
-  '<div class="stat-line"><span>介质</span><b>'+o.type+'</b></div><div class="stat-line"><span>状态</span><span class="tag '+s.c+'">'+s.t+'</span></div></div>'+
-  '<div><div class="stat-line"><span>容量</span><b class="mono">'+bytes(o.size)+'</b></div><div class="stat-line"><span>已用</span><b class="mono">'+bytes(o.used)+' ('+p+'%)</b></div>'+
-  '<div class="stat-line"><span>使用率</span><div class="bar" style="width:120px;margin:0"><i style="width:'+p+'%;background:'+(p>85?'var(--danger)':'var(--ok)')+'"></i></div></div>'+
-  '<div class="stat-line"><span>PG 数</span><b class="mono">'+o.pgs+'</b></div><div class="stat-line"><span>CRUSH weight</span><b class="mono">'+o.weight.toFixed(2)+'</b></div>'+
-  '<div class="stat-line"><span>SMART</span><b class="'+(o.smart==='OK'?'t':'td')+'">'+o.smart+'</b></div></div></div>'+
+  '<div class="stat-line"><span>介质</span><b>'+(o.type?esc(o.type):'未采集')+'</b></div><div class="stat-line"><span>状态</span><span class="tag '+s.c+'">'+s.t+'</span></div></div>'+
+  '<div><div class="stat-line"><span>容量</span><b class="mono">'+(hasCap?bytes(o.size):'未采集')+'</b></div><div class="stat-line"><span>已用</span><b class="mono">'+(hasCap?bytes(o.used)+' ('+p+'%)':'—')+'</b></div>'+
+  '<div class="stat-line"><span>使用率</span>'+(hasCap?'<div class="bar" style="width:120px;margin:0"><i style="width:'+p+'%;background:'+(p>85?'var(--danger)':'var(--ok)')+'"></i></div>':'<b class="td">未采集</b>')+'</div>'+
+  '<div class="stat-line"><span>PG 数</span><b class="mono">'+o.pgs+'</b></div><div class="stat-line"><span>CRUSH weight</span><b class="mono">'+Number(o.weight||0).toFixed(2)+'</b></div>'+
+  '<div class="stat-line"><span>SMART</span><b class="'+(o.smart==='OK'?'t':'td')+'">'+(o.smart||'未采集')+'</b></div></div></div>'+
   (o.smart==='FAIL'?'<div class="dangerbox" style="margin-top:14px">'+ic('alert')+'<div>该盘 SMART 报告介质失效且 OSD 已下线，建议立即走「踢盘换盘」流程。换盘前请核对 SN <span class="mono">'+esc(o.serial)+'</span> 与物理盘位。</div></div>':'')+
   '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">相关告警</div>'+
   (state.alerts.filter(function(a){return a.osd===o.id;}).map(function(a){return '<div class="ck"><div class="ck-i '+(a.sev==='critical'?'f':'w')+'">!</div><div><div class="ck-n">'+esc(a.title)+'</div><div class="ck-d mono">'+a.id+' · '+ago(a.since)+'</div></div></div>';}).join('')||'<div class="note">暂无关联告警</div>');

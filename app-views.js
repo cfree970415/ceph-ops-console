@@ -51,9 +51,9 @@ function devCell(d){
  if(!d)return '<span class="tag mute" title="后端未采集设备名">未采集</span>';
  return '<span class="mono">'+esc(d)+'</span>';
 }
-function osdRow(o){var s=osdStatus(o),p=pct(o.used,o.size),pc=p>=85?'var(--danger)':p>=75?'var(--warn)':'var(--ok)';
- return '<tr><td class="mono"><b>osd.'+o.id+'</b></td><td>'+hostCell(o.host)+'</td><td>'+devCell(o.dev)+'</td><td><span class="tag mute">'+o.type+'</span></td><td class="mono">'+bytes(o.size)+'</td>'+
-  '<td style="min-width:130px"><div class="flex" style="gap:7px"><div class="bar" style="flex:1;margin:0"><i style="width:'+p+'%;background:'+pc+'"></i></div><span class="mono mini" style="width:32px;text-align:right;color:'+pc+'">'+p+'%</span></div></td>'+
+function osdRow(o){var s=osdStatus(o),hasCap=o.size>0,p=pct(o.used,o.size),pc=p>=85?'var(--danger)':p>=75?'var(--warn)':'var(--ok)';
+ return '<tr><td class="mono"><b>osd.'+o.id+'</b></td><td>'+hostCell(o.host)+'</td><td>'+devCell(o.dev)+'</td><td>'+(o.type?'<span class="tag mute">'+esc(o.type)+'</span>':'<span class="tag mute" title="osd df 尚未统计该 OSD">未采集</span>')+'</td><td class="mono">'+(hasCap?bytes(o.size):'—')+'</td>'+
+  '<td style="min-width:130px">'+(hasCap?'<div class="flex" style="gap:7px"><div class="bar" style="flex:1;margin:0"><i style="width:'+p+'%;background:'+pc+'"></i></div><span class="mono mini" style="width:32px;text-align:right;color:'+pc+'">'+p+'%</span></div>':'<span class="mono mini" title="osd df 尚未统计该 OSD">—</span>')+'</td>'+
   '<td><span class="tag '+s.c+'"><span class="dot '+(s.c==='err'?'err':s.c==='warn'?'warn':'ok')+'"></span>'+s.t+'</span></td><td class="mono mini">'+o.pgs+'</td>'+
   '<td>'+(o.smart==='OK'?'<span class="tag ok">OK</span>':o.smart==='WARN'?'<span class="tag warn">WARN</span>':o.smart==='FAIL'?'<span class="tag err">FAIL</span>':'<span class="tag mute" title="后端未采集 SMART">未采集</span>')+'</td>'+
  '<td><div class="btn-row" style="flex-wrap:nowrap;gap:5px"><button class="btn sm" data-act="osd-detail" data-id="'+o.id+'">详情</button>'+

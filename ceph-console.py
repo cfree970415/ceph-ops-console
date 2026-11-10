@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -605,40 +605,50 @@ def osd_device_map(cfg, want=None):
     return dev_by_id, host_by_id, serial_by_id
 
 
-def osd_upin_map(cfg):
-    """OSD id -> (up, in) 的真实状态。
-
-    `ceph osd df` 的 node 里没有 up / in 字段，早前用 `n.get("in", 1)` 取值，
-    于是所有 OSD 恒为 in——点 OUT 后前端刚变，下一次刷新又被“纠正”回 OUT。
-    这里以 `ceph osd dump` 的 osds[].up / osds[].in 为准（一次调用拿全量）。
-    """
-    out = {}
-    if cfg.backend == "rest":
-        return out
-    doc, _ = ceph_json(cfg, ["osd", "dump"], timeout=30)
-    if isinstance(doc, dict):
-        for o in (doc.get("osds") or []):
-            if not isinstance(o, dict):
-                continue
-            try:
-                oid = int(o.get("osd"))
-            except (TypeError, ValueError):
-                continue
-            out[oid] = (bool(o.get("up")), bool(o.get("in")))
-    return out
-
-
 def read_osds(cfg):
     if cfg.backend == "rest":
         return []
-    doc, _ = ceph_json(cfg, ["osd", "df"])
-    if doc is None:
-        return []
-    nodes = doc.get("nodes", doc.get("OSDs", [])) if isinstance(doc, dict) else (doc if isinstance(doc, list) else [])
-    if not isinstance(nodes, list):
-        nodes = []
+
+    def _oid(value):
+        try:
+            return int(str(value).replace("osd.", ""))
+        except (TypeError, ValueError):
+            return None
+
+    # 全量 OSD 集合以 `osd dump` 为准。新加入集群的 OSD 在 `osd df` 里可能
+    # 还没有统计行（进程刚起 / 尚未产生 PG / kb 还没上报），早前只遍历 df，
+    # 新盘就会直接从列表里消失。df 现在只负责补容量与使用率。
+    dump, _ = ceph_json(cfg, ["osd", "dump"], timeout=30)
+    dump_osds = []
+    if isinstance(dump, dict):
+        dump_osds = [o for o in (dump.get("osds") or []) if isinstance(o, dict)]
+
+    df, _ = ceph_json(cfg, ["osd", "df"])
+    if isinstance(df, dict):
+        df_nodes = df.get("nodes") or df.get("OSDs") or []
+    else:
+        df_nodes = df if isinstance(df, list) else []
+    if not isinstance(df_nodes, list):
+        df_nodes = []
+
+    stats = {}
+    for n in df_nodes:
+        if not isinstance(n, dict):
+            continue
+        oid = _oid(n.get("id", n.get("osd", n.get("name"))))
+        if oid is not None:
+            stats[oid] = n
+
+    by_dump = {}
+    for o in dump_osds:
+        oid = _oid(o.get("osd"))
+        if oid is not None:
+            by_dump[oid] = o
+
+    ids = sorted(set(stats) | set(by_dump))
     host_by_id = {}
     tree_state = {}
+    tree_osd_ids = set()
 
     # CRUSH tree: map each OSD id to its host (works on every Ceph release).
     tree, _ = ceph_json(cfg, ["osd", "tree"])
@@ -662,45 +672,56 @@ def read_osds(cfg):
             for child in node.get("children", []) or []:
                 rec(child, h)
         for node in by_id.values():
+            if node.get("type") == "osd":
+                # 即使该 OSD 还没挂到任何 root 下（未进 CRUSH），也要能被列出来。
+                tree_osd_ids.add(node["id"])
             if node.get("type") == "root":
                 rec(node["id"], "")
-    upin = osd_upin_map(cfg)
+
+    # 三源并集：dump（权威状态）、df（容量）、tree（CRUSH 归属）。
+    # 任何一个单独出现都不能被漏掉——新盘往往先出现在 dump/tree，最后才进 df。
+    ids = sorted(set(ids) | tree_osd_ids)
+    if not ids:
+        return []
 
     # 真实设备 / SN：按 osd id 精确映射，不能拿“第一个设备”套给所有 OSD。
-    ids = []
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        try:
-            ids.append(int(str(n.get("id", n.get("osd", n.get("name")))).replace("osd.", "")))
-        except (TypeError, ValueError):
-            continue
     dev_by_id, dev_host_by_id, serial_by_id = osd_device_map(cfg, ids)
 
     out = []
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        oid = n.get("id", n.get("osd", n.get("name")))
-        try:
-            oid = int(str(oid).replace("osd.", ""))
-        except (TypeError, ValueError):
-            continue
+    for oid in ids:
+        n = stats.get(oid) or {}
+        d = by_dump.get(oid) or {}
         kb = n.get("kb", 0) or 0
         used = n.get("kb_used", 0) or 0
         util = n.get("utilization", 0) or 0
         dev = dev_by_id.get(oid) or _dev_path(n.get("device") or "")
         host = host_by_id.get(oid) or dev_host_by_id.get(oid) or ""
-        up, inn = upin.get(oid) or tree_state.get(oid) or (
-            bool(n.get("up", 1)), bool(n.get("in", 1)))
-        cls = str(n.get("device_class") or n.get("type") or "SSD").upper()
+        # up/in 以 osd dump 为准（df 里没有这两个字段），tree 兜底。
+        if "up" in d:
+            up = bool(d.get("up"))
+        elif oid in tree_state:
+            up = tree_state[oid][0]
+        else:
+            up = bool(n.get("up", 1))
+        if "in" in d:
+            inn = bool(d.get("in"))
+        elif oid in tree_state:
+            inn = tree_state[oid][1]
+        else:
+            inn = bool(n.get("in", 1))
+        weight = d.get("weight")
+        if not isinstance(weight, (int, float)):
+            weight = n.get("crush_weight", 1) or 1
+        # 介质类型只有 df 提供；新盘还没进 df 时留空，前端显示“未采集”。
+        cls = str(n.get("device_class") or n.get("type") or "").upper()
         # SMART 需要 cephadm / node_exporter 侧的真实指标，这里不伪造 "OK"。
         out.append({"id": oid, "host": host,
                     "dev": dev,
-                    "type": cls[:8],
+                    "type": cls[:8] if cls else "",
                     "size": int(kb * 1024), "used": int(used * 1024),
+                    "capacityKnown": bool(kb),
                     "up": up, "inn": inn,
-                    "pgs": n.get("pgs", 0) or 0, "weight": n.get("crush_weight", 1) or 1,
+                    "pgs": n.get("pgs", 0) or 0, "weight": weight,
                     "smart": "", "serial": serial_by_id.get(oid, ""),
                     "utilization": util})
     return out

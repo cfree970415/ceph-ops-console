@@ -80,7 +80,7 @@ function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !
   '<div class="warnbox" style="margin-bottom:14px">'+ic('shield')+'<div><b>安全策略已生效</b>：默认 DRY-RUN，所有变更命令只生成不下发。真实执行需在「系统设置」开启写权限，并在向导中通过二次确认。当前版本档案 <span class="mono">'+esc(p.version||state.cluster.version)+' / '+esc(p.orchestrator)+'</span>，命令模板按实际能力探测结果选择。</div></div>'+
   card('OSD 列表','<div id="osd-table-wrap">'+osdTable()+'</div>','<span class="tag info">共 '+state.osds.length+' 台</span>',false)+
   '<div class="grid g2" style="margin-top:14px">'+card('处置流程说明','<div class="timeline">'+
-   '<div class="tl-i ok"><b>1. 选择 OSD 与意图</b><div class="tm">仅踢盘（退役）或踢盘+换盘（保留 OSD ID）</div></div>'+
+   '<div class="tl-i ok"><b>1. 选择 OSD 与意图</b><div class="tm">一键踢盘（仅 DOWN + OUT）／换盘（保留 OSD ID）／完整退役（purge）</div></div>'+
    '<div class="tl-i"><b>2. 自动预检</b><div class="tm">集群健康 / ok-to-stop / 剩余容量 / noout / 同故障域冲突 / min_size</div></div>'+
    '<div class="tl-i"><b>3. 二次确认</b><div class="tm">手工输入 OSD 编号 + 确认物理盘位，防止误操作</div></div>'+
    '<div class="tl-i w"><b>4. 执行与回填观察</b><div class="tm">逐条下发命令、终端日志、PG 回填进度、可中止</div></div>'+

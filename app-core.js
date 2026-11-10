@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.0-20261110';
+var UI_BUILD='1.1.1-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -383,7 +383,7 @@ function vOverview(){if(liveNoData())return noDataPage();
   '<div class="stat-line"><span>存储池</span><b class="mono">'+poolN+'</b></div>'+
   '<div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy)+'</b></div>');
  var fq=faultOsd();
- var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>检测到待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'，可从平台直接一键处置。</div></div>'+
+ var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>检测到待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'，可一键 <b>DOWN + OUT</b> 摘出（不退役，随时可 IN 恢复）。</div></div>'+
   '<div class="btn-row" style="margin-bottom:14px"><button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fq.id+'">'+ic('trash',14)+'一键踢盘</button>'+
   '<button class="qbtn lg" data-act="q-open" data-kind="replace" data-id="'+fq.id+'">'+ic('zap',14)+'一键换盘</button>'+
   '<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+'查看告警页面</button></div><div class="hr"></div>':'';

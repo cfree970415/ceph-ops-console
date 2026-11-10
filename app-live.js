@@ -243,8 +243,8 @@ function isolationCard(){
 }
 
 /* ---------- one-click kick / replace / in ---------- */
-function quickTitle(k){return k==='kick'?'一键踢盘（退役）':k==='in'?'一键 IN 盘（恢复上线）':'一键换盘（保留 OSD ID）';}
-function quickIntent(k){return k==='kick'?'remove':k==='in'?'in':'replace';}
+function quickTitle(k){return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':'一键换盘（保留 OSD ID）';}
+function quickIntent(k){return k==='kick'?'downout':k==='in'?'in':'replace';}
 function quickPlan(k,w){
  if(state.mode==='live'&&state.auth.authenticated){
   return apiFetch('POST','/api/plan',{intent:quickIntent(k),osd_id:w.osdId,host:w.host,dev:w.dev})
@@ -289,8 +289,8 @@ function quickPaintModal(){
  }else if(q.phase==='confirm'){
   var used=o.size?pct(o.used,o.size):0,isKick=q.kind==='kick',isIn=q.kind==='in';
   b='<div class="'+(isKick?'dangerbox':'warnbox')+'" style="margin-bottom:14px">'+ic(isIn?'check':'alert')+
-   '<div><b>'+(isKick?'即将把 osd.'+q.osdId+' 永久踢出集群':isIn?'即将把 osd.'+q.osdId+' 重新加入集群':'踢出并更换 osd.'+q.osdId+' 的磁盘')+'</b><br>'+
-   (isKick?'流程：标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证。':
+   '<div><b>'+(isKick?'即将把 osd.'+q.osdId+' 停掉并从集群摘出（DOWN + OUT）':isIn?'即将把 osd.'+q.osdId+' 重新加入集群':'踢出并更换 osd.'+q.osdId+' 的磁盘')+'</b><br>'+
+   (isKick?'流程：标记 DOWN（停止服务）→ 标记 OUT（从 CRUSH 摘出，触发回填）→ 状态复核 → 健康验证。<b>不做退役</b>：不 purge、不删认证、不清盘，数据与 OSD 身份保留，随时可点 IN 恢复。':
     isIn?'流程：确认 OSD 仍在 CRUSH → 取消 OUT 标记（osd in）→ 恢复权重并回填 → 健康验证。':
     '流程：标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD → 清理磁盘元数据 → <b>人工换盘（平台暂停）</b> → 原 ID 重建 → 回填观察。')+
    '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
@@ -312,7 +312,7 @@ function quickPaintModal(){
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
-   (isIn?'':'<button class="btn" data-act="q-wizard" title="改用带自动预检的完整向导">高级向导</button>')+
+   (isIn?'':'<button class="btn" data-act="q-wizard" title="'+(isKick?'踢盘只做 down + out；需要彻底移除 OSD 时走完整退役向导（含 purge / 清盘）':'改用带自动预检的完整向导')+'">'+(isKick?'完整退役向导':'高级向导')+'</button>')+
    '<button class="btn '+(isKick?'dan':'pri')+'" data-act="q-run">'+ic('zap',14)+' 立即执行'+(isKick?'踢盘':isIn?'IN 盘':'换盘')+'</button>';
  }else if(q.phase==='running'||q.phase==='paused'){
   b='<div class="flex" style="margin-bottom:10px"><span class="tag '+(q.dryRun?'warn':'err')+'">'+(q.dryRun?'DRY-RUN':'EXECUTE')+'</span>'+
@@ -328,10 +328,10 @@ function quickPaintModal(){
  }else if(q.phase==='done'){
   b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="t">'+ic('check',38)+'</div>'+
    '<div style="font-size:16px;font-weight:700;margin-top:8px">'+quickTitle(q.kind)+'流程已完成</div>'+
-   '<div class="note" style="margin-top:6px">osd.'+q.osdId+' · '+(q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':'命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
+   '<div class="note" style="margin-top:6px">osd.'+q.osdId+' · '+(q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':(q.kind==='kick'?'已标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群':'命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean'))+'</div></div>'+
    '<div class="grid g2"><div><div class="stat-line"><span>执行步骤</span><b class="mono">'+q.steps.length+'</b></div>'+
    '<div class="stat-line"><span>集群版本</span><b class="mono">'+esc(liveProfile().version||'-')+'</b></div></div>'+
-   '<div><div class="stat-line"><span>关联告警</span><b class="t">已自动恢复</b></div>'+
+   '<div><div class="stat-line"><span>关联告警</span><b class="'+(q.kind==='kick'?'tw':'t')+'">'+(q.kind==='kick'?'待复核（OSD 已 down）':'已自动恢复')+'</b></div>'+
    '<div class="stat-line"><span>审计记录</span><b class="t">已写入</b></div></div></div>'+
    '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>真实环境请回到「告警中心」确认告警已清除，并在「变更审计」复核完整命令序列与返回码。</div></div>';
   foot='<div class="sp"></div><button class="btn" data-act="q-alerts">查看告警</button>'+
@@ -350,13 +350,17 @@ function quickPaintLogs(){
 }
 function quickApply(){
  var q=state.quick,o=state.osds.filter(function(x){return x.id===q.osdId;})[0],isIn=q.kind==='in';
- if(q.kind==='kick'){state.osds=state.osds.filter(function(x){return x.id!==q.osdId;});
-  state.cluster.osds=Math.max(0,state.cluster.osds-1);}
+ if(q.kind==='kick'){/* 踢盘 = down + out：OSD 仍在集群里，不能从列表删掉，
+   只把本地状态标成 down / out，真实值由随后的强制刷新覆盖。 */
+  if(o){o.up=false;o.inn=false;}
+  state.cluster.osdsIn=Math.max(0,(state.cluster.osdsIn||0)-1);}
  else if(isIn){if(o){o.inn=true;o.up=true;}
   state.cluster.osdsIn=Math.min(state.cluster.osds,(state.cluster.osdsIn||0)+1);}
  else if(o){o.up=true;o.inn=true;o.smart='OK';o.used=Math.round(o.used*0.55);}
  state.alerts.forEach(function(a){if(a.osd!==q.osdId||a.status==='resolved')return;
-  /* IN 只清掉「被标记 OUT」类告警；盘仍 down 的硬件告警不能假装恢复。 */
+  /* 踢盘后 OSD 是 down+out，告警还在不在由后端真实健康检查决定，本地不假装恢复；
+     IN 只清掉「被标记 OUT」类告警；盘仍 down 的硬件告警永远不假装恢复。 */
+  if(q.kind==='kick')return;
   if(isIn&&a.code!=='OSD_OUT'&&a.code!=='OSD_IN')return;
   a.status='resolved';});
  state.cluster.osdsUp=state.osds.filter(function(x){return x.up;}).length+
@@ -399,7 +403,7 @@ function quickExec(stage){
     q.progress=100;qLog('c','✓ 全部步骤完成');
     quickApply();q.phase='done';quickPaintModal();
     toast(quickTitle(q.kind)+' 流程完成','ok');
-    if(state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState();},1500);
+    if(state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState(true);},1500);
     return;}
    var c=String(cmds[i]);qLog(c.charAt(0)==='#'?'d':'p',c.charAt(0)==='#'?c:'$ '+c);
    setTimeout(function(){

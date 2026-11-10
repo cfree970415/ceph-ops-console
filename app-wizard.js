@@ -52,6 +52,11 @@ function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cep
   {n:'用原 ID 重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+id,d:'13+ 支持 --osd-id；12.x 用 ceph-disk prepare/activate'},
   {n:'重新加入集群',c:'ceph osd in '+id,d:'恢复 CRUSH 权重'},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待 all PGs active+clean'}];
+ }else if(w.intent==='downout'){s=[
+  {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
+  {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'从 CRUSH 摘出并触发回填；不 purge、不清盘'},
+  {n:'确认 down / out 已生效',c:'ceph osd tree --format=json',d:'该 OSD 应为 down 且 reweight 为 0'},
+  {n:'集群健康验证',c:'ceph -s --format=json',d:'观察 PG 回到 active+clean'}];
  }else if(w.intent==='in'){s=[
   {n:'确认 OSD 仍在 CRUSH map',c:'ceph osd tree --format=json',d:'已被 purge / rm 的 OSD 无法 in，只能重新部署'},
   {n:'重新加入集群（osd in）',c:'ceph osd in '+id,d:'取消 out 标记，恢复 CRUSH 权重并触发回填'},
@@ -168,7 +173,7 @@ function wStepsHtml(w){return '<div class="steps">'+WSTEPS.map(function(t,i){var
 function renderWizard(){var w=state.wizard;if(!w)return;
  var o=state.osds.filter(function(x){return x.id===w.osdId;})[0]||state.osds[0],p=liveProfile(),b='',foot='';
  if(w.step===1){b='<div class="grid g2"><div><label class="fld">处置意图</label><div class="seg" style="margin-bottom:14px">'+
-   '<button class="'+(w.intent==='replace'?'on acc':'')+'" data-act="w-intent" data-value="replace">踢盘 + 换盘（保留 OSD ID）</button><button class="'+(w.intent==='remove'?'on acc':'')+'" data-act="w-intent" data-value="remove">仅踢盘退役</button></div>'+
+   '<button class="'+(w.intent==='replace'?'on acc':'')+'" data-act="w-intent" data-value="replace">换盘（保留 OSD ID）</button><button class="'+(w.intent==='remove'?'on acc':'')+'" data-act="w-intent" data-value="remove">完整退役（purge / 清盘）</button></div>'+
    '<div class="fgrp"><label class="fld">目标 OSD</label><select class="inp" data-bind="wizard.osdId">'+state.osds.map(function(x){return '<option value="'+x.id+'"'+(x.id===w.osdId?' selected':'')+'>osd.'+x.id+' · '+esc(x.host)+' · '+esc(x.dev)+' · '+(x.up?'up':'down')+'</option>';}).join('')+'</select></div>'+
    '<div class="fgrp"><label class="fld">部署方式</label><input class="inp" value="'+esc(p.orchestrator==='cephadm'&&p.caps.orch?'cephadm / orchestrator':'ceph-volume / legacy')+'" disabled></div>'+
    '<div class="hint">命令模板依据后端探测到的 Ceph 版本与命令能力自动选择，不依赖硬编码版本号。</div></div><div>'+

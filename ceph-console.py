@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -1018,10 +1018,10 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     oid = validate_target(osd_id, host, dev)
     orch = probe.caps.get("orch", False)
     purge = probe.caps.get("purge", False)
-    if intent not in ("remove", "replace", "in"):
+    if intent not in ("remove", "replace", "in", "downout"):
         raise ValueError("unknown intent: %s" % intent)
-    # Bringing an OSD back (osd in) only needs its id: no device, no host.
-    if intent != "in" and not dev and (not orch or intent == "remove"):
+    # osd in / down+out 只按 id 操作，不碰磁盘，也就不需要设备路径。
+    if intent not in ("in", "downout") and not dev and (not orch or intent == "remove"):
         raise ValueError("device path is required for this operation")
     plan = []  # (name, argv_or_None, note)
 
@@ -1075,6 +1075,15 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         elif dev:
             add("清除磁盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"])
         add("集群健康验证", ["ceph", "-s", "--format=json"])
+    elif intent == "downout":
+        # 一键踢盘的真实语义：把盘停掉并从 CRUSH 摘出，保留 OSD 身份与数据。
+        # 不走 purge / crush remove / zap —— 这些是「退役」，是不可逆的。
+        add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
+        add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
+            "从 CRUSH 摘出并触发数据回填；不 purge、不清盘，随时可 osd in 恢复")
+        add("确认 down / out 已生效", ["ceph", "osd", "tree", "--format=json"],
+            "该 OSD 应为 down 且 reweight 为 0，其它 OSD 分担其 PG")
+        add("集群健康验证", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
     elif intent == "in":
         add("确认 OSD 仍在 CRUSH map", ["ceph", "osd", "tree", "--format=json"],
             "已被 purge / rm 的 OSD 无法 in，只能重新部署")
@@ -1657,7 +1666,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/api/quick/kick", "/api/quick/replace", "/api/quick/in", "/api/execute"):
             override = None
             if path == "/api/quick/kick":
-                override = "remove"
+                # 踢盘 = down + out，不是退役；退役走 /api/quick/replace 之外的 remove 意图。
+                override = "downout"
             elif path == "/api/quick/replace":
                 override = "replace"
             elif path == "/api/quick/in":

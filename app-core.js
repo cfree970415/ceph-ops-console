@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.10-20261110';
+var UI_BUILD='1.1.13-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -198,7 +198,9 @@ var NAV=[{cap:'监控'},{v:'overview',t:'集群概览',i:'grid'},{v:'alerts',t:'
    page instead of showing fabricated numbers as if they were real. */
 function liveNoData(){return state.mode==='live'&&!!state.link&&!state.link.stateOk;}
 var CLUSTER_VIEWS=['overview','alerts','osds','pools','hosts'];
-function activeAlerts(){if(liveNoData())return [];return state.alerts.filter(function(a){return a.status!=='resolved';});}
+/* 概览只提醒「未处置」的告警：已确认 / 已静音的仍然保留在告警中心，
+   但不再反复出现在首页和角标上。 */
+function activeAlerts(){if(liveNoData())return [];return state.alerts.filter(function(a){return a.status==='active';});}
 function healthInfo(){
  if(liveNoData())return {t:'UNKNOWN',cl:'',dot:'off',txt:'数据未就绪'};
  if(state.mode==='live'&&state.cluster.health&&state.cluster.health.indexOf('HEALTH_')===0){

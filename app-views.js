@@ -2,11 +2,24 @@
 'use strict';
 function sevTag(s){return s==='critical'?'<span class="tag err">严重</span>':s==='warning'?'<span class="tag warn">警告</span>':'<span class="tag info">提示</span>';}
 function stTag(s){return {active:'<span class="tag err">活跃</span>',acked:'<span class="tag warn">已确认</span>',silenced:'<span class="tag mute">已静音</span>',resolved:'<span class="tag ok">已恢复</span>'}[s]||'';}
+/* 告警涉及的资源：OSD / 主机 / 设备盘符。后端从 health detail 文本里解析，
+   再用 osd 表补全主机与盘符，识别不出的留空，不猜。 */
+function alertAssets(a){
+ var p=[];
+ if(a.osdIds&&a.osdIds.length)p.push(a.osdIds.map(function(x){return 'osd.'+x;}).join(', '));
+ if(a.hosts&&a.hosts.length)p.push(a.hosts.join(', '));
+ if(a.devs&&a.devs.length)p.push(a.devs.join(', '));
+ return p.join(' · ');
+}
 function alertRow(a,compact){var cls=a.sev==='critical'?'c':a.sev==='warning'?'w':'i';
+ var who=(a.by&&(a.status==='acked'||a.status==='silenced'))?'<span title="处置状态保存在后端，刷新和换浏览器都不会丢">'+esc(a.by)+' '+(a.status==='acked'?'已确认':'已静音')+'</span>':'';
+ var where=alertAssets(a);
  return '<div class="alert-i"><div class="alert-ic '+cls+'">'+ic(a.sev==='info'?'info':'alert')+'</div><div style="flex:1;min-width:0"><div class="alert-tt">'+sevTag(a.sev)+esc(a.title)+stTag(a.status)+'</div>'+
-  (compact?'':'<div class="alert-ms">'+esc(a.msg)+'</div>')+'<div class="alert-meta"><span class="mono">'+a.id+'</span><span>'+esc(a.code)+'</span><span>'+esc(a.src)+'</span><span>'+ago(a.since)+'</span><span>触发 '+a.count+' 次</span></div></div>'+
+  (compact?'':'<div class="alert-ms">'+esc(a.msg)+'</div>')+'<div class="alert-meta"><span class="mono">'+a.id+'</span>'+(where?'<span class="mono" style="color:var(--text)">'+esc(where)+'</span>':'')+'<span>'+esc(a.src)+'</span><span>'+ago(a.since)+'</span><span>触发 '+a.count+' 次</span>'+who+'</div></div>'+
   (compact?'':'<div style="display:flex;gap:5px;align-items:flex-start;flex-wrap:wrap;justify-content:flex-end">'+(a.status==='active'?'<button class="btn sm" data-act="alert-ack" data-id="'+a.id+'">确认</button>':'')+
-   (a.status==='active'||a.status==='acked'?'<button class="btn sm" data-act="alert-silence" data-id="'+a.id+'">静音</button>':'')+'<button class="btn sm" data-act="alert-detail" data-id="'+a.id+'">详情</button>'+
+   (a.status==='active'||a.status==='acked'?'<button class="btn sm" data-act="alert-silence" data-id="'+a.id+'">静音</button>':'')+
+   (a.status==='acked'||a.status==='silenced'?'<button class="btn sm" data-act="alert-reopen" data-id="'+a.id+'">重新激活</button>':'')+
+   '<button class="btn sm" data-act="alert-detail" data-id="'+a.id+'">详情</button>'+
    (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',12)+'一键踢盘</button>'+
     '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button>':'')+'</div>')+'</div>';}
 function vAlerts(){var f=state.filters;
@@ -165,10 +178,10 @@ function vHosts(){var c=state.cluster;
   card('MGR 服务','<div class="stat-line"><span>active</span><b class="mono" title="当前对外提供服务的 mgr 守护进程（名称是 cephadm 的 主机名.随机后缀）">'+esc(c.mgrActive||'—')+'</b></div><div class="stat-line"><span>standby</span><b class="mono" title="热备守护进程，active 挂掉后接管；与 active 在同一台主机时不提供主机级冗余">'+(stbys.length?stbys.map(esc).join(' · '):'无')+'</b></div><div class="stat-line"><span>mgr 可用</span><b class="mono '+(c.mgrAvailable?'t':'tw')+'">'+(c.mgrAvailable?'是':'否 / 未上报')+'</b></div>')+
   card('集群标识','<div class="stat-line"><span>FSID</span><b class="mono mini">'+esc(c.fsid||'—')+'</b></div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc((c.version||'—')+' '+(c.codename||''))+'</b></div><div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy||'—')+'</b></div><div class="stat-line"><span>对象数</span><b class="mono">'+((typeof c.objects==='number')?c.objects.toLocaleString():'—')+'</b></div>')+'</div>';}
 function vAudit(){var rows=state.audit.slice().sort(function(a,b){return b.ts-a.ts;}).map(function(a){var c=a.result==='OK'?'ok':a.result==='DRY-RUN'?'warn':'err';
- return '<tr><td class="mono mini">'+dt(a.ts)+'</td><td class="mono">'+esc(a.user)+'</td><td><span class="tag '+(a.act.indexOf('OSD')>=0?'pur':'info')+'">'+esc(a.act)+'</span></td><td class="mono">'+esc(a.target)+'</td>'+
-  '<td class="mono mini" style="max-width:330px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.cmd)+'</td><td><span class="tag '+c+'">'+esc(a.result)+'</span></td><td class="tm">'+esc(a.note)+'</td></tr>';}).join('');
+ return '<tr><td class="mono mini audit-ts">'+dt(a.ts)+'</td><td class="mono">'+esc(a.user)+'</td><td><span class="tag '+(a.act.indexOf('OSD')>=0?'pur':'info')+'">'+esc(a.act)+'</span></td><td class="mono">'+esc(a.target)+'</td>'+
+  '<td class="mono mini audit-cmd" title="'+esc(a.cmd)+'">'+esc(a.cmd)+'</td><td><span class="tag '+c+'">'+esc(a.result)+'</span></td><td class="tm audit-note" title="'+esc(a.note)+'">'+esc(a.note)+'</td></tr>';}).join('');
  return pageH('变更审计','所有踢盘 / 换盘 / 配置变更均留痕，含执行命令与结果','<button class="btn" data-act="export-audit">'+ic('file',14)+' 导出 JSONL</button>')+
-  card('审计日志','<div class="tbl-wrap"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>命令 / 参数</th><th>结果</th><th>备注</th></tr></thead><tbody>'+rows+'</tbody></table></div>','<span class="tag mute">'+state.audit.length+' 条记录</span>',false)+
+  card('审计日志','<div class="tbl-wrap"><table class="audit-tbl"><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>命令 / 参数</th><th>结果</th><th>备注</th></tr></thead><tbody>'+rows+'</tbody></table></div>','<span class="tag mute">'+state.audit.length+' 条记录</span>',false)+
   '';}
 
 /* ---- deploy ---- */

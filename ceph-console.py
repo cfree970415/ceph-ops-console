@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.10"
+VERSION = "1.1.13"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -53,6 +53,11 @@ HISTORY_PATH = "/var/lib/ceph-console/history.jsonl"
 HISTORY_WINDOW = 24 * 3600
 HISTORY_STEP = 60
 HISTORY_MAX_POINTS = 24 * 60 + 60
+# Alert lifecycle. One health check = one alert until it actually clears.
+# Kept on disk so an acknowledged alert stays acknowledged across restarts.
+ALERT_STATE_PATH = "/var/lib/ceph-console/alerts.json"
+ALERT_RESOLVE_TTL = 2 * 3600      # keep resolved rows this long for review
+ALERT_SILENCE_DEFAULT = 60        # minutes
 SESSION_TTL = 8 * 3600
 LOGIN_WINDOW = 300
 LOGIN_MAX_FAIL = 5
@@ -1210,28 +1215,268 @@ def read_osds(cfg):
     return out
 
 
-def read_alerts(cfg, settings):
+# --------------------------------------------------------------------------
+# alert lifecycle
+#   `health detail` 是「当前状态快照」，每 20 秒重算一次。早前直接把它当告警
+#   列表返回，since 每次都是「现在」、status 每次都是 active —— 页面于是像
+#   「每刷新一次就冒出一条新告警」，用户点确认也会在下一轮被覆盖回去。
+#   现在按 health check code 归并：同一问题只有一条，首次发现时间、累计发作
+#   次数、确认 / 静音状态都保留，并落盘到 alerts.json（重启不丢）。
+# --------------------------------------------------------------------------
+_ALERT_LOCK = threading.Lock()
+_ALERT_STATE = {}
+_ALERT_LOADED = {"done": False, "path": ""}
+
+
+def alert_state_path(cfg):
+    raw = (getattr(cfg, "alert_file", "") or os.environ.get("CEPH_CONSOLE_ALERTS", "")
+           or ALERT_STATE_PATH)
+    folder = os.path.dirname(raw) or "."
+    try:
+        if not os.path.isdir(folder):
+            os.makedirs(folder, 0o755)
+        return raw
+    except OSError:
+        return os.path.join(getattr(cfg, "dir", HERE) or HERE, "alerts.json")
+
+
+def alert_state_load(cfg):
+    if _ALERT_LOADED["done"]:
+        return
+    _ALERT_LOADED["done"] = True
+    _ALERT_LOADED["path"] = alert_state_path(cfg)
+    try:
+        with open(_ALERT_LOADED["path"], "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict):
+            for k, v in doc.items():
+                if isinstance(v, dict):
+                    _ALERT_STATE[str(k)] = v
+    except (IOError, OSError, ValueError):
+        pass
+
+
+def alert_state_save(cfg):
+    path = _ALERT_LOADED["path"] or alert_state_path(cfg)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_ALERT_STATE, f, ensure_ascii=False)
+        if hasattr(os, "replace"):
+            os.replace(tmp, path)
+        else:
+            os.rename(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except (IOError, OSError):
+        pass
+
+
+def _alert_key(code):
+    """同一个 health check 只对应一个 key，ceph 的 check code 本身是稳定的
+    （OSD_DOWN / PG_DEGRADED / MON_CLOCK_SKEW…），不会每轮采集换一个。"""
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(code or "")).upper()[:48] or "UNKNOWN"
+
+
+def _alert_live_status(item, now_s):
+    st = item.get("status") or "active"
+    if st == "silenced" and int(item.get("until") or 0) and int(item["until"]) <= now_s:
+        return "active"
+    return st
+
+
+# health detail 里只有 detail 文本带具体对象，例如
+#   "osd.1 is down" / "host 'ceph-node-2' (root=default) is down"
+#   "Device /dev/nvme0n2 is expected to fail soon" / "acting [0,1]"
+_ALERT_OSD_RE = re.compile(r"\bosd[. ](\d+)\b")
+_ALERT_HOST_RE = re.compile(r"\bhost '([^']{1,64})'")
+_ALERT_DEV_RE = re.compile(r"(/dev/[A-Za-z0-9/_.\-]{1,64})")
+_ALERT_ACTING_RE = re.compile(r"acting \[([0-9,\s]{1,64})\]")
+
+
+def alert_assets(texts, osds=None):
+    """从告警文本认出 osd / 主机 / 设备盘符，再用 osd 表补全主机与盘符。
+    认不出来就留空，不用推测值填空。"""
+    osd_ids, hosts, devs = [], [], []
+
+    def add(seq, v):
+        if v and v not in seq:
+            seq.append(v)
+
+    for t in texts:
+        if not t:
+            continue
+        for m in _ALERT_OSD_RE.finditer(str(t)):
+            try:
+                add(osd_ids, int(m.group(1)))
+            except ValueError:
+                pass
+        for m in _ALERT_HOST_RE.finditer(str(t)):
+            add(hosts, m.group(1))
+        for m in _ALERT_DEV_RE.finditer(str(t)):
+            add(devs, m.group(1))
+    # PG 类告警没有 osd.N 字样，退化取 acting 列表（只取第一条 PG 的）
+    if not osd_ids:
+        for t in texts:
+            m = _ALERT_ACTING_RE.search(str(t or ""))
+            if m:
+                for x in re.split(r"[,\s]+", m.group(1)):
+                    if x.isdigit():
+                        add(osd_ids, int(x))
+                break
+    by_id = {}
+    for o in (osds or []):
+        if isinstance(o, dict) and o.get("id") is not None:
+            by_id[o["id"]] = o
+    for oid in list(osd_ids):
+        o = by_id.get(oid) or {}
+        add(hosts, o.get("host") or "")
+        add(devs, o.get("dev") or "")
+    # 只认到盘符时，用 osd 表按设备反查主机（DEVICE_HEALTH 这类告警没有 host 字样）
+    if devs and not hosts:
+        for o in (osds or []):
+            if isinstance(o, dict) and o.get("dev") in devs and o.get("host"):
+                add(hosts, o["host"])
+    return osd_ids[:12], hosts[:8], devs[:8]
+
+
+def read_alerts(cfg, settings, osds=None):
+    """当前 health check → 告警列表；同一 code 一条，状态跨刷新保持。"""
     if cfg.backend == "rest":
         return []
     doc, err = ceph_json(cfg, ["health", "detail"])
     if doc is None:
         return []
     checks = doc.get("checks", {}) or {}
-    out = []
-    for code, c in checks.items():
-        if not isinstance(c, dict):
-            continue
-        sev_num = c.get("severity", "")
-        sev = "warning" if "WARN" in str(sev_num).upper() else "info"
-        summary = c.get("summary", {}) or {}
-        msg = summary.get("message", code) if isinstance(summary, dict) else str(summary)
-        detail = c.get("detail", []) or []
-        out.append({"id": "H-" + re.sub(r"[^A-Z0-9_]", "", code.upper())[:12],
-                    "sev": sev, "code": code, "title": msg,
-                    "msg": " ".join(str(x.get("message", "")) if isinstance(x, dict) else str(x) for x in detail[:3]),
-                    "src": "ceph health detail", "osd": None,
-                    "since": int(time.time() * 1000), "status": "active", "count": 1})
-    return out
+    now_s = int(time.time())
+    now_ms = now_s * 1000
+    changed = False
+    with _ALERT_LOCK:
+        alert_state_load(cfg)
+        # 静音到期自动恢复为活跃，不需要用户再点一次。
+        for item in _ALERT_STATE.values():
+            if (item.get("status") or "") == "silenced" \
+                    and int(item.get("until") or 0) and int(item["until"]) <= now_s:
+                item["status"] = "active"
+                changed = True
+        seen = set()
+        for code, c in checks.items():
+            if not isinstance(c, dict):
+                continue
+            key = _alert_key(code)
+            seen.add(key)
+            snum = str(c.get("severity", "")).upper()
+            # HEALTH_ERR 必须算严重：早前只判 WARN，ERR 反而落进「提示」。
+            sev = "critical" if ("ERR" in snum or "CRIT" in snum) else (
+                "warning" if "WARN" in snum else "info")
+            summary = c.get("summary", {}) or {}
+            msg = summary.get("message", code) if isinstance(summary, dict) else str(summary)
+            detail = c.get("detail", []) or []
+            body = " ".join(str(x.get("message", "")) if isinstance(x, dict) else str(x)
+                            for x in detail[:3])
+            item = _ALERT_STATE.get(key)
+            osd_ids, hosts, devs = alert_assets([msg, body], osds)
+            if item is None:
+                # 首次发现：这才是唯一「产生一条新告警」的时机。
+                item = {"key": key, "code": code, "first": now_ms, "last": now_ms,
+                        "count": 1, "status": "active", "by": "", "until": 0,
+                        "resolvedAt": 0, "sev": sev, "title": msg, "msg": body,
+                        "osdIds": osd_ids, "hosts": hosts, "devs": devs}
+                _ALERT_STATE[key] = item
+                changed = True
+            else:
+                if (item.get("status") or "") == "resolved":
+                    # 恢复之后再次出现：算同一问题的新一次发作，累计次数累加，
+                    # 「首次发现」重置为本次发作时间。
+                    item["count"] = int(item.get("count") or 1) + 1
+                    item["first"] = now_ms
+                    item["resolvedAt"] = 0
+                    item["status"] = ("silenced" if int(item.get("until") or 0) > now_s
+                                      else "active")
+                    changed = True
+                item["last"] = now_ms
+                item["sev"] = sev
+                item["title"] = msg
+                item["msg"] = body
+                item["code"] = code
+                # 设备可能刚刚才被 metadata 采到，有值就刷新，没值不覆盖旧值
+                if osd_ids or hosts or devs:
+                    item["osdIds"] = osd_ids or item.get("osdIds") or []
+                    item["hosts"] = hosts or item.get("hosts") or []
+                    item["devs"] = devs or item.get("devs") or []
+        # 已经不在 health detail 里的：标恢复，过了保留期再删掉。
+        for key in list(_ALERT_STATE.keys()):
+            if key in seen:
+                continue
+            item = _ALERT_STATE[key]
+            if (item.get("status") or "") != "resolved":
+                item["status"] = "resolved"
+                item["resolvedAt"] = now_ms
+                item["last"] = now_ms
+                changed = True
+            elif now_s - int(item.get("resolvedAt") or 0) // 1000 > ALERT_RESOLVE_TTL:
+                _ALERT_STATE.pop(key, None)
+                changed = True
+        if changed:
+            alert_state_save(cfg)
+        rows = []
+        for key, item in _ALERT_STATE.items():
+            oids = [x for x in (item.get("osdIds") or []) if isinstance(x, int)]
+            rows.append({"id": "H-" + key,
+                         "sev": item.get("sev") or "warning",
+                         "code": item.get("code") or key,
+                         "title": item.get("title") or key,
+                         "msg": item.get("msg") or "",
+                         "src": "ceph health detail",
+                         "osd": oids[0] if oids else None,
+                         "osdIds": oids,
+                         "hosts": list(item.get("hosts") or []),
+                         "devs": list(item.get("devs") or []),
+                         "since": int(item.get("first") or now_ms),
+                         "status": _alert_live_status(item, now_s),
+                         "count": int(item.get("count") or 1),
+                         "by": item.get("by") or "",
+                         "until": int(item.get("until") or 0)})
+    stat_rank = {"active": 0, "acked": 1, "silenced": 2, "resolved": 3}
+    sev_rank = {"critical": 0, "warning": 1, "info": 2}
+    rows.sort(key=lambda r: (stat_rank.get(r["status"], 4), sev_rank.get(r["sev"], 3), -r["since"]))
+    return rows
+
+
+def alert_ack(cfg, aid, action, by="", minutes=0):
+    """确认 / 静音 / 重新激活 / 手动标恢复。只改控制台侧状态，不碰集群。"""
+    key = str(aid or "").strip()
+    if key.upper().startswith("H-"):
+        key = key[2:]
+    key = _alert_key(key)
+    now_s = int(time.time())
+    with _ALERT_LOCK:
+        alert_state_load(cfg)
+        item = _ALERT_STATE.get(key)
+        if item is None:
+            return {"ok": False, "error": "告警不存在或已过保留期（%s）" % key}
+        if action == "ack":
+            item["status"] = "acked"
+            item["by"] = by
+        elif action == "silence":
+            item["status"] = "silenced"
+            item["by"] = by
+            item["until"] = now_s + max(5, int(minutes or ALERT_SILENCE_DEFAULT)) * 60
+        elif action == "reopen":
+            item["status"] = "active"
+            item["by"] = ""
+            item["until"] = 0
+        elif action == "resolve":
+            item["status"] = "resolved"
+            item["resolvedAt"] = now_s * 1000
+        else:
+            return {"ok": False, "error": "未知操作 %s" % action}
+        alert_state_save(cfg)
+        return {"ok": True, "id": "H-" + key, "status": item["status"],
+                "until": int(item.get("until") or 0), "by": item.get("by") or "",
+                "count": int(item.get("count") or 1)}
 
 
 def _int_or_none(v):
@@ -1636,8 +1881,10 @@ def read_state(cfg, probe, settings):
     # 依赖内置演示值 "6 个池"。
     if cfg.backend == "cli" and not cluster.get("error") and isinstance(pools, list):
         cluster["pools"] = len(pools)
-    return {"cluster": cluster, "osds": read_osds(cfg),
-            "alerts": read_alerts(cfg, settings), "pools": pools,
+    # OSD 只取一次：告警要按 osd 编号反查主机与设备盘符，不能再跑一遍命令。
+    osds = read_osds(cfg)
+    return {"cluster": cluster, "osds": osds,
+            "alerts": read_alerts(cfg, settings, osds), "pools": pools,
             "hosts": read_hosts(cfg, cluster), "profile": probe.as_dict(),
             # 阈值来自后端配置文件，前端不再用自己的演示默认值 85/95。
             "settings": {"nearfull": settings.get("nearfull"),
@@ -2613,7 +2860,37 @@ class Handler(BaseHTTPRequestHandler):
                            "dry_run": dry, "version": self.probe.version,
                            "orchestrator": self.probe.orchestrator})
 
+    def _alert_ack(self, body):
+        """确认 / 静音告警。状态存在后端，刷新页面和换浏览器都保持，
+        不会下一轮采集又被 health detail 覆盖成「未处置」。"""
+        if not self._authorized():
+            return self._auth_error()
+        s = self._session()
+        if s is not None and s.get("role") != "admin":
+            return self._json({"error": "viewer role cannot acknowledge alerts"}, 403)
+        aid = str(body.get("id", "") or "")
+        action = str(body.get("action", "ack") or "ack")
+        try:
+            minutes = int(body.get("minutes") or ALERT_SILENCE_DEFAULT)
+        except (TypeError, ValueError):
+            minutes = ALERT_SILENCE_DEFAULT
+        res = alert_ack(self.cfg, aid, action, self._user(), minutes)
+        if not res.get("ok"):
+            return self._json(res, 404)
+        audit({"ack": "ALERT_ACK", "silence": "ALERT_SILENCE",
+               "reopen": "ALERT_REOPEN", "resolve": "ALERT_RESOLVE"}.get(action, "ALERT_ACK"),
+              aid, "-", "OK",
+              "status=%s by=%s%s" % (res["status"], self._user(),
+                                     (" until_ts=%s" % res["until"]) if res.get("until") else ""),
+              self._client(), self._user())
+        # 让下一次 /api/state 重新取告警（否则还是旧的 active 快照）。
+        _STATE_CACHE["data"] = None
+        _STATE_CACHE["ts"] = 0
+        return self._json({"ok": True, "alert": res})
+
     def api_post(self, path, body):
+        if path == "/api/alert/ack":
+            return self._alert_ack(body)
         if path == "/api/password":
             return self.api_password(body)
         if path == "/api/pool/plan":

@@ -22,13 +22,41 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
   '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
   '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
+/* 告警确认 / 静音 / 重新激活：处置状态存后端，刷新页面、换浏览器都保持；
+   离线（demo）模式没有后端可写，只改本地状态，不假装调用成功。 */
+/* 处置后如果详情弹窗还开着，就地刷新，否则按钮状态和列表对不上。 */
+function refreshAlertDetail(id){
+ var r=document.getElementById('modal-root');
+ if(r&&r.innerHTML&&r.innerHTML.indexOf('告警详情')>=0)alertDetail(id);
+}
+function alertAction(a,action,okMsg){
+ var ACT={ack:'ALERT_ACK',silence:'ALERT_SILENCE',reopen:'ALERT_REOPEN'}[action]||'ALERT_ACK';
+ function local(){
+  a.status=action==='ack'?'acked':action==='silence'?'silenced':'active';
+  a.until=action==='silence'?Math.floor(Date.now()/1000)+3600:0;
+  addAudit(ACT,a.id,'-',okMsg);render();refreshAlertDetail(a.id);toast(okMsg,'ok');}
+ if(state.mode!=='live'||!state.auth.authenticated){local();return;}
+ apiFetch('POST','/api/alert/ack',{id:a.id,action:action,minutes:60}).then(function(r){
+  var e=(r&&r.alert)||{};
+  if(e.status)a.status=e.status;
+  a.by=e.by||a.by||'';a.until=e.until||0;
+  /* 后端已经写过一条审计 jsonl，这里不再 addAudit，否则同一条显示两遍。 */
+  render();refreshAlertDetail(a.id);toast(okMsg,'ok');
+ }).catch(function(err){toast('操作失败：'+((err&&err.message)||'后端未响应'),'e');});
+}
 function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)return;
  var body='<div class="flex" style="gap:10px;margin-bottom:14px">'+sevTag(a.sev)+stTag(a.status)+'<span class="tag mute mono">'+a.id+'</span></div>'+
   '<div style="font-size:15px;font-weight:650;margin-bottom:10px">'+esc(a.title)+'</div><div class="note" style="font-size:12.5px;color:var(--muted);margin-bottom:16px">'+esc(a.msg)+'</div>'+
-  '<div class="grid g2"><div><div class="stat-line"><span>告警代码</span><b class="mono">'+a.code+'</b></div><div class="stat-line"><span>来源</span><b class="mono">'+esc(a.src)+'</b></div><div class="stat-line"><span>首次出现</span><b class="mono">'+dt(a.since)+'</b></div></div>'+
-  '<div><div class="stat-line"><span>持续</span><b>'+ago(a.since).replace('前','')+'</b></div><div class="stat-line"><span>触发次数</span><b class="mono">'+a.count+'</b></div><div class="stat-line"><span>关联 OSD</span><b class="mono">'+(a.osd!=null?'osd.'+a.osd:'-')+'</b></div></div></div>'+
+  '<div class="grid g2"><div><div class="stat-line"><span>告警代码</span><b class="mono">'+a.code+'</b></div><div class="stat-line"><span>来源</span><b class="mono">'+esc(a.src)+'</b></div><div class="stat-line"><span>首次出现</span><b class="mono">'+dt(a.since)+'</b></div><div class="stat-line"><span>处置人</span><b class="mono">'+(a.by?esc(a.by):'—')+'</b></div></div>'+
+  '<div><div class="stat-line"><span>持续</span><b>'+ago(a.since).replace('前','')+'</b></div><div class="stat-line"><span>触发次数</span><b class="mono">'+a.count+'</b></div>'+
+  '<div class="stat-line"><span>涉及 OSD</span><b class="mono">'+((a.osdIds&&a.osdIds.length)?a.osdIds.map(function(x){return 'osd.'+x;}).join(', '):'—')+'</b></div>'+
+  '<div class="stat-line"><span>涉及主机</span><b class="mono">'+((a.hosts&&a.hosts.length)?esc(a.hosts.join(', ')):'—')+'</b></div>'+
+  '<div class="stat-line"><span>涉及设备</span><b class="mono">'+((a.devs&&a.devs.length)?esc(a.devs.join(', ')):'—')+'</b></div></div></div>'+
   '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 先置 DOWN 停止服务，再 OUT 摘盘（或直接用页面上的「一键踢盘」）\nceph osd down '+a.osd+'\nceph osd out '+a.osd+'\n# 3. 观察回填至 active+clean；维护结束后可用「一键 IN 盘」恢复':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
- openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div><button class="btn" data-act="modal-close">关闭</button>'+
+ openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
+  (a.status==='active'?'<button class="btn" data-act="alert-ack" data-id="'+a.id+'">确认告警</button><button class="btn" data-act="alert-silence" data-id="'+a.id+'">静音 60 分钟</button>':'')+
+  (a.status==='acked'||a.status==='silenced'?'<button class="btn" data-act="alert-reopen" data-id="'+a.id+'">重新激活</button>':'')+
+  '<button class="btn" data-act="modal-close">关闭</button>'+
   (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',13)+'一键踢盘</button>'+
    '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+a.osd+'">'+ic('zap',13)+'一键换盘</button>':'')+'</div>','md');}
 
@@ -140,9 +168,19 @@ function syncState(force){
   if(!err&&Array.isArray(d.osds))state.osds=d.osds.map(function(o){
    return {id:o.id,host:o.host||'',dev:o.dev||'',type:o.type||'SSD',size:o.size||0,used:o.used||0,
     up:o.up!==false,inn:o.inn!==false,pgs:o.pgs||0,weight:o.weight||1,smart:o.smart||'',serial:o.serial||''};});
-  if(!err&&Array.isArray(d.alerts))state.alerts=d.alerts.map(function(a){
-   return {id:a.id||uid(),sev:a.sev||'warning',code:a.code||'HEALTH_CHECK',title:a.title||a.code||'告警',
-    msg:a.msg||'',src:a.src||'ceph',osd:a.osd==null?null:a.osd,since:a.since||Date.now(),status:a.status||'active',count:a.count||1};});
+  if(!err&&Array.isArray(d.alerts)){
+   /* 后端已按 health check 归并成一条，这里再兜一层：同 id 沿用本地记录的
+      since / status，避免某次响应字段缺失把「已确认」冲回 active。 */
+   var prevA={};state.alerts.forEach(function(a){prevA[a.id]=a;});
+   state.alerts=d.alerts.map(function(a){
+    var p=prevA[a.id]||{};
+    return {id:a.id||uid(),sev:a.sev||'warning',code:a.code||'HEALTH_CHECK',title:a.title||a.code||'告警',
+     msg:a.msg||'',src:a.src||'ceph',osd:a.osd==null?null:a.osd,
+     osdIds:Array.isArray(a.osdIds)?a.osdIds:[],hosts:Array.isArray(a.hosts)?a.hosts:[],
+     devs:Array.isArray(a.devs)?a.devs:[],
+     since:a.since||p.since||Date.now(),status:a.status||p.status||'active',
+     count:a.count||p.count||1,by:a.by||'',until:a.until||0};});
+  }
   if(!err&&Array.isArray(d.pools))state.pools=d.pools;
   if(!err&&Array.isArray(d.hosts))state.hosts=d.hosts.map(function(h){
    return {name:h.name||'',ip:h.ip||'',mons:!!h.mons,mgr:!!h.mgr,osds:h.osds||0,up:h.up||0,
@@ -309,8 +347,15 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
   case 'refresh':state.lastRefresh=Date.now();if(state.mode==='live')testConn();else render();toast('已刷新','ok');break;
   case 'modal-close':closeModal();break;
   case 'overlay':case 'w-close':return;
-  case 'alert-ack':{var a=state.alerts.filter(function(x){return x.id===id;})[0];if(a){a.status='acked';addAudit('ALERT_ACK',a.id,'-','确认告警');render();toast('告警已确认','ok');}break;}
-  case 'alert-silence':{var a2=state.alerts.filter(function(x){return x.id===id;})[0];if(a2){a2.status='silenced';addAudit('ALERT_SILENCE',a2.id,'-','静音告警');render();toast('告警已静音','ok');}break;}
+  case 'alert-ack':{
+   var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)break;
+   alertAction(a,'ack','告警已确认，同一问题不再重复提示');break;}
+  case 'alert-silence':{
+   var a2=state.alerts.filter(function(x){return x.id===id;})[0];if(!a2)break;
+   alertAction(a2,'silence','告警已静音 60 分钟');break;}
+  case 'alert-reopen':{
+   var a3=state.alerts.filter(function(x){return x.id===id;})[0];if(!a3)break;
+   alertAction(a3,'reopen','告警已重新激活');break;}
   case 'alert-detail':alertDetail(id);break;
   case 'osd-detail':osdDetail(id);break;
   case 'osd-out':osdMark(id,false);break;

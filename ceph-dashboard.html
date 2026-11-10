@@ -44,6 +44,17 @@ button,input,select,textarea{font:inherit;color:inherit}button{cursor:pointer;ba
 .btn-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.flex{display:flex;align-items:center;gap:10px}
 table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;padding:10px 12px;color:var(--faint);font-weight:600;font-size:10.5px;letter-spacing:.7px;text-transform:uppercase;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--panel2)}
 td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle}tr:last-child td{border-bottom:none}tbody tr:hover{background:var(--panel2)}.tbl-wrap{overflow-x:auto}
+/* 审计表：固定布局 + 明确列宽，时间列不再被挤压换行，备注列也不会撑破卡片 */
+.audit-tbl{table-layout:fixed;min-width:940px}
+.audit-tbl th:nth-child(1){width:160px}
+.audit-tbl th:nth-child(2){width:94px}
+.audit-tbl th:nth-child(3){width:114px}
+.audit-tbl th:nth-child(4){width:86px}
+.audit-tbl th:nth-child(5){width:330px}
+.audit-tbl th:nth-child(6){width:84px}
+.audit-tbl .audit-ts{white-space:nowrap;color:var(--muted)}
+.audit-tbl td:nth-child(2),.audit-tbl td:nth-child(4){white-space:nowrap}
+.audit-tbl .audit-cmd,.audit-tbl .audit-note{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tag{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:5px;font-size:10.5px;font-weight:650;white-space:nowrap;border:1px solid transparent}
 .tag.ok{color:var(--ok);background:rgba(47,216,165,.1);border-color:rgba(47,216,165,.25)}.tag.warn{color:var(--warn);background:rgba(255,181,71,.1);border-color:rgba(255,181,71,.25)}.tag.err{color:var(--danger);background:rgba(255,91,110,.1);border-color:rgba(255,91,110,.25)}
 .tag.info{color:var(--info);background:rgba(77,163,255,.1);border-color:rgba(77,163,255,.25)}.tag.mute{color:var(--muted);background:var(--panel3);border-color:var(--border)}.tag.pur{color:var(--purple);background:rgba(167,139,250,.1);border-color:rgba(167,139,250,.25)}
@@ -101,9 +112,9 @@ label.fld{display:block;font-size:11px;color:var(--muted);margin-bottom:6px;font
   <div class="main"><header class="topbar" id="topbar"></header><main class="content" id="content"></main></div>
 </div>
 <div id="modal-root"></div><div id="toast-root"></div><div id="auth-root"></div>
-<script src="app-core.js?v=1.1.10"></script>
-<script src="app-views.js?v=1.1.10"></script>
-<script src="app-wizard.js?v=1.1.10"></script>
-<script src="app-live.js?v=1.1.10"></script>
+<script src="app-core.js?v=1.1.13"></script>
+<script src="app-views.js?v=1.1.13"></script>
+<script src="app-wizard.js?v=1.1.13"></script>
+<script src="app-live.js?v=1.1.13"></script>
 </body>
 </html>

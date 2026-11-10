@@ -21,7 +21,7 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
  openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host||'—')+' · '+esc(o.dev||'—'))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
-  '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
+  '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
 /* 告警确认 / 静音 / 重新激活：处置状态存后端，刷新页面、换浏览器都保持；
    离线（demo）模式没有后端可写，只改本地状态，不假装调用成功。 */
 /* 处置后如果详情弹窗还开着，就地刷新，否则按钮状态和列表对不上。 */
@@ -52,13 +52,11 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
   '<div class="stat-line"><span>涉及 OSD</span><b class="mono">'+((a.osdIds&&a.osdIds.length)?a.osdIds.map(function(x){return 'osd.'+x;}).join(', '):'—')+'</b></div>'+
   '<div class="stat-line"><span>涉及主机</span><b class="mono">'+((a.hosts&&a.hosts.length)?esc(a.hosts.join(', ')):'—')+'</b></div>'+
   '<div class="stat-line"><span>涉及设备</span><b class="mono">'+((a.devs&&a.devs.length)?esc(a.devs.join(', ')):'—')+'</b></div></div></div>'+
-  '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 先置 DOWN 停止服务，再 OUT 摘盘（或直接用页面上的「一键踢盘」）\nceph osd down '+a.osd+'\nceph osd out '+a.osd+'\n# 3. 观察回填至 active+clean；维护结束后可用「一键 IN 盘」恢复':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
+  '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 先置 DOWN 停止服务，再 OUT 摘盘（也可在 OSD 页面执行「一键踢盘」）\nceph osd down '+a.osd+'\nceph osd out '+a.osd+'\n# 3. 观察回填至 active+clean；维护结束后再 IN 恢复':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
  openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   (a.status==='active'?'<button class="btn" data-act="alert-ack" data-id="'+a.id+'">确认告警</button><button class="btn" data-act="alert-silence" data-id="'+a.id+'">静音 60 分钟</button>':'')+
   (a.status==='acked'||a.status==='silenced'?'<button class="btn" data-act="alert-reopen" data-id="'+a.id+'">重新激活</button>':'')+
-  '<button class="btn" data-act="modal-close">关闭</button>'+
-  (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',13)+'一键踢盘</button>'+
-   '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+a.osd+'">'+ic('zap',13)+'一键换盘</button>':'')+'</div>','md');}
+  '<button class="btn" data-act="modal-close">关闭</button>'+'</div>','md');}
 
 /* ---------- command plan / preflight ---------- */
 function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cephadm'&&p.caps.orch,rep=w.intent==='replace',s=[];

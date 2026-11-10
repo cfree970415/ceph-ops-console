@@ -19,9 +19,7 @@ function alertRow(a,compact){var cls=a.sev==='critical'?'c':a.sev==='warning'?'w
   (compact?'':'<div style="display:flex;gap:5px;align-items:flex-start;flex-wrap:wrap;justify-content:flex-end">'+(a.status==='active'?'<button class="btn sm" data-act="alert-ack" data-id="'+a.id+'">确认</button>':'')+
    (a.status==='active'||a.status==='acked'?'<button class="btn sm" data-act="alert-silence" data-id="'+a.id+'">静音</button>':'')+
    (a.status==='acked'||a.status==='silenced'?'<button class="btn sm" data-act="alert-reopen" data-id="'+a.id+'">重新激活</button>':'')+
-   '<button class="btn sm" data-act="alert-detail" data-id="'+a.id+'">详情</button>'+
-   (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',12)+'一键踢盘</button>'+
-    '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button>':'')+'</div>')+'</div>';}
+   '<button class="btn sm" data-act="alert-detail" data-id="'+a.id+'">详情</button>'+'</div>')+'</div>';}
 function vAlerts(){var f=state.filters;
  var list=state.alerts.filter(function(a){if(f.alertSev!=='all'&&a.sev!==f.alertSev)return false;if(f.alertStatus!=='all'&&a.status!==f.alertStatus)return false;
   if(f.alertQ&&(a.title+a.msg+a.code+a.src+a.id).toLowerCase().indexOf(f.alertQ.toLowerCase())<0)return false;return true;});
@@ -38,16 +36,9 @@ function vAlerts(){var f=state.filters;
  var statsHtml='<div class="grid g4" style="margin-bottom:14px">'+
   [['严重告警',c,'td','alert'],['警告',w,'tw','alert'],['提示',i,'ti','info'],['已恢复',resolved,'t','check']].map(function(x){
    return '<div class="qstat">'+ic(x[3],20)+'<div><div class="v '+x[2]+'">'+x[1]+'</div><div class="l">'+x[0]+'</div></div></div>';}).join('')+'</div>';
- var faultAlerts=state.alerts.filter(function(a){return a.osd!=null&&a.status!=='resolved'&&(a.sev==='critical'||a.code==='SMART_FAIL'||a.code==='OSD_DOWN');});
- var faultCard=faultAlerts.length?card('待处置故障盘 · 从告警页直接一键操作',
-  faultAlerts.slice(0,6).map(function(a){var o=state.osds.filter(function(x){return x.id===a.osd;})[0]||{};
-   return '<div class="stat-line"><span>'+sevTag(a.sev)+' <b class="mono">osd.'+a.osd+'</b> <span class="tm">'+esc(o.host||'')+' · '+esc(o.dev||'')+' · '+esc(a.title)+'</span></span>'+
-   '<span class="btn-row" style="flex-wrap:nowrap"><button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',12)+'一键踢盘</button>'+
-   '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button></span></div>';}).join(''),
-  '<span class="tag err">'+faultAlerts.length+' 块待处置</span>',false):'';
  var nh=notify.map(function(n){return '<div class="setrow"><div><div class="l">'+n[1]+'</div><div class="d">'+n[2]+'</div></div><button class="switch '+(state.settings[n[0]]?'on':'')+'" data-act="toggle" data-key="settings.'+n[0]+'"></button></div>';}).join('');
- return pageH('告警中心 · 查看与处置','实时监控告警 · 分级查看 / 确认 / 静音 · 一键踢盘换盘','<button class="btn" data-act="refresh">'+ic('refresh',14)+' 刷新告警</button><button class="btn pri" data-act="nav" data-view="settings">'+ic('settings',14)+' 阈值设置</button>')+
-   statsHtml+faultCard+filter+card('告警列表',list.length?list.map(function(a){return alertRow(a);}).join(''):'<div class="empty">当前筛选条件下没有告警</div>','',false)+
+ return pageH('告警中心 · 查看与处置','实时监控告警 · 分级查看 / 确认 / 静音','<button class="btn" data-act="refresh">'+ic('refresh',14)+' 刷新告警</button><button class="btn pri" data-act="nav" data-view="settings">'+ic('settings',14)+' 阈值设置</button>')+
+   statsHtml+filter+card('告警列表',list.length?list.map(function(a){return alertRow(a);}).join(''):'<div class="empty">当前筛选条件下没有告警</div>','',false)+
   '<div class="grid g2" style="margin-top:14px">'+card('告警规则',ruleTbl,'',false)+card('通知渠道',nh+'<div class="fgrp" style="margin-top:14px"><label class="fld">Webhook 地址</label><input class="inp" data-bind="settings.webhook" value="'+esc(state.settings.webhook)+'" placeholder="https://alert.example.com/hook"></div>')+'</div>';}
 
 /* ---- OSD ---- */

@@ -8,7 +8,7 @@ function alertRow(a,compact){var cls=a.sev==='critical'?'c':a.sev==='warning'?'w
   (compact?'':'<div style="display:flex;gap:5px;align-items:flex-start;flex-wrap:wrap;justify-content:flex-end">'+(a.status==='active'?'<button class="btn sm" data-act="alert-ack" data-id="'+a.id+'">确认</button>':'')+
    (a.status==='active'||a.status==='acked'?'<button class="btn sm" data-act="alert-silence" data-id="'+a.id+'">静音</button>':'')+'<button class="btn sm" data-act="alert-detail" data-id="'+a.id+'">详情</button>'+
    (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',12)+'一键踢盘</button>'+
-    '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button>':'')+'</div>')+'</div>';}
+    '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button>':'')+'</div>')+'</div>';}
 function vAlerts(){var f=state.filters;
  var list=state.alerts.filter(function(a){if(f.alertSev!=='all'&&a.sev!==f.alertSev)return false;if(f.alertStatus!=='all'&&a.status!==f.alertStatus)return false;
   if(f.alertQ&&(a.title+a.msg+a.code+a.src+a.id).toLowerCase().indexOf(f.alertQ.toLowerCase())<0)return false;return true;});
@@ -30,7 +30,7 @@ function vAlerts(){var f=state.filters;
   faultAlerts.slice(0,6).map(function(a){var o=state.osds.filter(function(x){return x.id===a.osd;})[0]||{};
    return '<div class="stat-line"><span>'+sevTag(a.sev)+' <b class="mono">osd.'+a.osd+'</b> <span class="tm">'+esc(o.host||'')+' · '+esc(o.dev||'')+' · '+esc(a.title)+'</span></span>'+
    '<span class="btn-row" style="flex-wrap:nowrap"><button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',12)+'一键踢盘</button>'+
-   '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button></span></div>';}).join(''),
+   '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+a.osd+'">'+ic('zap',12)+'一键换盘</button></span></div>';}).join(''),
   '<span class="tag err">'+faultAlerts.length+' 块待处置</span>',false):'';
  var nh=notify.map(function(n){return '<div class="setrow"><div><div class="l">'+n[1]+'</div><div class="d">'+n[2]+'</div></div><button class="switch '+(state.settings[n[0]]?'on':'')+'" data-act="toggle" data-key="settings.'+n[0]+'"></button></div>';}).join('');
  return pageH('告警中心 · 查看与处置','实时监控告警 · 分级查看 / 确认 / 静音 · 一键踢盘换盘','<button class="btn" data-act="refresh">'+ic('refresh',14)+' 刷新告警</button><button class="btn pri" data-act="nav" data-view="settings">'+ic('settings',14)+' 阈值设置</button>')+
@@ -59,7 +59,7 @@ function osdRow(o){var s=osdStatus(o),hasCap=o.size>0,p=pct(o.used,o.size),pc=p>
  '<td><div class="btn-row" style="flex-wrap:nowrap;gap:5px"><button class="btn sm" data-act="osd-detail" data-id="'+o.id+'">详情</button>'+
  (o.inn?'<button class="btn sm" data-act="osd-out" data-id="'+o.id+'">OUT</button>':'<button class="btn sm" data-act="osd-in" data-id="'+o.id+'">IN</button>')+
  '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',12)+'一键踢盘</button>'+
- '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+o.id+'">'+ic('zap',12)+'一键换盘</button></div></td></tr>';}
+ '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+o.id+'">'+ic('zap',12)+'一键换盘</button></div></td></tr>';}
 function osdTable(){var f=state.filters,list=state.osds.filter(function(o){
   if(f.osdStatus==='down'&&o.up)return false;if(f.osdStatus==='out'&&o.inn)return false;if(f.osdStatus==='nearfull'&&pct(o.used,o.size)<85)return false;
   if(f.osdStatus==='smart'&&o.smart!=='FAIL'&&o.smart!=='WARN')return false;if(f.osdQ&&(('osd.'+o.id)+o.host+o.dev+o.type+o.serial+hostIp(o.host)).toLowerCase().indexOf(f.osdQ.toLowerCase())<0)return false;return true;});
@@ -68,19 +68,19 @@ function osdTable(){var f=state.filters,list=state.osds.filter(function(o){
 function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !o.up;}).length,out=state.osds.filter(function(o){return !o.inn;}).length,
  nf=state.osds.filter(function(o){return pct(o.used,o.size)>=85;}).length,sm=state.osds.filter(function(o){return o.smart==='FAIL'||o.smart==='WARN';}).length,p=liveProfile();
  var filter='<div class="flex" style="gap:9px;flex-wrap:wrap;margin-bottom:14px"><div class="seg">'+[['all','全部 '+state.osds.length],['down','Down '+down],['out','Out '+out],['nearfull','近满 '+nf],['smart','SMART 异常 '+sm]].map(function(x){return '<button class="'+(f.osdStatus===x[0]?'on acc':'')+'" data-act="filter" data-key="osdStatus" data-value="'+x[0]+'">'+x[1]+'</button>';}).join('')+'</div>'+
-  '<input class="inp" style="width:250px" placeholder="搜索 OSD / 主机 / 设备 / SN…" value="'+esc(f.osdQ)+'" data-bind="filters.osdQ"><div class="sp"></div><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 踢盘换盘向导</button></div>';
+  '<input class="inp" style="width:250px" placeholder="搜索 OSD / 主机 / 设备 / SN…" value="'+esc(f.osdQ)+'" data-bind="filters.osdQ"><div class="sp"></div><button class="btn" data-act="q-open" data-kind="init" title="额外插入一块盘做扩容：会新增一个 OSD 编号">'+ic('layers',14)+' 新增磁盘</button><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 踢盘换盘向导</button></div>';
  var fO=faultOsd();
  var quickBar=fO?'<div class="card" style="margin-bottom:14px"><div class="card-b" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'+
   '<div><div class="tiny">检测到待处置磁盘</div><div style="font-size:14px;font-weight:650" class="mono">osd.'+fO.id+' · '+esc(fO.host||'—')+' · '+esc(fO.dev||'—')+'</div>'+
   '<div class="tiny">'+(fO.smart==='FAIL'?'SMART FAIL':fO.smart==='WARN'?'SMART WARN':'磁盘状态异常（'+(fO.up?'up':'down')+' / '+(fO.inn?'in':'out')+'）')+' · SN '+esc(fO.serial||'未采集')+'</div></div><div class="sp"></div>'+
   '<button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fO.id+'">'+ic('trash',14)+'一键踢盘</button>'+
-  '<button class="qbtn lg" data-act="q-open" data-kind="init" data-id="'+fO.id+'">'+ic('zap',14)+'一键换盘</button>'+
+  '<button class="qbtn lg" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+fO.id+'">'+ic('zap',14)+'一键换盘</button>'+
   '<button class="btn" data-act="wizard" data-id="'+fO.id+'" data-intent="replace">'+ic('wrench',14)+' 高级向导</button></div></div>':'';
- return pageH('OSD / 磁盘管理','一键踢盘（停服务 + DOWN + OUT）与一键换盘（新盘初始化），含版本适配与回填观察')+quickBar+filter+
+ return pageH('OSD / 磁盘管理','一键踢盘（停服务 + DOWN + OUT）／一键换盘（坏盘换新盘，OSD 编号不变）／新增磁盘（扩容，新编号）')+quickBar+filter+
   '<div class="warnbox" style="margin-bottom:14px">'+ic('shield')+'<div><b>安全策略已生效</b>：默认 DRY-RUN，所有变更命令只生成不下发。真实执行需在「系统设置」开启写权限，并在向导中通过二次确认。当前版本档案 <span class="mono">'+esc(p.version||state.cluster.version)+' / '+esc(p.orchestrator)+'</span>，命令模板按实际能力探测结果选择。</div></div>'+
   card('OSD 列表','<div id="osd-table-wrap">'+osdTable()+'</div>','<span class="tag info">共 '+state.osds.length+' 台</span>',false)+
   '<div class="grid g2" style="margin-top:14px">'+card('处置流程说明','<div class="timeline">'+
-   '<div class="tl-i ok"><b>1. 选择 OSD 与意图</b><div class="tm">一键踢盘（停服务 + DOWN + OUT）／一键换盘（新盘初始化）／完整退役（purge）</div></div>'+
+   '<div class="tl-i ok"><b>1. 选择 OSD 与意图</b><div class="tm">一键踢盘（停服务 + DOWN + OUT）／一键换盘（坏盘换新盘，沿用原编号）／新增磁盘（扩容，新编号）／完整退役（purge）</div></div>'+
    '<div class="tl-i"><b>2. 自动预检</b><div class="tm">集群健康 / ok-to-stop / 剩余容量 / noout / 同故障域冲突 / min_size</div></div>'+
    '<div class="tl-i"><b>3. 二次确认</b><div class="tm">手工输入 OSD 编号 + 确认物理盘位，防止误操作</div></div>'+
    '<div class="tl-i w"><b>4. 执行与回填观察</b><div class="tm">逐条下发命令、终端日志、PG 回填进度、可中止</div></div>'+

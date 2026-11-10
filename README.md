@@ -45,7 +45,8 @@
 | OSD / 磁盘 | OSD 列表（服务器名 + IP + 真实设备映射）、元数据查询、行内 OUT / IN 切换、一键踢盘换盘 |
 | 存储池 / 主机 | 存储池用量、主机与 MON 视图 |
 | 一键踢盘 | 停止 OSD 守护进程 → 标记 DOWN → 标记 OUT → 健康验证 → 回读复核（**不退役**，不清 CRUSH 条目、不清盘） |
-| 一键换盘 | 预检新盘 → 清理元数据 → 创建 OSD → 等待上线 → 健康验证（插入新盘后一键初始化） |
+| 一键换盘 | 停服务 → OUT → 移除但**保留编号**（`--replace`）→ 现场换盘（暂停）→ 清理新盘 → 用原编号重建 → 回读复核（**OSD 编号不变**） |
+| 新增磁盘 | 预检新盘 → 清理元数据 → 创建 OSD（**新编号**）→ 等待上线 → 健康验证（扩容加盘） |
 | 一键 IN 盘 | 确认仍在 CRUSH → `ceph osd in` → 恢复权重并回填 → 健康验证（OUT 状态时才显示入口） |
 | 高级向导 | 5 步流程，逐步展示命令、预检项与执行结果 |
 | 变更审计 | jsonl 全量记录（时间、用户、目标、命令、DRY-RUN / EXECUTED / REJECTED、来源 IP） |
@@ -277,17 +278,32 @@ unset PW
 
 需要真正把 OSD 从集群抹掉（永久下线）时，用「换盘向导」的 `remove`（完整退役，含 purge / 清盘）意图，那条路径才是不可逆的。
 
-**一键换盘（插入新盘后一键初始化）**
+**一键换盘（坏盘换新盘 · OSD 编号不变）**
 
 ```
-预检设备（是否空闲 / 可加入集群）→ 清理旧元数据 → 创建 OSD → 等待上线 → 健康验证
+停故障 OSD 守护进程 → osd out（PG 迁走）→ 移除 OSD 但保留编号（--replace）
+→ 现场换盘（平台暂停）→ 清理新盘残留签名 → 用原编号重建 OSD → 回读 osd dump 复核 → 健康验证
 ```
 
-适用于「坏盘已踢出、现场插上新盘」之后：在弹窗里选一块**新盘**（下拉框列出 `ceph orch device ls` 中 available 的设备，也可手工填 `/dev/sdX`），平台会清掉该盘的分区表 / LVM / 文件系统签名，然后创建 OSD 并加入 CRUSH。不碰任何已有 OSD，也不需要先选某个 OSD。
+适用场景：一块物理盘坏了、**硬件层已经换成新盘**，要把它以**原来的 OSD 编号**接回集群（1:1 替换，不是扩容）。弹窗里目标 OSD 默认就是被点的那一行，再选定新盘（下拉列出该服务器上未被其它 OSD 占用的设备，**原盘位路径排第一**——换盘后新盘往往还在 `/dev/nvme0n2` 这个路径上；带旧 LVM 签名的盘会标「需先清理」，流程里会先 zap）。
+
+- 确认短语是 `osd.<id>` 而不是设备路径：这次要保住的是编号；
+- cephadm：`ceph orch osd rm <id> --replace`（盘已 down 时附 `--force` 跳过回填等待）→ `ceph orch device zap <host> <dev> --force` → `ceph orch daemon add osd <host>:<dev>`。`--replace` 会把编号留在替换队列里，重建时复用它；
+- 包安装：`osd purge`（或 crush remove + auth del + osd rm）→ `ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev> --osd-id <id>`；原权重不是 1.0 时再 `ceph osd crush reweight osd.<id> <原权重>`，否则新盘承载的数据会明显偏少；
+- 流程在「物理更换故障盘」处暂停，装好新盘后点「磁盘已换好，继续执行」才跑后面的 zap / 重建；
+- 收尾**回读 `ceph osd dump`**：`osd.<id>` 必须重新出现且 `up=true / in=true`；如果编号没被复用（dump 里只剩一个新编号），界面直接报「未完全生效」并说明去哪确认，不会假装成功。cephadm 已经自动完成重建时，第二阶段会检测到并跳过重复的 zap / 重建。
+
+**新增磁盘（扩容 · 会分配新编号）**
+
+```
+预检设备（是否空闲 / 可加入集群）→ 清理旧元数据 → 创建 OSD（新编号）→ 等待上线 → 健康验证
+```
+
+适用于「额外插进一块盘做扩容」：在弹窗里选一块**空闲盘**（下拉列出 `ceph orch device ls` 中 available 的设备，也可手工填 `/dev/sdX`），平台清掉该盘的分区表 / LVM / 文件系统签名后创建 OSD 并加入 CRUSH。不碰任何已有 OSD，也不需要先选某个 OSD；完成后 OSD 列表会多出一个新编号。
 
 - cephadm：`ceph orch device zap <host> <dev> --force` → `ceph orch daemon add osd <host>:<dev>`
 - 包安装：`ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev>`
-- 安全闸：后端在执行前会比对现有 OSD 的设备名，若该设备已被占用则直接拒绝（zap 不可逆）；前端还要输入设备路径二次确认。
+- 安全闸：执行前比对现有 OSD 的设备名，设备已被占用直接拒绝（zap 不可逆）；前端还要输入设备路径二次确认。
 
 **一键 IN 盘（维护结束 / 误 out 后恢复）**
 
@@ -383,12 +399,12 @@ unset PW
 | GET | `/api/progress` | 回填 / 任务进度 |
 | GET | `/api/isolation` | 原生 Dashboard 隔离自检 |
 | GET | `/api/audit` | 审计记录 |
-| GET | `/api/devices` | 可加入集群的空闲磁盘（一键换盘时选新盘用） |
+| GET | `/api/devices` | 各主机的磁盘清单与 available 标记（换盘 / 新增磁盘时选新盘用） |
 | GET | `/api/osd/<id>/meta` | OSD 元数据 |
 | POST | `/api/quick/kick` | 一键踢盘（停服务 + `osd down` + `osd out`，不退役，返回 `verify` 复核结论） |
 | POST | `/api/quick/in` | 一键 IN 盘（启动守护进程 + `osd in` + 回填观察） |
-| POST | `/api/quick/init` | 一键换盘（新盘初始化：zap + 创建 OSD） |
-| POST | `/api/quick/replace` | 换盘并保留原 OSD ID（旧流程，需人工换盘中转） |
+| POST | `/api/quick/init` | 新增磁盘（扩容：zap + 创建 OSD，分配新编号） |
+| POST | `/api/quick/replace` | 一键换盘：坏盘换新盘并**保留原 OSD 编号**（`stage=pre` 停在中途等现场换盘，`stage=post` 继续重建） |
 | POST | `/api/execute` | 高级向导执行 |
 | POST | `/api/osd/<id>/out` `/in` | 标记 OSD out / in |
 | POST | `/api/alert/ack` | 告警确认 |

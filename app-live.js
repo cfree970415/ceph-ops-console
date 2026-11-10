@@ -242,8 +242,11 @@ function isolationCard(){
   '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>原生 Dashboard 继续按原地址和原账号使用；本控制台只是通过只读命令与独立 client 凭证观察集群。写操作同样经该凭证下发，不会修改 mgr dashboard 的任何配置。</div></div>',head);
 }
 
-/* ---------- one-click kick / init new disk / in ---------- */
-function quickTitle(k){return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':k==='init'?'一键换盘（新盘初始化）':'一键换盘';}
+/* ---------- one-click kick / replace one disk / add a disk / in ---------- */
+function quickTitle(k){
+ return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':
+  k==='replace'?'一键换盘（坏盘换新盘 · OSD 编号不变）':
+  k==='init'?'新增磁盘（初始化新盘 · 新编号）':'一键换盘';}
 function quickIntent(k){return k==='kick'?'downout':k==='in'?'in':k==='init'?'init':'replace';}
 function quickPlan(k,w){
  if(state.mode==='live'&&state.auth.authenticated){
@@ -254,11 +257,59 @@ function quickPlan(k,w){
  if(k==='init')return Promise.resolve([
   {n:'预检设备',c:'# 预检设备是否空闲、可加入集群',note:'确认设备未被 OSD 占用',manual:true},
   {n:'清理元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',note:'清掉分区表 / LVM / 文件系统签名'},
-  {n:'创建 OSD',c:'ceph-volume lvm create --data '+w.dev,note:'创建 OSD 并加入 CRUSH'},
+  {n:'创建 OSD',c:'ceph-volume lvm create --data '+w.dev,note:'创建新 OSD（新编号）并加入 CRUSH'},
   {n:'健康验证',c:'ceph -s --format=json',note:'观察 PG 回到 active+clean'}]);
+ if(k==='replace')return Promise.resolve([
+  {n:'停止故障 OSD 守护进程',c:'# 先停服务：否则心跳会把 down 改回 up',note:'盘已坏时可能直接失败',manual:true},
+  {n:'标记 OSD OUT',c:'ceph osd out '+w.osdId,note:'把数据迁走'},
+  {n:'物理更换故障盘',c:'# 现场按盘位 / SN 换上同规格新盘',note:'不要换盘位',manual:true},
+  {n:'清理新盘元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',note:'只作用于新盘'},
+  {n:'用原编号重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+w.osdId,note:'强制复用原编号'},
+  {n:'复核',c:'ceph osd dump --format=json',note:'确认 osd.'+w.osdId+' up/in'}]);
  return Promise.resolve(wizardPlan({osdId:w.osdId,host:w.host,dev:w.dev,intent:quickIntent(k)}));
 }
-/* 新盘初始化：目标是「设备」，不是某个 OSD；先探测可用的空闲盘再生成命令 */
+/* 设备列表：新增磁盘只列真正空闲的盘；换盘还要允许「带着旧 LVM 签名的新盘」
+   （换上的盘往往能读到上一块的残留签名，流程里会先 zap 再重建）。 */
+function pickDevices(q,list,host){
+ var seen={},usedBy={},same=[],ok=[],soft=[];
+ (state.osds||[]).forEach(function(x){if(x&&x.dev)usedBy[x.dev]=x.id;});
+ (list||[]).forEach(function(d){
+  if(!d||!d.dev||seen[d.dev])return;
+  if(host&&d.host&&d.host!==host)return;
+  seen[d.dev]=1;
+  /* 任何别的 OSD 正在用的盘都不列——zap 是不可逆的，不能给误选的机会。
+     注意 osd.0 的 id 是 0（falsy），必须显式判断 undefined，不能只写 truthy。 */
+  if(usedBy[d.dev]!==undefined&&usedBy[d.dev]!==q.osdId)return;
+  /* 换盘时新盘通常出现在原盘位、也就是原设备路径上（/dev/nvme0n2 拔掉换新，
+     路径还是它）。这种情况要排在最前，而不是被过滤掉。 */
+  if(q.kind==='replace'&&q.oldDev&&d.dev===q.oldDev){same.push(d);return;}
+  (d.available?ok:soft).push(d);
+ });
+ if(q.kind==='init')return ok;
+ return same.concat(ok,soft);
+}
+/* 换盘：目标是「某个坏掉的 OSD」，新盘是它的替代品，重建后编号必须还是原来那个 */
+function quickOpenReplace(o){
+ if(!o||o.id==null){toast('请先选择一个要更换的 OSD','e');return;}
+ state.quick={kind:'replace',osdId:o.id,host:o.host||'',dev:'',oldDev:o.dev||'',serial:o.serial||'',
+  weight:o.weight,devices:[],phase:'loading',steps:[],logs:[],progress:0,phrase:'',confirmed:false,
+  busy:false,error:'',stage:'pre',aborted:false,pending:[],hasManual:true,
+  dryRun:!state.settings.allowWrite,role:state.auth.role||'admin'};
+ state.wizard=null;
+ var mine=state.quick;
+ quickPaintModal();
+ loadFreeDevices(mine).then(function(list){
+  if(!state.quick||state.quick!==mine)return;
+  var q=mine,pick=pickDevices(q,list,q.host);
+  q.devices=pick;
+  q.dev=pick.length?pick[0].dev:'';
+  if(!q.dev){q.phase='confirm';quickPaintModal();return;}
+  return replanQuick(q);
+ }).catch(function(e){
+  if(!state.quick||state.quick!==mine)return;
+  var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
+}
+/* 新增磁盘（扩容）：目标是「设备」，不是某个 OSD；先探测可用的空闲盘再生成命令 */
 function loadFreeDevices(q){
  if(!(state.mode==='live'&&state.auth.authenticated))return Promise.resolve([]);
  return apiFetch('GET','/api/devices',null).then(function(r){return (r&&r.devices)||[];})
@@ -268,6 +319,7 @@ function quickOpen(kind,osdId){
  var n=osdId==null?(kind==='in'?(inOsd()||{}).id:(faultOsd()||{}).id):Number(osdId);
  var o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[0];
  if(kind==='init'){return quickOpenInit(o);}
+ if(kind==='replace'){return quickOpenReplace(o);}
  if(!o){toast('没有可用的 OSD','e');return;}
  state.quick={kind:kind,osdId:o.id,host:o.host,dev:o.dev,serial:o.serial||'',phase:'loading',steps:[],logs:[],
   progress:0,phrase:'',confirmed:false,busy:false,error:'',stage:'pre',aborted:false,pending:[],hasManual:false,
@@ -286,6 +338,7 @@ function quickOpen(kind,osdId){
   if(!state.quick||state.quick!==mine)return;
   var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
+/* 新增磁盘：目标是「设备」，不是某个 OSD；走完会多出一个新编号的 OSD */
 function quickOpenInit(o){
  state.quick={kind:'init',osdId:o?o.id:null,host:(o&&o.host)||'',
   dev:'',serial:'',devices:[],phase:'loading',steps:[],logs:[],progress:0,phrase:'',confirmed:false,
@@ -296,35 +349,35 @@ function quickOpenInit(o){
  quickPaintModal();
  loadFreeDevices(mine).then(function(list){
   if(!state.quick||state.quick!==mine)return;
-  var q=mine,host=q.host;
-  var usable=list.filter(function(d){return d.available&&(!host||!d.host||d.host===host);});
-  if(!usable.length)usable=list.filter(function(d){return d.available;});
-  q.devices=usable;
-  q.dev=usable.length?usable[0].dev:'';
+  var q=mine,pick=pickDevices(q,list,q.host);
+  q.devices=pick;
+  q.dev=pick.length?pick[0].dev:'';
   if(!q.dev){q.phase='confirm';quickPaintModal();return;}
-  return quickPlan('init',q).then(function(steps){
-   if(!state.quick||state.quick!==q)return;
-   q.steps=steps;q.hasManual=false;q.phase='confirm';
-   if(!state.settings.confirm){q.phrase=q.dev;q.confirmed=true;}
-   quickPaintModal();});
+  return replanQuick(q);
  }).catch(function(e){
   if(!state.quick||state.quick!==mine)return;
   var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
-/* 换了一块新盘 / 改了设备路径：重新向后端要命令序列 */
-function replanInit(q){
+/* 换了新盘 / 改了设备路径 / 改了服务器：重新向后端要命令序列 */
+function replanQuick(q){
  q.phase='loading';q.phrase='';quickPaintModal();
- return quickPlan('init',q).then(function(steps){
+ return quickPlan(q.kind,q).then(function(steps){
   if(state.quick!==q)return;
-  q.steps=steps;q.phase='confirm';
-  if(!state.settings.confirm){q.phrase=q.dev;q.confirmed=true;}
+  q.steps=steps;
+  q.hasManual=steps.some(function(s){return s.manual||String(s.c).charAt(0)==='#';});
+  q.phase='confirm';
+  if(!state.settings.confirm){
+   q.phrase=q.kind==='replace'?'osd.'+q.osdId:q.dev;
+   q.confirmed=true;}
   quickPaintModal();
  }).catch(function(e){
   if(state.quick!==q)return;
   q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
 function qHead(){var q=state.quick;
- return modalHead(quickTitle(q.kind)+(q.kind==='init'?' · '+esc(q.dev||'选择新盘'):' · osd.'+q.osdId),
+ var tail=(q.kind==='init'||q.kind==='replace')?' · osd.'+q.osdId+' → '+esc(q.dev||'选择新盘'):' · osd.'+q.osdId;
+ if(q.kind==='init')tail=' · '+esc(q.dev||'选择新盘');
+ return modalHead(quickTitle(q.kind)+tail,
  '后端按 Ceph 版本自动选择命令模板 · '+(q.dryRun?'DRY-RUN 只生成命令':'真实执行'));}
 function quickPaintModal(){
  var q=state.quick;if(!q)return;
@@ -336,22 +389,41 @@ function quickPaintModal(){
   b='<div class="dangerbox">'+ic('alert')+'<div>'+esc(q.error)+'</div></div>'+
     '<div class="note" style="margin-top:12px">请确认已登录、后端为 CLI 通道且 /api/plan 可访问。</div>';
   foot='<div class="sp"></div><button class="btn" data-act="q-close">关闭</button><button class="btn" data-act="q-retry">重试</button>';
- }else if(q.phase==='confirm'&&q.kind==='init'){
-  /* 一键换盘 = 插入新盘后一键初始化：目标是设备，不需要先选 OSD */
-  b='<div class="warnbox" style="margin-bottom:14px">'+ic('zap')+
-   '<div><b>把新插入的磁盘初始化并加入集群</b><br>'+
-   '流程：预检设备（是否空闲 / 可加入）→ 清理旧元数据（分区表 / LVM / 文件系统签名）→ 创建 OSD → 等待上线 → 健康验证。'+
-   '不改动任何已有 OSD 的数据，也不做退役。<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
-   '<div class="fgrp" style="margin-bottom:12px"><label class="fld">目标服务器</label>'+
+ }else if(q.phase==='confirm'&&(q.kind==='init'||q.kind==='replace')){
+  /* 两个「动盘」入口共用同一块表单，语义完全不同：
+     - replace：坏盘 1:1 换新盘，重建后必须还是 osd.<id>（编号不变）
+     - init：额外加一块盘，扩容，会分配一个新编号 */
+  var isRep=q.kind==='replace';
+  var devOpts=q.devices.map(function(d){
+   return '<option value="'+esc(d.dev)+'"'+(d.dev===q.dev?' selected':'')+'>'+esc(d.dev)+' · '+bytes(d.size||0)+
+    ' · '+esc(d.host||'本机')+(isRep&&d.dev===q.oldDev?' · 原盘位':'')+
+    (d.available?'':' · 需先清理')+(d.note?' · '+esc(d.note):'')+'</option>';}).join('');
+  b='<div class="warnbox" style="margin-bottom:14px">'+ic(isRep?'disk':'zap')+
+   '<div><b>'+(isRep?'把 osd.'+q.osdId+' 的坏盘换成新盘，重建后仍是 osd.'+q.osdId
+                  :'把新插入的磁盘初始化并加入集群（会新增一个 OSD 编号）')+'</b><br>'+
+   (isRep?
+    '流程：停守护进程 → OUT（把 PG 迁走）→ 移除 OSD 但<b>保留编号</b> → <b>现场换盘（平台暂停）</b> → 清理新盘签名 → 用原编号重建 → 回读 osd dump 复核。':
+    '流程：预检设备（是否空闲 / 可加入）→ 清理旧元数据（分区表 / LVM / 文件系统签名）→ 创建 OSD → 等待上线 → 健康验证。')+
+   '<br>'+(isRep?'适用于「盘坏了、硬件层已经换成新盘」的 1:1 替换；要扩容加盘请用「新增磁盘」。'
+                :'不改动任何已有 OSD 的数据，也不做退役。')+
+   '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
+   (isRep?'<div class="grid g2" style="margin-bottom:14px"><div>'+
+     '<div class="stat-line"><span>目标 OSD</span><b class="mono tp">osd.'+q.osdId+'</b></div>'+
+     '<div class="stat-line"><span>原设备</span><b class="mono">'+esc(q.oldDev||'未采集')+'</b></div></div><div>'+
+     '<div class="stat-line"><span>服务器</span><b class="mono">'+esc(q.host||'未采集')+'</b></div>'+
+     '<div class="stat-line"><span>原序列号</span><b class="mono">'+esc(q.serial||'未采集')+'</b></div></div></div>':'')+
+   '<div class="fgrp" style="margin-bottom:12px"><label class="fld">'+
+    (isRep?'新盘所在服务器（编号不变的前提：仍装回原服务器的原盘位）':'目标服务器')+'</label>'+
     '<input class="inp mono" data-bind="quick.host" value="'+esc(q.host)+'" placeholder="ceph-single" autocomplete="off"></div>'+
-   '<div class="fgrp" style="margin-bottom:8px"><label class="fld">新盘设备</label>'+
+   '<div class="fgrp" style="margin-bottom:8px"><label class="fld">'+(isRep?'换上来的新盘设备':'新盘设备')+'</label>'+
    (q.devices.length
-    ?'<select class="inp mono" data-bind="quick.dev" data-act="q-dev">'+q.devices.map(function(d){
-       return '<option value="'+esc(d.dev)+'"'+(d.dev===q.dev?' selected':'')+'>'+esc(d.dev)+' · '+bytes(d.size||0)+
-        ' · '+esc(d.host||'本机')+(d.note?' · '+esc(d.note):'')+'</option>';}).join('')+'</select>'
-    :'<input class="inp mono" data-bind="quick.dev" value="'+esc(q.dev)+'" placeholder="/dev/sdb" autocomplete="off">')+'</div>'+
+    ?'<select class="inp mono" data-bind="quick.dev" data-act="q-dev">'+devOpts+'</select>'
+    :'<input class="inp mono" data-bind="quick.dev" value="'+esc(q.dev)+'" placeholder="/dev/nvme0n2" autocomplete="off">')+'</div>'+
    '<div class="btn-row" style="margin-bottom:12px;align-items:center"><span class="note">'+
-    (q.devices.length?'只列出未被 OSD 占用的空闲盘，插入新盘后点「重新探测」即可看到。':'未探测到可自动纳管的空闲盘，请手工填写设备路径（如 /dev/sdb），并确认该盘未被占用。')+
+    (q.devices.length
+      ?(isRep?'候选只含该服务器上未被其它 OSD 占用的盘；新盘仍挂在原路径时会标「原盘位」并排在最前。带旧签名（显示「需先清理」）是正常的，流程里会先 zap。'
+             :'只列出未被 OSD 占用的空闲盘，插入新盘后点「重新探测」即可看到。')
+      :'未探测到可自动纳管的空闲盘，请手工填写设备路径（如 /dev/nvme0n2），并确认该盘未被别的 OSD 使用。')+
     '</span><div class="sp"></div><button class="btn sm" data-act="q-replan">'+ic('refresh',12)+' 重新生成命令</button>'+
     '<button class="btn sm" data-act="q-dev-refresh">'+ic('disk',12)+' 重新探测</button></div>'+
    '<div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">后端生成的命令序列（'+esc(liveProfile().version||'')+' / '+esc(liveProfile().orchestrator||'')+'）</div>'+
@@ -359,20 +431,23 @@ function quickPaintModal(){
      return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
       (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('')+'</div>';
   if(state.settings.confirm){
-   b+='<div class="hr"></div><div class="fgrp"><label class="fld">输入设备路径 <span class="mono" style="color:var(--accent2)">'+esc(q.dev||'/dev/sdb')+'</span> 确认</label>'+
-    '<input class="inp mono" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="'+esc(q.dev)+'" autocomplete="off"></div>'+
-    '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对盘位与设备名 <span class="mono">'+esc(q.dev)+'</span></span></label>';
+   b+=isRep
+    ?'<div class="hr"></div><div class="fgrp"><label class="fld">输入 <span class="mono" style="color:var(--accent2)">osd.'+q.osdId+'</span> 确认要重建的编号</label>'+
+     '<input class="inp" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="osd.'+q.osdId+'" autocomplete="off"></div>'+
+     '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已确认 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 已换成新盘 <span class="mono">'+esc(q.dev||'-')+'</span>，且编号保持 osd.'+q.osdId+'</span></label>'
+    :'<div class="hr"></div><div class="fgrp"><label class="fld">输入设备路径 <span class="mono" style="color:var(--accent2)">'+esc(q.dev||'/dev/sdb')+'</span> 确认</label>'+
+     '<input class="inp mono" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="'+esc(q.dev)+'" autocomplete="off"></div>'+
+     '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对盘位与设备名 <span class="mono">'+esc(q.dev)+'</span></span></label>';
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
-   '<button class="btn pri" data-act="q-run">'+ic('zap',14)+' 立即执行初始化</button>';
+   '<button class="btn pri" data-act="q-run">'+ic(isRep?'wrench':'zap',14)+' 立即执行'+(isRep?'换盘':'初始化')+'</button>';
  }else if(q.phase==='confirm'){
   var used=o.size?pct(o.used,o.size):0,isKick=q.kind==='kick',isIn=q.kind==='in';
   b='<div class="'+(isKick?'dangerbox':'warnbox')+'" style="margin-bottom:14px">'+ic(isIn?'check':'alert')+
-   '<div><b>'+(isKick?'即将把 osd.'+q.osdId+' 停掉并从集群摘出（DOWN + OUT）':isIn?'即将把 osd.'+q.osdId+' 重新加入集群':'踢出并更换 osd.'+q.osdId+' 的磁盘')+'</b><br>'+
+   '<div><b>'+(isKick?'即将把 osd.'+q.osdId+' 停掉并从集群摘出（DOWN + OUT）':'即将把 osd.'+q.osdId+' 重新加入集群')+'</b><br>'+
    (isKick?'流程：停止 OSD 守护进程 → 标记 DOWN → 标记 OUT（从 CRUSH 摘出，触发回填）→ 状态复核 → 健康验证。<b>不做退役</b>：不 purge、不删认证、不清盘，随时可点 IN 恢复。':
-    isIn?'流程：启动 OSD 守护进程 → 确认 OSD 仍在 CRUSH → 取消 OUT 标记（osd in）→ 恢复权重并回填 → 健康验证。':
-    '流程：标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD → 清理磁盘元数据 → <b>人工换盘（平台暂停）</b> → 原 ID 重建 → 回填观察。')+
+    '流程：启动 OSD 守护进程 → 确认 OSD 仍在 CRUSH → 取消 OUT 标记（osd in）→ 恢复权重并回填 → 健康验证。')+
    '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
    '<div class="grid g2" style="margin-bottom:14px"><div>'+
     '<div class="stat-line"><span>目标 OSD</span><b class="mono">osd.'+q.osdId+'</b></div>'+
@@ -393,34 +468,39 @@ function quickPaintModal(){
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
    (isIn?'':'<button class="btn" data-act="q-wizard" title="'+(isKick?'踢盘只做 down + out；需要彻底移除 OSD 时走完整退役向导（含 purge / 清盘）':'改用带自动预检的完整向导')+'">'+(isKick?'完整退役向导':'高级向导')+'</button>')+
-   '<button class="btn '+(isKick?'dan':'pri')+'" data-act="q-run">'+ic('zap',14)+' 立即执行'+(isKick?'踢盘':isIn?'IN 盘':'换盘')+'</button>';
+   '<button class="btn '+(isKick?'dan':'pri')+'" data-act="q-run">'+ic('zap',14)+' 立即执行'+(isKick?'踢盘':'IN 盘')+'</button>';
  }else if(q.phase==='running'||q.phase==='paused'){
   b='<div class="flex" style="margin-bottom:10px"><span class="tag '+(q.dryRun?'warn':'err')+'">'+(q.dryRun?'DRY-RUN':'EXECUTE')+'</span>'+
     '<span class="tag info">stage: '+esc(q.stage)+'</span><div class="sp"></div><b class="mono" id="q-pct">'+q.progress+'%</b></div>'+
    '<div class="prog"><i id="q-prog" style="width:'+q.progress+'%"></i></div>'+
    '<div class="term" id="q-term" style="height:230px"></div>';
   if(q.phase==='paused'){
-   b+='<div class="warnbox" style="margin-top:12px">'+ic('wrench')+'<div><b>请现场更换磁盘</b>：按 SN <span class="mono">'+esc(q.serial||'-')+'</span> 与盘位更换 '+esc(q.dev)+
-    '。平台已暂停，后续 '+q.pending.length+' 条命令（重建 OSD / 重新加入 / 健康验证）将在确认后继续下发。</div></div>';
+   b+='<div class="warnbox" style="margin-top:12px">'+ic('wrench')+'<div><b>请现场更换磁盘</b>：按 SN <span class="mono">'+esc(q.serial||'-')+'</span> 与盘位把 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 换成新盘（新盘装回<b>原盘位</b>，编号才能沿用）。'+
+    '平台已暂停，后续 '+q.pending.length+' 条命令（清理新盘签名 / 用原编号重建 / 复核 up·in）将在确认后继续下发。</div></div>';
    foot='<div class="sp"></div><button class="btn" data-act="q-abort">中止流程</button>'+
     '<button class="btn pri" data-act="q-resume">'+ic('check',14)+' 磁盘已换好，继续执行</button>';
   }else foot='<div class="sp"></div><button class="btn dan" data-act="q-abort">中止</button>';
  }else if(q.phase==='done'){
-  var badVerify=q.kind==='kick'&&q.verify&&q.verify.ok===false;
+  var badVerify=(q.kind==='kick'||q.kind==='replace')&&q.verify&&q.verify.ok===false;
   b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+(badVerify?'td':'t')+'">'+
    ic(badVerify?'alert':'check',38)+'</div>'+
    '<div style="font-size:16px;font-weight:700;margin-top:8px">'+quickTitle(q.kind)+(badVerify?'未完全生效':'流程已完成')+'</div>'+
-   '<div class="note" style="margin-top:6px">'+(q.kind==='init'?esc(q.dev)+' @ '+esc(q.host):'osd.'+q.osdId)+' · '+
+   '<div class="note" style="margin-top:6px">'+
+   (q.kind==='init'?esc(q.dev)+' @ '+esc(q.host):
+    q.kind==='replace'?'osd.'+q.osdId+' · '+esc(q.oldDev||'原盘')+' → '+esc(q.dev||'新盘'):'osd.'+q.osdId)+' · '+
    (q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':
     q.kind==='init'?'已初始化并加入集群，数据开始回填；新 OSD 会在 OSD 列表出现':
     q.kind==='kick'?(badVerify?esc(q.verify.message):'已停服务并标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群'):
+    q.kind==='replace'?(badVerify?esc(q.verify.message):'新盘已用原编号 osd.'+q.osdId+' 重建并上线，数据开始回填'):
     '命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
    (badVerify?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div>后端复核未通过：'+esc(q.verify.message)+
     '</div></div>':'')+
    '<div class="grid g2"><div><div class="stat-line"><span>执行步骤</span><b class="mono">'+q.steps.length+'</b></div>'+
    '<div class="stat-line"><span>集群版本</span><b class="mono">'+esc(liveProfile().version||'-')+'</b></div></div>'+
-   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'关联告警')+'</span><b class="'+(q.kind==='kick'?'tw':'t')+'">'+
-   (q.kind==='init'?'待同步（列表刷新后可见）':q.kind==='kick'?'待复核（后端已回读 osd dump）':'已自动恢复')+'</b></div>'+
+   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'关联告警')+'</span><b class="'+((q.kind==='kick'||badVerify)?'tw':'t')+'">'+
+   (q.kind==='init'?'待同步（列表刷新后可见）':
+    q.kind==='replace'?(q.verify&&q.verify.ok?'osd.'+q.osdId+' 已 up/in':'待复核（后端已回读 osd dump）'):
+    q.kind==='kick'?'待复核（后端已回读 osd dump）':'已自动恢复')+'</b></div>'+
    '<div class="stat-line"><span>审计记录</span><b class="t">已写入</b></div></div></div>'+
    '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>真实环境请回到「告警中心」确认告警已清除，并在「变更审计」复核完整命令序列与返回码。</div></div>';
   foot='<div class="sp"></div><button class="btn" data-act="q-alerts">查看告警</button>'+
@@ -440,7 +520,7 @@ function quickPaintLogs(){
 function quickApply(){
  var q=state.quick,o=state.osds.filter(function(x){return x.id===q.osdId;})[0],isIn=q.kind==='in';
  if(q.kind==='init'){
-  /* 新盘初始化：新 OSD 的 id / 容量只有后端知道，本地不猜，等强制刷新带回真实值。 */
+  /* 新增磁盘：新 OSD 的 id / 容量只有后端知道，本地不猜，等强制刷新带回真实值。 */
   addAudit('OSD_INIT_1CLICK',q.dev||'-',q.steps.map(function(s){return s.c;}).join(' ; '),
    (q.dryRun?'DRY-RUN 演练 · ':'一键执行 · ')+(state.auth.user||'console'));
   return;}
@@ -449,9 +529,12 @@ function quickApply(){
    后端复核没过时不能往前端写成 down——那会让界面说谎。 */
   if(!q.verify||q.verify.ok!==false){if(o){o.up=false;o.inn=false;}
    state.cluster.osdsIn=Math.max(0,(state.cluster.osdsIn||0)-1);}}
+ else if(q.kind==='replace'){
+  /* 换盘：编号不变，只看后端复核结论改 up/in；新盘的 SMART / 用量只有刷新才知道，
+     不能在这里编一个「已恢复」的假象。 */
+  if(!q.verify||q.verify.ok!==false){if(o){o.up=true;o.inn=true;}}}
  else if(isIn){if(o){o.inn=true;o.up=true;}
   state.cluster.osdsIn=Math.min(state.cluster.osds,(state.cluster.osdsIn||0)+1);}
- else if(o){o.up=true;o.inn=true;o.smart='OK';o.used=Math.round(o.used*0.55);}
  state.alerts.forEach(function(a){if(a.osd!==q.osdId||a.status==='resolved')return;
   /* 踢盘后 OSD 是 down+out，告警还在不在由后端真实健康检查决定，本地不假装恢复；
      IN 只清掉「被标记 OUT」类告警；盘仍 down 的硬件告警永远不假装恢复。 */
@@ -469,7 +552,8 @@ function quickExec(stage){
  var q=state.quick;if(!q)return;
  q.phase='running';q.stage=stage;q.aborted=false;q.logs=[];q.progress=0;q.pending=[];q.verify=null;quickPaintModal();
  qLog('d','# Ceph Ops Console · '+(q.dryRun?'DRY-RUN':'EXECUTE')+' · '+dt(Date.now()));
- qLog('d','# target '+(q.kind==='init'?q.dev+' @ '+q.host:'osd.'+q.osdId+' @ '+q.host+' '+q.dev)+
+ qLog('d','# target '+(q.kind==='init'?q.dev+' @ '+q.host:
+  'osd.'+q.osdId+' @ '+q.host+' '+(q.kind==='replace'?(q.oldDev||'?')+' → '+q.dev:q.dev))+
   ' · '+liveProfile().version+' / '+liveProfile().orchestrator);
  qLog('d','# stage='+stage+' · 所有命令参数化执行，不经 shell');qLog('d','');
  var body=q.kind==='init'
@@ -538,25 +622,28 @@ function quickAction(act,el){
   case 'q-wizard':if(q){if(q.kind==='in'){toast('IN 盘只涉及 osd in 与回填观察，直接执行即可','w');return;}
    var k=q.kind,id=q.osdId;state.quick=null;closeModal();startWizard(id,k==='kick'?'remove':'replace');}return;
   case 'q-dev':/* 选了另一块新盘：重新生成命令序列 */
-   if(q&&q.kind==='init'){q.dev=el.value||q.dev;replanInit(q);}return;
+   if(q&&(q.kind==='init'||q.kind==='replace')){q.dev=el.value||q.dev;replanQuick(q);}return;
   case 'q-replan':
-   if(q&&q.kind==='init'){replanInit(q);}return;
+   if(q&&(q.kind==='init'||q.kind==='replace')){replanQuick(q);}return;
   case 'q-dev-refresh':
-   if(q&&q.kind==='init'){
+   if(q&&(q.kind==='init'||q.kind==='replace')){
     var keep=q;
     loadFreeDevices(keep).then(function(list){
      if(state.quick!==keep)return;
-     var usable=list.filter(function(d){return d.available&&(!keep.host||!d.host||d.host===keep.host);});
-     if(!usable.length)usable=list.filter(function(d){return d.available;});
+     var usable=pickDevices(keep,list,keep.host);
      keep.devices=usable;
      if(usable.length)keep.dev=usable[0].dev;
-     if(keep.dev)replanInit(keep);else{keep.steps=[];quickPaintModal();}
+     if(keep.dev)replanQuick(keep);else{keep.steps=[];keep.phase='confirm';quickPaintModal();}
     });}return;
   case 'q-run':
    if(!q)return;
    if(q.kind==='init'){
     if(!q.dev){toast('请先选择或填写新盘设备','e');return;}
     if(state.settings.confirm&&(q.phrase!==q.dev||!q.confirmed)){toast('请输入设备路径 '+q.dev+' 并勾选盘位确认','e');return;}
+   }else if(q.kind==='replace'){
+    if(!q.dev){toast('请先选择或填写换上新盘的设备路径','e');return;}
+    if(!q.host){toast('请填写新盘所在的服务器','e');return;}
+    if(state.settings.confirm&&(q.phrase!=='osd.'+q.osdId||!q.confirmed)){toast('请输入 osd.'+q.osdId+' 确认编号不变，并勾选换盘确认','e');return;}
    }else if(q.phrase!=='osd.'+q.osdId||!q.confirmed){toast('请输入 osd.'+q.osdId+' 并勾选盘位确认','e');return;}
    if(state.mode==='live'&&state.auth.role!=='admin'){toast('只读账号无法执行写操作，请用管理员登录','e');return;}
    quickExec(q.kind==='init'?'auto':'pre');return;

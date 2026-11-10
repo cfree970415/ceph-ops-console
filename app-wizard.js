@@ -35,22 +35,26 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
 /* ---------- command plan / preflight ---------- */
 function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cephadm'&&p.caps.orch,rep=w.intent==='replace',s=[];
  if(rep&&orch){s=[
-  {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
-  {n:'移除故障 OSD 并保留 ID',c:'ceph orch osd rm '+id+' --replace',d:'cephadm 自动 zap 设备并保留 CRUSH 位置'},
-  {n:'轮询移除任务状态',c:'ceph orch osd rm status --format=json',d:'确认移除任务完成'},
-  {n:'物理更换故障盘',c:'# 现场操作：按 SN / 盘位更换磁盘',d:'需人工确认，平台在此暂停等待'},
-  {n:'确认新盘可用',c:'ceph orch device ls '+w.host+' --format=json',d:'新盘状态应为 Available'},
-  {n:'等待 cephadm 自动部署',c:'ceph orch ps --daemon-type osd --format=json',d:'同 ID OSD 自动重建并开始回填'},
+  {n:'停止故障 OSD 守护进程',c:'ceph orch daemon stop osd.'+id,d:'盘已坏时可能直接失败；还在跑必须先停，否则 out 会被心跳改回 up'},
+  {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'先把 PG 迁走，再动盘'},
+  {n:'移除 OSD 并保留编号',c:'ceph orch osd rm '+id+' --replace'+(((state.osds.filter(function(x){return x.id===id;})[0]||{}).up)?'':' --force'),d:'--replace 保留 osd.'+id+' 编号供新盘复用；盘已 down 时加 --force 跳过回填等待'},
+  {n:'轮询移除进度',c:'ceph orch osd rm status --format=json',d:'确认该 OSD 已离开移除队列（编号留作替换）'},
+  {n:'物理更换故障盘',c:'# 现场操作：按盘位 / SN 换上同规格新盘，装回原盘位',d:'需人工确认，平台在此暂停等待'},
+  {n:'确认新盘已被编排器识别',c:'ceph orch device ls '+w.host+' --format=json',d:'新盘应出现在设备列表（available 可能为 false，还带着旧签名）'},
+  {n:'清理新盘残留签名',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',d:'只作用于新盘，执行前核对盘位与 SN'},
+  {n:'用原编号重建 OSD',c:'ceph orch daemon add osd '+w.host+':'+w.dev,d:'cephadm 优先复用 --replace 保留的编号 osd.'+id},
+  {n:'确认 osd.'+id+' 重新上线',c:'ceph osd dump --format=json',d:'up=true / in=true，且编号必须仍是 osd.'+id},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待所有 PG active+clean，HEALTH_OK'}];
- }else if(rep){s=[
-  {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
-  {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'停止数据写入，开始数据重平衡'},
-  {n:'等待回填完成',c:'ceph -s --format=json',d:'观察 PG 回到 active+clean'},
-  {n:(p.caps.purge?'移除 OSD（purge）':'三步式移除 OSD'),c:p.caps.purge?'ceph osd purge '+id+' --yes-i-really-mean-it':'ceph osd crush remove osd.'+id+' && ceph auth del osd.'+id+' && ceph osd rm '+id,d:p.caps.purge?'14+ 单行完成移除':'12.x/13.x 兼容写法'},
-  {n:'清除磁盘 LVM 元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',d:'12.x 无 ceph-volume 时回退 ceph-disk zap'},
-  {n:'物理更换故障盘',c:'# 现场操作：按 SN / 盘位更换磁盘',d:'需人工确认'},
-  {n:'用原 ID 重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+id,d:'13+ 支持 --osd-id；12.x 用 ceph-disk prepare/activate'},
-  {n:'重新加入集群',c:'ceph osd in '+id,d:'恢复 CRUSH 权重'},
+ }else if(rep){var _ow=(state.osds.filter(function(x){return x.id===id;})[0]||{}).weight;
+  s=[
+  {n:'停止故障 OSD 守护进程',c:'systemctl stop ceph-osd@'+id,d:'盘已坏时可能直接失败；还在跑必须先停'},
+  {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'先把 PG 迁走，再动盘'},
+  {n:(p.caps.purge?'移除 OSD 但留作替换（purge）':'三步式移除 OSD'),c:p.caps.purge?'ceph osd purge '+id+' --yes-i-really-mean-it':'ceph osd crush remove osd.'+id+' && ceph auth del osd.'+id+' && ceph osd rm '+id,d:'编号 osd.'+id+' 由下一步 --osd-id 强制复用'},
+  {n:'物理更换故障盘',c:'# 现场操作：按盘位 / SN 换上同规格新盘，装回原盘位',d:'需人工确认，平台在此暂停等待'},
+  {n:'清理新盘元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',d:'只作用于新盘；12.x 无 ceph-volume 时回退 ceph-disk zap'},
+  {n:'用原编号重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+id,d:'不指定 --osd-id 就会分配一个新编号'},
+  {n:'恢复原 CRUSH 权重',c:'ceph osd crush reweight osd.'+id+' '+(_ow||1),d:'新建 OSD 默认权重 1.0，按原值恢复以免容量分布失衡'},
+  {n:'确认 osd.'+id+' 重新上线',c:'ceph osd dump --format=json',d:'up=true / in=true，且编号必须仍是 osd.'+id},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待 all PGs active+clean'}];
  }else if(w.intent==='downout'){s=[
   {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
@@ -239,7 +243,9 @@ function wExec(){var w=state.wizard;if(!w||w.running)return;w.running=true;w.don
 function wApplyResult(){var w=state.wizard;if(w.aborted)return;
  var o=state.osds.filter(function(x){return x.id===w.osdId;})[0];
  if(w.intent==='remove'){state.osds=state.osds.filter(function(x){return x.id!==w.osdId;});state.cluster.osds=Math.max(0,state.cluster.osds-1);}
- else if(o){o.up=true;o.inn=true;o.smart='OK';o.used=Math.round(o.used*0.55);o.pgs=200+(o.id*7)%90;}
+ /* 换盘只按真实结论改 up/in；SMART / 用量 / PG 数都要等下一次刷新带回，
+    不能在这里编一个「焕然一新」的假象。 */
+ else if(o){o.up=true;o.inn=true;}
  state.alerts.forEach(function(a){if(a.osd===w.osdId&&a.status!=='resolved'){a.status='resolved';}});
  state.cluster.osdsUp=state.osds.filter(function(x){return x.up;}).length+(state.cluster.osds-state.osds.length);
  state.cluster.health=healthInfo().t;

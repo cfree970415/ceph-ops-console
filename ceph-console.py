@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -523,7 +523,12 @@ def osd_daemon_cmd(probe, action, oid):
 
 
 def osd_upin_state(cfg, oid):
-    """单个 OSD 的权威 up / in（来自 ceph osd dump，df 里没有这两个字段）。"""
+    """单个 OSD 的权威 up / in / 权重（来自 ceph osd dump，df 里没有这几个字段）。
+
+    crush_weight 用来在「原编号重建」之后把设备权重改回原值：新建的 OSD 默认
+    权重是 1.0，而 cephadm 部署的 NVMe 常常是 3.6 之类的真实值，不恢复会让
+    这块盘承载的数据量明显偏少。
+    """
     doc, _ = ceph_json(cfg, ["osd", "dump"], 30)
     if isinstance(doc, dict):
         for o in (doc.get("osds") or []):
@@ -531,7 +536,12 @@ def osd_upin_state(cfg, oid):
                 continue
             try:
                 if int(o.get("osd")) == int(oid):
-                    return {"up": bool(o.get("up")), "in": bool(o.get("in"))}
+                    try:
+                        weight = float(o.get("crush_weight") or 0)
+                    except (TypeError, ValueError):
+                        weight = 0.0
+                    return {"up": bool(o.get("up")), "in": bool(o.get("in")),
+                            "weight": weight}
             except (TypeError, ValueError):
                 continue
     return None
@@ -557,6 +567,29 @@ def check_downout(cfg, oid):
             "message": "osd.%d %s" % (oid, "；".join(reasons))}
 
 
+def check_replace(cfg, oid):
+    """换盘后复核：编号是否被复用、是否真的重新上线。
+
+    「编号不变」是换盘的核心承诺，所以不能只报「命令都返回 0」：
+    必须回读 osd dump，确认 osd.<id> 仍存在且 up/in。
+    """
+    st = osd_upin_state(cfg, oid)
+    if st is None:
+        return {"ok": False, "up": None, "in": None, "reused": False,
+                "message": "osd.%d 不在 osd dump 中：新盘没有复用原编号，"
+                           "可能被分配了新编号（去 OSD 列表按设备名确认）" % oid}
+    if st["up"] and st["in"]:
+        return {"ok": True, "up": True, "in": True, "reused": True,
+                "message": "osd.%d 已用原编号重新上线（up/in），数据开始回填" % oid}
+    reasons = []
+    if not st["up"]:
+        reasons.append("仍为 down：新盘上的 OSD 守护进程没起来（看 ceph orch ps 或 systemctl status ceph-osd@%d）" % oid)
+    if not st["in"]:
+        reasons.append("仍为 out：执行 ceph osd in %d" % oid)
+    return {"ok": False, "up": st["up"], "in": st["in"], "reused": True,
+            "message": "osd.%d 已用原编号重建，但%s" % (oid, "；".join(reasons))}
+
+
 def osd_used_devices(cfg):
     """osd id -> 设备 / 主机，用来判断某块盘是否已经被 OSD 占用。"""
     ids = []
@@ -574,7 +607,7 @@ def osd_used_devices(cfg):
 
 
 def read_free_devices(cfg, probe):
-    """可加入集群的空闲磁盘，供「一键换盘（新盘初始化）」选择。"""
+    """各主机的磁盘清单，供「一键换盘 / 新增磁盘」选择新盘。"""
     out, seen = [], set()
     if cfg.backend != "cli":
         return out
@@ -1204,7 +1237,8 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     purge = probe.caps.get("purge", False)
     if intent not in ("remove", "replace", "in", "downout", "init"):
         raise ValueError("unknown intent: %s" % intent)
-    # 一键换盘（init）针对的是「新插入的盘」，没有 OSD id，只认 host + 设备路径。
+    # 新增磁盘（init）针对的是「额外插进来的一块盘」，没有 OSD id，只认 host + 设备路径。
+    # 注意它与「一键换盘（replace）」不是一回事：replace 是坏盘 1:1 换新盘、沿用原编号。
     if intent == "init":
         oid = None
         if not dev:
@@ -1217,7 +1251,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             raise ValueError("invalid device path")
     else:
         oid = validate_target(osd_id, host, dev)
-    # osd in / down+out / 新盘初始化只按 id 或设备操作，不要求「先有 OSD」的设备路径。
+    # osd in / down+out / 新增磁盘只按 id 或设备操作，不要求「先有 OSD」的设备路径。
     if intent not in ("in", "downout", "init") and not dev and (not orch or intent == "remove"):
         raise ValueError("device path is required for this operation")
     plan = []  # (name, argv_or_None, note)
@@ -1227,36 +1261,68 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
 
     DOWN_NOTE = "先停服务再摘盘：避免故障盘抖动产生 slow ops；已 down 时该命令幂等"
 
-    if intent == "replace" and orch:
-        add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
-        add("移除故障 OSD 并保留 ID", ["ceph", "orch", "osd", "rm", str(oid), "--replace"], "cephadm 自动 zap 并保留 CRUSH 位置")
-        add("轮询移除任务状态", ["ceph", "orch", "osd", "rm", "status", "--format=json"])
-        add("物理更换故障盘", None, "现场操作：按 SN / 盘位更换磁盘")
-        add("确认新盘可用", ["ceph", "orch", "device", "ls", str(host), "--format=json"])
-        add("等待 cephadm 自动部署", ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"])
-        add("集群健康验证", ["ceph", "-s", "--format=json"])
-    elif intent == "replace":
-        add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
-        add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)])
-        add("等待回填完成", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
-        if purge:
-            add("移除 OSD（purge）", ["ceph", "osd", "purge", str(oid), "--yes-i-really-mean-it"])
+    if intent == "replace":
+        # 一键换盘的真实场景：一块物理盘坏了 -> 硬件层已换成新盘 -> 把新盘接回集群，
+        # 且 **OSD 编号不变**（1:1 替换，不是 +1 块盘）。
+        # 与「退役 remove」的区别：不放弃编号、不永久摘除身份，重建时复用 osd.<id>。
+        # 与「新增磁盘 init」的区别：init 是容量扩容，会拿到一个新编号。
+        if not dev:
+            raise ValueError("换盘必须指定新盘的设备路径（换上的是哪块盘）")
+        if not host:
+            raise ValueError("换盘必须指定新盘所在的服务器")
+        cur = osd_upin_state(cfg, oid)
+        dead = bool(cur) and not cur.get("up")
+        weight = (cur or {}).get("weight") or 0.0
+        add("停止故障 OSD 守护进程", osd_daemon_cmd(probe, "stop", oid),
+            "盘已坏时这条可能直接失败，不影响后续；还在跑时必须先停，否则 out 会被心跳改回 up")
+        add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
+            "先把 PG 从这块盘迁走；盘已彻底损坏时其他副本通常早已接管，该步幂等")
+        if orch:
+            if dead:
+                add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace", "--force"],
+                    "--replace 保留 osd.%d 编号供新盘复用；--force 跳过回填等待（盘已 down，等下去也没有意义）" % oid)
+            else:
+                add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace"],
+                    "--replace 让 osd.%d 这个编号不被回收，cephadm 会等回填完成后再销毁 daemon" % oid)
+            add("轮询移除进度", ["ceph", "orch", "osd", "rm", "status", "--format=json"],
+                "确认该 OSD 已离开移除队列（destroyed，且编号留作替换）")
+            add("物理更换故障盘", None,
+                "现场操作：按盘位 / SN 换上同规格新盘；不要换盘位、不要改主机，否则编号无法沿用")
+            add("确认新盘已被编排器识别", ["ceph", "orch", "device", "ls", str(host), "--format=json"],
+                "新盘应出现在 %s 的设备列表里（available 可能为 false，因为还带着旧签名）" % host)
+            add("清理新盘残留签名", ["ceph", "orch", "device", "zap", str(host), str(dev), "--force"],
+                "清掉分区表 / LVM / 文件系统签名；只作用于 %s，执行前请核对盘位与 SN" % dev)
+            add("用原编号重建 OSD（cephadm 复用编号）",
+                ["ceph", "orch", "daemon", "add", "osd", "%s:%s" % (host, dev)],
+                "cephadm 会优先复用被 --replace 保留的编号 osd.%d；若它已自动重建，本步会提示已被管理，可忽略"
+                % oid)
         else:
-            add("从 CRUSH 移除", ["ceph", "osd", "crush", "remove", "osd.%d" % oid])
-            add("删除认证", ["ceph", "auth", "del", "osd.%d" % oid])
-            add("删除 OSD", ["ceph", "osd", "rm", str(oid)])
-        if probe.major >= 13:
-            add("清除磁盘 LVM 元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"])
-        else:
-            add("清除磁盘元数据（12.x）", ["ceph-disk", "zap", str(dev)])
-        add("物理更换故障盘", None, "现场操作：按 SN / 盘位更换磁盘")
-        if probe.major >= 13:
-            add("用原 ID 重建 OSD", ["ceph-volume", "lvm", "create", "--data", str(dev), "--osd-id", str(oid)])
-        else:
-            add("准备新盘（12.x）", ["ceph-disk", "prepare", str(dev)])
-            add("激活 OSD（12.x）", ["ceph-disk", "activate", str(dev)])
-        add("重新加入集群", ["ceph", "osd", "in", str(oid)])
-        add("集群健康验证", ["ceph", "-s", "--format=json"])
+            if purge:
+                add("移除 OSD 但留作替换（purge）", ["ceph", "osd", "purge", str(oid), "--yes-i-really-mean-it"],
+                    "清掉 CRUSH 条目 / 认证 / osdmap 记录；编号 osd.%d 由下一步 --osd-id 强制复用" % oid)
+            else:
+                add("从 CRUSH 移除", ["ceph", "osd", "crush", "remove", "osd.%d" % oid])
+                add("删除认证", ["ceph", "auth", "del", "osd.%d" % oid])
+                add("删除 OSD", ["ceph", "osd", "rm", str(oid)])
+            add("物理更换故障盘", None,
+                "现场操作：按盘位 / SN 换上同规格新盘；不要换盘位、不要改主机")
+            if probe.major >= 13:
+                add("清理新盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"],
+                    "清掉旧签名；只作用于 %s，执行前请核对盘位与 SN" % dev)
+                add("用原编号重建 OSD（--osd-id 强制复用）",
+                    ["ceph-volume", "lvm", "create", "--data", str(dev), "--osd-id", str(oid)],
+                    "不指定 --osd-id 就会分配一个新编号；这里强制沿用原编号 osd.%d" % oid)
+            else:
+                add("准备新盘（12.x）", ["ceph-disk", "prepare", str(dev)])
+                add("激活 OSD（12.x）", ["ceph-disk", "activate", str(dev)])
+            if weight > 0.001 and abs(weight - 1.0) > 0.001:
+                add("恢复原 CRUSH 权重", ["ceph", "osd", "crush", "reweight", "osd.%d" % oid,
+                                          "%.4f" % weight],
+                    "新建 OSD 默认权重是 1.0，原权重是 %.4f；不恢复会导致这块盘承载的数据偏少" % weight)
+        add("确认 osd.%d 用原编号重新上线" % oid, ["ceph", "osd", "dump", "--format=json"],
+            "osds[] 中应重新出现 osd.%d，且 up=true / in=true（编号必须与原来一致）" % oid)
+        add("集群健康验证", ["ceph", "-s", "--format=json"],
+            "新 OSD 上线后数据开始回填，观察 PG 回到 active+clean")
     elif intent == "remove":
         add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)])
@@ -1295,8 +1361,8 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             "osds[] 中该 OSD 的 up / in 都应为 true")
         add("集群健康验证", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
     elif intent == "init":
-        # 一键换盘 = 插入新盘后一键完成初始化：预检 -> 清元数据 -> 创建 OSD -> 等上线。
-        # 不碰任何已有 OSD，也不需要先踢掉旧 OSD。
+        # 新增磁盘 = 扩容：预检 -> 清元数据 -> 创建 OSD（新编号）-> 等上线。
+        # 不是「换盘」：换盘走 replace，要保住原编号。
         if orch:
             add("预检设备是否可加入集群", ["ceph", "orch", "device", "ls", "--format=json"],
                 "确认 %s 的 available 为 true，且没有被其它 OSD 占用" % dev)
@@ -1329,8 +1395,10 @@ def plan_strings(plan):
 
 # 这些步骤失败不应中断整个流程（权限不足 / 服务本来就没跑 / 编排器未接管），
 # 失败只记警告，后续步骤继续，最后由状态复核给出真实结论。
-TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "预检设备是否可加入集群",
-                  "预检设备是否未被占用")
+TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止故障 OSD 守护进程",
+                  "预检设备是否可加入集群", "预检设备是否未被占用",
+                  "轮询移除进度", "确认新盘已被编排器识别",
+                  "用原编号重建 OSD（cephadm 复用编号）")
 
 
 def execute_plan(cfg, probe, plan, allow_write):
@@ -1843,7 +1911,7 @@ class Handler(BaseHTTPRequestHandler):
         host = str(body.get("host", "") or "")
         dev = str(body.get("dev", "") or "")
         phrase = str(body.get("confirm_phrase", "") or "")
-        # 新盘初始化没有 OSD id，确认短语是设备路径；其余意图仍是 osd.<id>。
+        # 新增磁盘没有 OSD id，确认短语是设备路径；其余意图（含换盘）仍是 osd.<id>。
         if intent == "init":
             oid = None
             expected = dev
@@ -1877,12 +1945,45 @@ class Handler(BaseHTTPRequestHandler):
             used = set(osd_used_devices(self.cfg)[0].values())
             if dev in used:
                 return self._json({"error": "%s 已被现有 OSD 使用，拒绝初始化；请确认新盘设备路径" % dev}, 400)
+        if intent == "replace" and allow:
+            # 同一把锁：换盘同样要 zap 新盘，绝不能把别的 OSD 正在用的盘当「新盘」抹掉。
+            dev_by_id = osd_used_devices(self.cfg)[0]
+            owners = [i for i, d in dev_by_id.items() if d and d == dev]
+            if owners and oid not in owners:
+                others = "、".join("osd.%d" % i for i in owners)
+                return self._json({"error": "%s 当前被 %s 使用，不能当作新盘重建；"
+                                            "请核对设备路径" % (dev, others)}, 400)
+        if intent == "replace" and allow and stage == "post":
+            # cephadm 的 --replace 会在新盘出现后自动重建：这时再 zap + add 会把
+            # 刚建好的 OSD 又抹掉。所以 post 阶段先回读状态，已经回来了就直接收工。
+            st0 = osd_upin_state(self.cfg, oid)
+            if st0 and st0.get("up") and st0.get("in"):
+                verify = check_replace(self.cfg, oid)
+                _STATE_CACHE["data"] = None
+                _STATE_CACHE["ts"] = 0
+                audit("OSD_REPLACE", "osd.%d" % oid, "-", "SKIP",
+                      "cephadm 已自动用原编号重建并上线，跳过重复 zap / 重建",
+                      self._client(), self._user())
+                return self._json({"ok": True, "commands": [],
+                                   "results": ["skip: cephadm 已复用原编号 osd.%d 自动重建，"
+                                               "无需再 zap / 重建" % oid],
+                                   "target": "osd.%d" % oid, "verify": verify,
+                                   "dry_run": False, "version": self.probe.version,
+                                   "orchestrator": self.probe.orchestrator,
+                                   "stage": stage, "pause": False, "pending_commands": [],
+                                   "manual_step": None})
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
         verify = None
         if intent == "downout" and not dry:
             # 命令返回码为 0 不等于 down 真的生效（心跳会把标记改回 up），
             # 必须回读 ceph osd dump 复核，并把真实结论回给前端。
             verify = check_downout(self.cfg, oid)
+            if verify["message"]:
+                results.append("verify: " + verify["message"])
+        if intent == "replace" and not dry and stage != "pre":
+            # 换盘的核心承诺是「编号不变 + 真的回来了」，只能靠回读 osd dump 证明。
+            # stage=pre 时 OSD 刚被移除、新盘还没换，此刻复核必然失败，不能当成结论。
+            verify = check_replace(self.cfg, oid)
             if verify["message"]:
                 results.append("verify: " + verify["message"])
         if not dry:
@@ -1930,7 +2031,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/quick/in":
                 override = "in"
             elif path == "/api/quick/init":
-                # 一键换盘 = 插入新盘后一键初始化（清元数据 + 创建 OSD + 等上线）
+                # 新增磁盘 = 扩容（清元数据 + 创建 OSD，分配新编号）
                 override = "init"
             return self._execute(body, override, str(body.get("stage", "auto")))
         if path.startswith("/api/osd/") and path.endswith(("/out", "/in")):

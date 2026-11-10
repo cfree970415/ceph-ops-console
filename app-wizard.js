@@ -282,7 +282,8 @@ function exportAudit(){var lines=state.audit.map(function(a){return JSON.stringi
  var blob=new Blob([lines+'\n'],{type:'application/x-ndjson'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='ceph-console-audit.jsonl';a.click();URL.revokeObjectURL(u);toast('审计日志已导出','ok');}
 
 /* ---------- bindings ---------- */
-var NUMKEYS={nearfull:1,full:1,downMin:1,pgDegraded:1,slowOps:1,'wizard.osdId':1};
+var NUMKEYS={nearfull:1,full:1,downMin:1,pgDegraded:1,slowOps:1,'wizard.osdId':1,
+             'pool.size':1,'pool.minSize':1,'pool.pg':1,'pool.pgp':1};
 function setBind(path,val,el){var ks=path.split('.'),o=state;
  for(var i=0;i<ks.length-1;i++)o=o[ks[i]];var k=ks[ks.length-1];
  if(el&&el.type==='checkbox')o[k]=el.checked;

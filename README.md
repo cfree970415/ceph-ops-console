@@ -21,6 +21,7 @@
 - [快速开始](#快速开始)
 - [登录与权限](#登录与权限)
 - [一键踢盘 / 换盘 / IN 盘](#一键踢盘--一键换盘--一键-in-盘)
+- [创建存储池](#创建存储池)
 - [告警中心](#告警中心)
 - [与原生 Ceph Dashboard 的隔离](#与原生-ceph-dashboard-的隔离)
 - [安全设计](#安全设计)
@@ -43,7 +44,7 @@
 | 集群概览 | HEALTH 状态、OSD 上下线、容量与 PG 状态、活跃告警、待处置故障盘、SVG 趋势图 |
 | 告警中心 | 四级告警分级统计、筛选/确认/静默、告警直达故障 OSD 的一键处置入口 |
 | OSD / 磁盘 | OSD 列表（服务器名 + IP + 真实设备映射）、元数据查询、行内 OUT / IN 切换、一键踢盘换盘 |
-| 存储池 / 主机 | 存储池用量、主机与 MON 视图 |
+| 存储池 / 主机 | 存储池用量与创建（replicated / EC）、主机与 MON 视图 |
 | 一键踢盘 | 停止 OSD 守护进程 → 标记 DOWN → 标记 OUT → 健康验证 → 回读复核（**不退役**，不清 CRUSH 条目、不清盘） |
 | 一键换盘 | 停服务 → OUT → 移除但**保留编号**（`--replace`）→ 现场换盘（暂停）→ 清理新盘 → 用原编号重建 → 回读复核（**OSD 编号不变**） |
 | 新增磁盘 | 预检新盘 → 清理元数据 → 创建 OSD（**新编号**）→ 等待上线 → 健康验证（扩容加盘） |
@@ -322,9 +323,44 @@ unset PW
 1. 服务端启动参数 `--allow-write`（由 `deploy.sh --allow-write` 传入）；
 2. 专用 keyring 具备写能力（安装默认 `--keyring full`）；
 3. 登录角色为 `admin`，且请求带 `allow_write: true`；
-4. 请求体携带正确的 `confirm_phrase`（格式 `osd.<ID>`）。
+4. 请求体携带正确的 `confirm_phrase`（OSD 操作为 `osd.<ID>`，创建存储池为池名）。
 
 其余情况一律 DRY-RUN：返回完整命令列表、写入审计，但**不执行**。此外 OSD ID 强制整数校验、设备路径与主机名走白名单正则，所有外部命令以 argv 数组调用（不经 shell），避免命令注入。
+
+---
+
+## 创建存储池
+
+入口：「存储池」页右上角 **创建存储池**（列表为空时表格里也有同一个按钮）。
+
+```
+填写参数 → 后端生成命令预览 → 输入池名二次确认 → 执行 → 回读 ceph osd pool ls detail 复核
+```
+
+支持两种池：
+
+- **replicated（多副本）**：指定 `size` / `min_size`，常规业务首选；
+- **erasure（纠删码）**：选择已存在的 EC profile（弹窗里显示 `k` / `m` 与可容忍故障盘数），`size` 由 `k+m` 决定，**不允许单独设 size**。
+
+命令模板（12.x ~ 19.x 通用，不使用版本相关的 `--size` 一类参数）：
+
+```bash
+ceph osd pool create <name> <pg_num> <pgp_num> replicated [<crush_rule>]
+ceph osd pool set <name> size 3
+ceph osd pool set <name> min_size 2
+ceph osd pool set <name> pg_autoscale_mode on      # 14.x+，老版本失败不中断
+ceph osd pool application enable <name> rbd        # rbd / cephfs / rgw，可选
+ceph osd pool ls detail --format=json              # 复核
+ceph -s --format=json
+```
+
+EC 池把第二行换成 `... erasure <ec_profile>`，并跳过 `set size`。
+
+- **参数来源**：CRUSH rule 列表、EC profile 列表、OSD 数全部读自集群（`ceph osd crush rule ls` / `ceph osd erasure-code-profile ls|get` / `ceph osd ls`），取不到就不显示建议值；PG 建议值按「OSD 数 × 100 ÷ 3 副本」向上取 2 的幂，**只是建议**，可手工改。
+- **执行前挡重名**：后端先 `ceph osd pool ls` 比对，同名直接 400 拒绝（前端预览阶段也会标红并禁用创建按钮）。
+- **参数校验**：池名 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`、不能以 `.` 开头（Ceph 保留 `.mgr` / `.rgw.root`）、`size` 1~10、`min_size` ≤ `size`、`pg_num` 1~65536、应用类型白名单；所有命令仍以 argv 数组下发，不经 shell。
+- **复核才算成功**：执行后回读 `ceph osd pool ls detail`，池必须出现且 `size / min_size / pg_num` 与提交一致，否则界面显示「命令已下发，但复核未通过」并给出回读结果。
+- 建池只新增池与 PG，**不迁移、不删除**任何现有数据；`cephfs` 应用标记只是打标签，文件系统仍需单独创建（`ceph fs new`）。
 
 ---
 
@@ -406,6 +442,9 @@ unset PW
 | POST | `/api/quick/init` | 新增磁盘（扩容：zap + 创建 OSD，分配新编号） |
 | POST | `/api/quick/replace` | 一键换盘：坏盘换新盘并**保留原 OSD 编号**（`stage=pre` 停在中途等现场换盘，`stage=post` 继续重建） |
 | POST | `/api/execute` | 高级向导执行 |
+| GET | `/api/pool/options` | 建池下拉项：OSD 数、已有池名、CRUSH rule、EC profile（含 k/m）、PG 建议值 |
+| POST | `/api/pool/plan` | 建池命令预览（不执行） |
+| POST | `/api/pool/create` | 创建存储池（replicated / erasure，`confirm_phrase` = 池名，返回 `verify` 复核结论） |
 | POST | `/api/osd/<id>/out` `/in` | 标记 OSD out / in |
 | POST | `/api/alert/ack` | 告警确认 |
 | OPTIONS | `/api/*` | CORS 预检 |

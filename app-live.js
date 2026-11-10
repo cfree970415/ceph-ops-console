@@ -612,6 +612,215 @@ function quickExec(stage){
  });
 }
 
+/* ---------- create pool ---------- */
+/* 建池是「新增」类操作：不迁移也不删除任何现有数据，但会立刻产生 PG 并开始
+   占用集群 IO，所以同样走预览 → 二次确认 → 后端回读复核这条链路。 */
+function poolSpec(){
+ var p=state.pool||{};
+ return {name:String(p.name||'').trim(),type:p.type||'replicated',
+  size:Number(p.size)||0,min_size:Number(p.minSize)||0,
+  pg_num:Number(p.pg)||0,pgp_num:Number(p.pgp)||Number(p.pg)||0,
+  rule:p.rule||'',ec_profile:(p.type==='erasure')?(p.ec||'default'):'',
+  app:p.app||'',autoscale:!!p.autoscale};
+}
+function poolValidate(){
+ var p=state.pool,s=poolSpec();
+ if(!s.name)return '请填写存储池名称';
+ if(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(s.name))return '名称只允许字母、数字、点、下划线、短横线，且不超过 64 位';
+ if(s.name.charAt(0)==='.')return '名称不能以 . 开头（Ceph 保留）';
+ if(p.type==='replicated'){
+  if(!(s.size>=1&&s.size<=10))return '副本数需在 1 ~ 10 之间';
+  if(!(s.min_size>=1&&s.min_size<=s.size))return 'min_size 需在 1 ~ size 之间';
+ }else if(!s.ec_profile){return '请选择 EC profile';}
+ if(!(s.pg_num>=1&&s.pg_num<=65536))return 'PG 数需在 1 ~ 65536 之间';
+ return '';
+}
+function poolOpen(){
+ var live=state.mode==='live'&&state.auth.authenticated;
+ state.pool={name:'',type:'replicated',size:3,minSize:2,pg:0,pgp:0,rule:'',ec:'',
+  app:'rbd',autoscale:true,opts:null,loading:live,phase:'form',steps:[],spec:null,
+  phrase:'',confirmed:false,busy:false,error:'',dryRun:!state.settings.allowWrite,
+  logs:[],verify:null,exists:false,results:[]};
+ state.quick=null;
+ poolPaint();
+ if(!live){state.pool.loading=false;poolPaint();return;}
+ apiFetch('GET','/api/pool/options').then(function(r){
+  var p=state.pool;if(!p)return;
+  var d=r.data||{};
+  p.opts=d;p.loading=false;p.autoscale=!!d.autoscale;
+  var g=Number(d.pg_suggest)||64;p.pg=g;p.pgp=g;
+  if((d.ec_profiles||[]).length)p.ec=d.ec_profiles[0].name;
+  poolPaint();
+ }).catch(function(e){
+  var p=state.pool;if(!p)return;
+  p.loading=false;p.opts={};p.error='无法读取集群池配置：'+(e.message||e);poolPaint();
+ });
+}
+/* 预览：命令序列必须来自后端，前端不自己拼 ceph 命令 */
+function poolPreview(){
+ var p=state.pool;if(!p||p.busy)return;
+ var bad=poolValidate();if(bad){toast(bad,'e');return;}
+ if(!(state.mode==='live'&&state.auth.authenticated)){
+  p.error='未连接后端：请先登录后再创建存储池';poolPaint();return;}
+ p.error='';p.phase='loading';poolPaint();
+ apiFetch('POST','/api/pool/plan',poolSpec()).then(function(r){
+  var q=state.pool;if(!q)return;
+  q.spec=r.spec||poolSpec();q.exists=!!r.exists;
+  q.steps=(r.steps||[]).map(function(s){return {n:s.name,c:s.command||('# '+s.name),note:s.note||'',manual:!!s.manual};});
+  q.phase='confirm';
+  if(!state.settings.confirm){q.phrase=q.spec.name;q.confirmed=true;}
+  poolPaint();
+ }).catch(function(e){
+  var q=state.pool;if(!q)return;
+  q.phase='form';q.error=e.message||'命令预览失败';poolPaint();
+ });
+}
+function poolRun(){
+ var p=state.pool;if(!p||p.busy)return;
+ var s=poolSpec();
+ if(state.settings.confirm&&(p.phrase!==s.name||!p.confirmed)){
+  toast('请输入池名 '+s.name+' 并勾选确认','e');return;}
+ p.busy=true;p.error='';p.phase='running';p.logs=[];p.results=[];p.verify=null;poolPaint();
+ var body=poolSpec();
+ body.confirm_phrase=s.name;   /* 后端校验的就是这个池名，与输入框内容无关 */
+ body.allow_write=!p.dryRun;
+ apiFetch('POST','/api/pool/create',body).then(function(r){
+  var q=state.pool;if(!q)return;
+  q.busy=false;q.verify=r.verify||null;q.results=r.results||[];q.commands=r.commands||[];
+  q.spec=r.spec||q.spec;q.phase='done';
+  poolPaint();
+  var bad=q.verify&&q.verify.ok===false;
+  if(q.dryRun)toast('DRY-RUN：建池命令已生成，尚未下发集群','w');
+  else toast(bad?'池已创建但复核未通过，请查看详情':'存储池 '+s.name+' 已创建',bad?'w':'ok');
+  if(state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState(true).then(function(){render();});},800);
+ }).catch(function(e){
+  var q=state.pool;if(!q)return;
+  q.busy=false;q.phase='confirm';q.error=e.message||'创建失败';poolPaint();
+ });
+}
+function poolField(label,inner,hint){
+ return '<div class="fgrp" style="margin-bottom:12px"><label class="fld">'+label+'</label>'+inner+
+  (hint?'<div class="hint">'+hint+'</div>':'')+'</div>';
+}
+function poolPaint(){
+ var p=state.pool;if(!p)return;
+ var o=p.opts||{},b='',foot='',name='';
+ if(p.loading){
+  b='<div class="empty">'+ic('refresh',34)+'<div>正在读取集群池配置（OSD 数 / CRUSH rule / EC profile）…</div></div>';
+  foot='<div class="sp"></div><button class="btn" data-act="pool-close">取消</button>';
+ }else if(p.phase==='form'){
+  var rules=(o.rules||[]).map(function(r){
+   return '<option value="'+esc(r)+'"'+(p.rule===r?' selected':'')+'>'+esc(r)+'</option>';}).join('');
+  var ecs=(o.ec_profiles||[]).map(function(e){
+   var km=(e.k!=null&&e.m!=null)?(' · k='+e.k+' m='+e.m+'（可容忍 '+e.m+' 块盘故障）'):'';
+   return '<option value="'+esc(e.name)+'"'+(p.ec===e.name?' selected':'')+'>'+esc(e.name)+km+'</option>';}).join('');
+  var sug=Number(o.pg_suggest)||0;
+  b='<div class="warnbox" style="margin-bottom:14px">'+ic('db')+
+   '<div><b>在集群里新建一个存储池</b><br>只新增池与 PG，不迁移、不删除现有数据，也不改动已有池的配置。'+
+   '新建池会立刻产生 PG 并开始占用 IO，集群繁忙时建议先在低峰期操作。<br>'+
+   '已有池 '+((o.pools||[]).length||state.pools.length||0)+' 个 · OSD '+(o.osds!=null?o.osds:state.osds.length)+' 个 · 当前为 <b>'+
+   (p.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
+   poolField('存储池名称','<input class="inp mono" data-bind="pool.name" value="'+esc(p.name)+'" placeholder="例如 k8s-rbd" autocomplete="off">','建好后不能改名：RBD / CephFS / RGW 的应用都会被这个名称引用。')+
+   poolField('类型','<select class="inp" data-bind="pool.type" data-act="pool-type">'+
+     '<option value="replicated"'+(p.type==='replicated'?' selected':'')+'>replicated · 多副本（常规首选）</option>'+
+     '<option value="erasure"'+(p.type==='erasure'?' selected':'')+'>erasure · 纠删码（省空间，写放大高）</option></select>','')+
+   (p.type==='replicated'
+    ?'<div class="grid g2" style="gap:10px">'+
+      poolField('副本数 size','<input class="inp mono" type="number" min="1" max="10" data-bind="pool.size" value="'+esc(p.size)+'">','3 副本可容忍 1 块盘故障且不丢数据。')+
+      poolField('min_size','<input class="inp mono" type="number" min="1" max="10" data-bind="pool.minSize" value="'+esc(p.minSize)+'">','可用副本低于该值会停止写入，通常取 size-1。')+'</div>'
+    :'<div class="grid g2" style="gap:10px">'+
+      poolField('EC profile','<select class="inp mono" data-bind="pool.ec" data-act="pool-type">'+(ecs||'<option value="default">default</option>')+'</select>','k+m 决定空间放大与容忍度；ks=4 km=2 之类由 profile 决定。')+
+      poolField('min_size（可选）','<input class="inp mono" type="number" min="0" max="32" data-bind="pool.minSize" value="'+esc(p.minSize)+'">','一般填 k+1；填 0 表示用 profile 默认。')+'</div>')+
+   '<div class="grid g2" style="gap:10px">'+
+    poolField('PG 数（pg_num）','<input class="inp mono" type="number" min="1" max="65536" data-bind="pool.pg" value="'+esc(p.pg)+'">',
+      sug?('建议 '+sug+'（按 '+((o.osds!=null?o.osds:'?'))+' 个 OSD × 100 / 3 副本估算，取 2 的幂）：'+
+       '<button class="btn sm" data-act="pool-suggest-pg" data-value="'+sug+'">用建议值</button>'):'')+
+    poolField('PG 自动扩缩','<label class="chk" style="margin-top:6px"><input type="checkbox" data-bind="pool.autoscale"'+(p.autoscale?' checked':'')+'><span>开启 <span class="mono">pg_autoscale_mode</span>（按实际用量自动调 PG）</span></label>','14.x 及以上支持；老版本该步会失败但不影响建池。')+'</div>'+
+   '<div class="grid g2" style="gap:10px">'+
+    poolField('CRUSH rule','<select class="inp mono" data-bind="pool.rule"><option value="">默认（集群默认 rule）</option>'+rules+'</select>','需要指定故障域 / 设备类时选择对应 rule。')+
+    poolField('应用类型','<select class="inp" data-bind="pool.app">'+
+      [['','不启用（通用池）'],['rbd','rbd · 块存储'],['cephfs','cephfs · 文件系统元数据 / 数据'],['rgw','rgw · 对象网关']].map(function(x){
+       return '<option value="'+x[0]+'"'+(p.app===x[0]?' selected':'')+'>'+x[1]+'</option>';}).join('')+'</select>','enable 只是打应用标记；CephFS 还需另外创建文件系统，RBD 可直接建镜像。')+'</div>'+
+   (p.error?'<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div>'+esc(p.error)+'</div></div>':'');
+  if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝创建；请用管理员账号登录。</div></div>';
+  foot='<button class="btn" data-act="pool-close">取消</button><div class="sp"></div>'+
+   '<button class="btn pri" data-act="pool-preview">'+ic('terminal',14)+' 生成命令预览</button>';
+ }else if(p.phase==='loading'){
+  b='<div class="empty">'+ic('refresh',34)+'<div>正在向后端请求建池命令序列…</div></div>';
+  foot='<div class="sp"></div><button class="btn" data-act="pool-close">取消</button>';
+ }else if(p.phase==='confirm'){
+  var sp=p.spec||poolSpec();
+  var typeTxt=sp.type==='erasure'?('erasure · '+esc(sp.ec_profile)):'replicated · size '+sp.size+' / min_size '+sp.min_size;
+  b='<div class="warnbox" style="margin-bottom:14px">'+ic('db')+
+   '<div><b>即将创建存储池 '+esc(sp.name)+'</b><br>流程：建池 → 设置 size / min_size → 开启 PG 自动扩缩 → 标记应用类型 → 回读池配置复核 → 健康验证。<br>'+
+   '这是新增操作，不会删除或改写任何现有池的数据。<br>当前为 <b>'+(p.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
+   '<div class="grid g2" style="margin-bottom:14px"><div>'+
+    '<div class="stat-line"><span>名称</span><b class="mono tp">'+esc(sp.name)+'</b></div>'+
+    '<div class="stat-line"><span>类型</span><b class="mono">'+typeTxt+'</b></div>'+
+    '<div class="stat-line"><span>PG</span><b class="mono">'+sp.pg_num+' / pgp '+sp.pgp_num+'</b></div></div><div>'+
+    '<div class="stat-line"><span>应用</span><b class="mono">'+esc(sp.app||'未标记')+'</b></div>'+
+    '<div class="stat-line"><span>CRUSH rule</span><b class="mono">'+esc(sp.rule||'默认')+'</b></div>'+
+    '<div class="stat-line"><span>自动扩缩</span><b class="'+(sp.autoscale?'t':'tw')+'">'+(sp.autoscale?'开启':'关闭')+'</b></div></div></div>'+
+   (p.exists?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div>集群中已存在同名池 <b class="mono">'+esc(sp.name)+'</b>，创建会被拒绝。请改名后重试。</div></div>':'')+
+   '<div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">后端生成的命令序列（'+esc(liveProfile().version||'')+' / '+esc(liveProfile().orchestrator||'')+'）</div>'+
+   '<div class="cmdbox" style="max-height:200px;overflow:auto">'+p.steps.map(function(s,i){
+     return '<div><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
+      (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('')+'</div>'+
+   (p.error?'<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div>'+esc(p.error)+'</div></div>':'');
+  if(state.settings.confirm){
+   b+='<div class="hr"></div><div class="fgrp"><label class="fld">输入池名 <span class="mono" style="color:var(--accent2)">'+esc(sp.name)+'</span> 确认</label>'+
+    '<input class="inp mono" data-bind="pool.phrase" value="'+esc(p.phrase)+'" placeholder="'+esc(sp.name)+'" autocomplete="off"></div>'+
+    '<label class="chk"><input type="checkbox" data-bind="pool.confirmed"'+(p.confirmed?' checked':'')+'><span>我确认要创建该存储池，且名称与参数符合预期</span></label>';
+  }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即创建」将直接下发。</div>';
+  foot='<button class="btn" data-act="pool-back">返回修改</button><div class="sp"></div>'+
+   '<button class="btn pri" data-act="pool-run"'+(p.exists?' disabled':'')+'>'+ic('db',14)+' 立即创建存储池</button>';
+ }else if(p.phase==='running'){
+  b='<div class="flex" style="margin-bottom:10px"><span class="tag '+(p.dryRun?'warn':'err')+'">'+(p.dryRun?'DRY-RUN':'EXECUTE')+'</span>'+
+   '<div class="sp"></div><b class="mono">后端执行中…</b></div>'+
+   '<div class="empty">'+ic('refresh',34)+'<div>正在下发 '+(p.steps.length||0)+' 条命令并回读池配置，请稍候…</div></div>';
+  foot='<div class="sp"></div><button class="btn" disabled>执行中</button>';
+ }else if(p.phase==='done'){
+  var bad=p.verify&&p.verify.ok===false;
+  var v=p.verify||{};
+  b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+(bad?'td':'t')+'">'+
+   ic(bad?'alert':'check',38)+'</div>'+
+   '<div style="font-size:16px;font-weight:700;margin-top:8px">'+
+   (p.dryRun?'命令已生成（DRY-RUN 未下发）':bad?'命令已下发，但复核未通过':'存储池已创建')+'</div>'+
+   '<div class="note" style="margin-top:6px">'+esc((p.spec||{}).name||'')+' · '+
+   (p.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':
+    bad?esc(v.message||'无法回读该池'):esc(v.message||'已创建'))+'</div></div>'+
+   (bad?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div>'+esc(v.message||'')+'</div></div>':'')+
+   '<div class="grid g2"><div>'+
+    '<div class="stat-line"><span>执行步骤</span><b class="mono">'+p.steps.length+'</b></div>'+
+    '<div class="stat-line"><span>集群版本</span><b class="mono">'+esc(liveProfile().version||'-')+'</b></div></div><div>'+
+    '<div class="stat-line"><span>复核结果</span><b class="'+(bad?'td':'t')+'">'+(p.dryRun?'未执行':(bad?'未通过':'通过'))+'</b></div>'+
+    '<div class="stat-line"><span>审计记录</span><b class="t">已写入</b></div></div></div>'+
+   (p.results.length?'<div class="cmdbox" style="max-height:170px;overflow:auto;margin-top:12px">'+
+     p.results.map(function(r){return '<div class="'+(/^(warning|verify|stopped)/.test(String(r))?'tw':'')+'">'+esc(String(r))+'</div>';}).join('')+'</div>':'')+
+   '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>回到「存储池」页确认新池已出现、PG 回到 active+clean；建池的完整命令与返回码已写入变更审计。</div></div>';
+  foot='<div class="sp"></div><button class="btn" data-act="pool-audit">变更审计</button>'+
+   '<button class="btn pri" data-act="pool-view">查看存储池</button>';
+ }
+ openModal(modalHead('创建存储池','不触碰现有池与数据 · '+(p.dryRun?'DRY-RUN':'EXECUTE'))+
+  '<div class="modal-b">'+b+'</div><div class="modal-f">'+foot+'</div>','md');
+}
+function poolAction(act,el){
+ var p=state.pool;
+ switch(act){
+  case 'pool-open':poolOpen();return;
+  case 'pool-close':state.pool=null;closeModal();render();return;
+  case 'pool-back':if(p){p.phase='form';p.error='';poolPaint();}return;
+  case 'pool-type':if(p){poolPaint();}return;
+  case 'pool-suggest-pg':if(p){p.pg=Number(el.getAttribute('data-value'))||p.pg;p.pgp=p.pg;poolPaint();}return;
+  case 'pool-preview':poolPreview();return;
+  case 'pool-run':poolRun();return;
+  case 'pool-view':state.pool=null;closeModal();state.view='pools';render();
+   if(state.mode==='live')syncState(true).then(function(){render();});return;
+  case 'pool-audit':state.pool=null;closeModal();state.view='audit';render();loadAudit(true).then(function(){render();});return;
+  default:return;
+ }
+}
+
 /* ---------- action routing ---------- */
 function quickAction(act,el){
  var q=state.quick;
@@ -665,6 +874,7 @@ var __baseOnAct=onAct;
 onAct=function(act,el){
  if(act.indexOf('auth-')===0)return authAction(act,el);
  if(act.indexOf('q-')===0)return quickAction(act,el);
+ if(act.indexOf('pool-')===0)return poolAction(act,el);
  if(act==='diag-retry'){__histAt=0;syncState(true).then(function(){return loadHistory(true);}).then(function(){render();});return;}
  if(act==='diag-run'){runDiag();return;}
  if(act==='logout')return doLogout();
@@ -672,9 +882,12 @@ onAct=function(act,el){
  if(act==='overlay'){
   if(state.quick&&(state.quick.phase==='running'||state.quick.phase==='paused')){
    toast('操作进行中，请先完成或中止','w');return;}
-  state.quick=null;return __baseOnAct(act,el);}
- if(act==='modal-close'&&state.quick){state.quick=null;return __baseOnAct(act,el);}
- if(act==='nav'&&state.quick){state.quick=null;}
+  if(state.pool&&state.pool.busy){toast('建池命令正在下发，请稍候','w');return;}
+  state.quick=null;state.pool=null;return __baseOnAct(act,el);}
+ if(act==='modal-close'&&(state.quick||state.pool)){
+  if(state.pool&&state.pool.busy){toast('建池命令正在下发，请稍候','w');return;}
+  state.quick=null;state.pool=null;return __baseOnAct(act,el);}
+ if(act==='nav'&&(state.quick||state.pool)){state.quick=null;state.pool=null;}
  return __baseOnAct(act,el);
 };
 

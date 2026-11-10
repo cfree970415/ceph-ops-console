@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -63,6 +63,9 @@ CODENAMES = {12: "Luminous", 13: "Mimic", 14: "Nautilus", 15: "Octopus",
              16: "Pacific", 17: "Quincy", 18: "Reef", 19: "Squid", 20: "Tentacle"}
 DEV_RE = re.compile(r"^/dev/[A-Za-z0-9._/-]+$")
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# 存储池名称：不允许空格 / 斜杠 / 冒号，也不能以 . 开头（Ceph 保留命名空间，
+# 例如 .mgr、.rgw.root）。参数化 subprocess 不经 shell，这里只做最小必要限制。
+POOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 # --------------------------------------------------------------------------
@@ -990,6 +993,202 @@ def read_pools(cfg):
     return out
 
 
+# --------------------------------------------------------------------------
+# pool create (replicated / erasure)
+# --------------------------------------------------------------------------
+def pool_names(cfg):
+    """已存在的池名，用来在创建前挡住重名。"""
+    doc, _ = ceph_json(cfg, ["osd", "pool", "ls"], 20)
+    return [str(x) for x in doc] if isinstance(doc, list) else []
+
+
+def ec_profile_list(cfg):
+    """EC profile + k / m。`osd erasure-code-profile get` 只输出 key=value
+    文本（不支持 --format=json），所以这里解析文本而不是走 ceph_json。"""
+    names, _ = ceph_json(cfg, ["osd", "erasure-code-profile", "ls"], 20)
+    out = []
+    if not isinstance(names, list):
+        return out
+    for n in names:
+        item = {"name": str(n), "k": None, "m": None, "plugin": ""}
+        rc, text, _ = ceph_run(cfg, ["osd", "erasure-code-profile", "get", str(n)], 15)
+        if rc == 0:
+            for line in (text or "").splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k in ("k", "m"):
+                    try:
+                        item[k] = int(v)
+                    except ValueError:
+                        pass
+                elif k == "plugin":
+                    item["plugin"] = v
+        out.append(item)
+    return out
+
+
+def suggest_pg_num(osds, divisor, floor=8, cap=1024):
+    """按「每 OSD 约 100 个 PG / 单个池」估一个 2 的幂，仅作建议值。"""
+    target = max(floor, (max(1, int(osds)) * 100) // max(1, int(divisor)))
+    p = 1
+    while p < target:
+        p *= 2
+    return int(min(cap, max(floor, p)))
+
+
+def read_pool_options(cfg, probe):
+    """创建存储池弹窗需要的下拉项与建议值，全部来自集群实际状态。"""
+    ids, _ = ceph_json(cfg, ["osd", "ls"], 20)
+    osd_count = len(ids) if isinstance(ids, list) else 0
+    rules, _ = ceph_json(cfg, ["osd", "crush", "rule", "ls"], 20)
+    return {"osds": osd_count,
+            "pools": pool_names(cfg),
+            "rules": [str(x) for x in rules] if isinstance(rules, list) else [],
+            "ec_profiles": ec_profile_list(cfg),
+            "autoscale": probe.major >= 14 or probe.major == 0,
+            # 拿不到 OSD 数就不给建议值，免得用 0 算出一个看似精确的假数字
+            "pg_suggest": suggest_pg_num(osd_count, 3) if osd_count else 0,
+            "version": probe.version,
+            "orchestrator": probe.orchestrator}
+
+
+def validate_pool_spec(body):
+    """把请求体收敛成一份可信的建池参数，非法输入直接报错而不是拼进命令。"""
+    name = str(body.get("name", "") or "").strip()
+    if not name:
+        raise ValueError("请填写存储池名称")
+    if name.startswith("."):
+        raise ValueError("存储池名称不能以 . 开头（Ceph 保留给 .mgr / .rgw.root 等）")
+    if not POOL_NAME_RE.match(name):
+        raise ValueError("存储池名称只允许字母、数字、点、下划线、短横线，且不超过 64 位")
+
+    ptype = str(body.get("type", "replicated") or "replicated")
+    if ptype not in ("replicated", "erasure"):
+        raise ValueError("type must be replicated or erasure")
+
+    def num(key, default=None):
+        raw = body.get(key, None)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            raise ValueError("%s 必须是整数" % key)
+
+    pg = num("pg_num", 32)
+    if pg is None or pg < 1 or pg > 65536:
+        raise ValueError("pg_num 必须在 1 ~ 65536 之间")
+    pgp = num("pgp_num", pg)
+    if pgp is None or pgp < 1 or pgp > 65536:
+        raise ValueError("pgp_num 必须在 1 ~ 65536 之间")
+
+    app = str(body.get("app", "") or "")
+    if app and app not in ("rbd", "cephfs", "rgw", "nfs"):
+        raise ValueError("unknown application: %s" % app)
+    rule = str(body.get("rule", "") or "")
+    if rule and not re.match(r"^[A-Za-z0-9._-]{1,64}$", rule):
+        raise ValueError("invalid crush rule name")
+    ec = str(body.get("ec_profile", "") or "")
+    if ec and not re.match(r"^[A-Za-z0-9._-]{1,64}$", ec):
+        raise ValueError("invalid erasure code profile name")
+
+    if ptype == "replicated":
+        size = num("size", 3)
+        if size is None or size < 1 or size > 10:
+            raise ValueError("副本数 size 必须在 1 ~ 10 之间")
+        min_size = num("min_size", max(1, size - 1))
+        if min_size is None or min_size < 1 or min_size > size:
+            raise ValueError("min_size 必须在 1 ~ size 之间（大于 size 会让池无法写入）")
+    else:
+        # EC 池的 size 由 profile 的 k+m 决定，不能单独设 size。
+        ec = ec or "default"
+        size = 0
+        min_size = num("min_size", 0) or 0
+        if min_size < 0 or min_size > 32:
+            raise ValueError("min_size 超出合理范围")
+
+    autoscale = body.get("autoscale", True)
+    if isinstance(autoscale, str):
+        autoscale = autoscale not in ("0", "false", "False", "off")
+    return {"name": name, "type": ptype, "size": size, "min_size": min_size,
+            "pg_num": pg, "pgp_num": pgp, "rule": rule, "ec_profile": ec,
+            "app": app, "autoscale": bool(autoscale)}
+
+
+def build_pool_plan(cfg, probe, spec):
+    """建池命令模板：12.x ~ 19.x 通用（不使用 --size 之类的版本相关参数）。"""
+    name = spec["name"]
+    plan = []
+
+    def add(n, argv, note=""):
+        plan.append((n, argv, note))
+
+    add("检查池名是否已被占用", ["ceph", "osd", "pool", "ls"],
+        "同名池存在时创建会失败；执行前后端还会再校验一次")
+    if spec["type"] == "replicated":
+        argv = ["ceph", "osd", "pool", "create", name, str(spec["pg_num"]),
+                str(spec["pgp_num"]), "replicated"]
+        if spec["rule"]:
+            argv.append(spec["rule"])
+        add("创建副本池", argv, "先按默认参数建池，size / min_size 由后续两条命令显式设定")
+        add("设置副本数 size", ["ceph", "osd", "pool", "set", name, "size", str(spec["size"])],
+            "副本数 %d：同时保存 %d 份数据" % (spec["size"], spec["size"]))
+        add("设置 min_size", ["ceph", "osd", "pool", "set", name, "min_size", str(spec["min_size"])],
+            "可用副本低于 min_size 时停止写入，避免数据进入不可恢复状态")
+    else:
+        add("创建 EC 池", ["ceph", "osd", "pool", "create", name, str(spec["pg_num"]),
+                          str(spec["pgp_num"]), "erasure", spec["ec_profile"]],
+            "纠删码池：profile %s，size 由 k+m 决定" % spec["ec_profile"])
+        if spec["min_size"]:
+            add("设置 min_size", ["ceph", "osd", "pool", "set", name, "min_size",
+                                  str(spec["min_size"])], "一般取 k+1：丢掉一块盘仍可读写")
+    if spec["autoscale"]:
+        add("启用 PG 自动扩缩", ["ceph", "osd", "pool", "set", name, "pg_autoscale_mode", "on"],
+            "由 mgr 按实际使用量自动调整 PG（14.x 及以上支持；老版本失败不影响建池）")
+    if spec["app"]:
+        add("标记应用类型 " + spec["app"], ["ceph", "osd", "pool", "application", "enable",
+                                            name, spec["app"]],
+            "rbd / cephfs / rgw 必须先 enable 才允许使用；cephfs 还需另外创建文件系统")
+    add("复核池配置", ["ceph", "osd", "pool", "ls", "detail", "--format=json"],
+        "确认池已出现，且 size / min_size / pg_num 与提交的参数一致")
+    add("集群健康验证", ["ceph", "-s", "--format=json"],
+        "新建池会立刻产生 PG，观察是否很快回到 active+clean")
+    return plan
+
+
+def check_pool(cfg, name):
+    """回读池配置：只有 pool ls detail 里真的出现且参数对得上才算成功。"""
+    doc, err = ceph_json(cfg, ["osd", "pool", "ls", "detail"], 30)
+    if not isinstance(doc, list):
+        return {"ok": False, "message": "无法回读池列表：%s" % (err or "命令失败")}
+    for d in doc:
+        if not isinstance(d, dict):
+            continue
+        pn = d.get("poolname") or d.get("pool_name") or ""
+        if pn != name:
+            continue
+        ptype = d.get("type")
+        if ptype == 3:
+            tname = "erasure"
+        elif ptype == 1:
+            tname = "replicated"
+        else:
+            tname = "erasure" if d.get("erasure_code_profile") else "replicated"
+        pg = d.get("pg_num")
+        if pg is None:
+            pg = d.get("pg_placement_num")
+        return {"ok": True, "name": name, "type": tname,
+                "size": d.get("size"), "min_size": d.get("min_size"),
+                "pg_num": pg, "pgp_num": d.get("pgp_num") or d.get("pg_placement_num"),
+                "ec_profile": d.get("erasure_code_profile") or "",
+                "message": "%s 已创建：%s · size=%s · min_size=%s · pg_num=%s" % (
+                    name, tname, d.get("size"), d.get("min_size"), pg)}
+    return {"ok": False,
+            "message": "池 %s 没有出现在 ceph osd pool ls detail 中，请检查创建命令的返回" % name}
+
+
 def read_hosts(cfg, cluster=None):
     if cfg.backend == "rest":
         return []
@@ -1398,7 +1597,9 @@ def plan_strings(plan):
 TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止故障 OSD 守护进程",
                   "预检设备是否可加入集群", "预检设备是否未被占用",
                   "轮询移除进度", "确认新盘已被编排器识别",
-                  "用原编号重建 OSD（cephadm 复用编号）")
+                  "用原编号重建 OSD（cephadm 复用编号）",
+                  # 建池：预检 / autoscale / 复核失败都不应中断（池可能已经建好）
+                  "检查池名是否已被占用", "启用 PG 自动扩缩", "复核池配置")
 
 
 def execute_plan(cfg, probe, plan, allow_write):
@@ -1891,6 +2092,9 @@ class Handler(BaseHTTPRequestHandler):
             # 「一键换盘」要先选新盘：只返回未被占用、可直接加入集群的设备。
             return self._json({"ok": True, "devices": read_free_devices(self.cfg, self.probe),
                                "orchestrator": self.probe.orchestrator})
+        if path == "/api/pool/options":
+            # 创建存储池弹窗的下拉项：OSD 数、CRUSH rule、EC profile、已有池名。
+            return self._json({"ok": True, "data": read_pool_options(self.cfg, self.probe)})
         if path == "/api/plan":
             return self._json({"ok": True, "caps": self.probe.caps, "version": self.probe.version})
         if path == "/api/progress":
@@ -2004,9 +2208,61 @@ class Handler(BaseHTTPRequestHandler):
                            "manual_step": ({"name": manual[0], "note": manual[2] or ""}
                                            if manual else None)})
 
+    def _pool_create(self, body):
+        """创建存储池：与 OSD 操作共用同一套权限闸、DRY-RUN 与审计，
+        确认短语是池名（新建对象没有 OSD 编号可确认）。"""
+        if not self._authorized():
+            return self._auth_error()
+        s = self._session()
+        if s is not None and s.get("role") != "admin" and bool(body.get("allow_write")):
+            return self._json({"error": "viewer role cannot create pools"}, 403)
+        if self.cfg.read_only:
+            return self._json({"error": "read-only keyring: write operations are disabled"}, 403)
+        if self.cfg.backend != "cli":
+            return self._json({"error": "REST backend is read-only; deploy CLI backend for pool operations"}, 403)
+        spec = validate_pool_spec(body)
+        if str(body.get("confirm_phrase", "") or "") != spec["name"]:
+            return self._json({"error": "confirm_phrase mismatch (expected %s)" % spec["name"]}, 403)
+        # 重名会让 create 直接失败，也可能误以为「建好了」；提前挡住并说清楚。
+        if spec["name"] in pool_names(self.cfg):
+            return self._json({"error": "存储池 %s 已存在，请换一个名称" % spec["name"]}, 400)
+        plan = build_pool_plan(self.cfg, self.probe, spec)
+        allow = bool(body.get("allow_write")) and self.cfg.allow_write and self._can_write()
+        commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
+        verify = None
+        if not dry:
+            # 只有回读到池且参数对得上才算成功，命令返回 0 不当作结论。
+            verify = check_pool(self.cfg, spec["name"])
+            if verify["message"]:
+                results.append("verify: " + verify["message"])
+            _STATE_CACHE["data"] = None
+            _STATE_CACHE["ts"] = 0
+        audit("POOL_CREATE", spec["name"], " ; ".join(commands),
+              "DRY-RUN" if dry else ("EXECUTED" if (verify is None or verify.get("ok")) else "UNVERIFIED"),
+              "remote=%s ceph=%s type=%s pg=%s" % (self._client(), self.probe.version,
+                                                  spec["type"], spec["pg_num"]),
+              self._client(), self._user())
+        return self._json({"ok": True, "commands": commands, "results": results,
+                           "target": spec["name"], "spec": spec, "verify": verify,
+                           "dry_run": dry, "version": self.probe.version,
+                           "orchestrator": self.probe.orchestrator})
+
     def api_post(self, path, body):
         if path == "/api/password":
             return self.api_password(body)
+        if path == "/api/pool/plan":
+            # 只预览不落库：前端第二步展示的必须与执行时同一套模板。
+            spec = validate_pool_spec(body)
+            plan = build_pool_plan(self.cfg, self.probe, spec)
+            return self._json({"ok": True, "spec": spec, "steps": plan_detail(plan),
+                               "commands": plan_strings(plan),
+                               "exists": spec["name"] in pool_names(self.cfg),
+                               "version": self.probe.version,
+                               "orchestrator": self.probe.orchestrator,
+                               "allow_write": self.cfg.allow_write and self._can_write(),
+                               "read_only": self.cfg.read_only})
+        if path == "/api/pool/create":
+            return self._pool_create(body)
         if path == "/api/plan":
             intent = str(body.get("intent", "replace"))
             oid = body.get("osd_id")

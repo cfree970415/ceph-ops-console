@@ -112,13 +112,18 @@ function vPools(){var rows=state.pools.map(function(p){var pc=p.pct>=80?'var(--d
  var tp=p.type?(p.type==='erasure'?'erasure':'replicated'):'';
  return '<tr><td class="mono"><b>'+esc(p.name)+'</b></td><td>'+(tp?'<span class="tag '+(tp==='erasure'?'pur':'info')+'">'+tp+'</span>':'<span class="tag mute">—</span>')+'</td><td class="mono">'+cfg+'</td><td class="mono">'+p.pgs+'</td><td class="mono">'+bytes(p.used)+'</td>'+
   '<td style="min-width:140px"><div class="flex" style="gap:7px"><div class="bar" style="flex:1;margin:0"><i style="width:'+p.pct+'%;background:'+pc+'"></i></div><span class="mono mini" style="width:32px;text-align:right;color:'+pc+'">'+p.pct+'%</span></div></td><td><span class="tag mute">'+esc(p.app||'—')+'</span></td></tr>';}).join('');
+ if(!rows)rows='<tr><td colspan="7"><div class="empty" style="padding:22px 0">'+ic('db',30)+
+   '<div>尚未读取到存储池</div><div class="tiny" style="margin-top:8px">新建一个池，或检查后端 ceph osd pool ls 是否可执行</div>'+
+   '<div style="margin-top:12px"><button class="btn pri sm" data-act="pool-open">'+ic('plus',13)+' 创建存储池</button></div></div></td></tr>';
  var ec=state.pools.filter(function(p){return p.type==='erasure';}).length,ct=capTrend();
  var gTxt=ct.g==null?'累积中（需 ≥3 个采样点）':((ct.g>=0?'+':'')+ct.g.toFixed(3)+' pt/小时');
  var etaTxt=ct.eta==null?'—':(ct.eta>48?Math.round(ct.eta/24)+' 天':Math.round(ct.eta)+' 小时');
  var bf=(typeof state.cluster.pgBackfill==='number')?state.cluster.pgBackfill:'—';
  var rec=(typeof state.cluster.recoveringBytes==='number')?bytes(state.cluster.recoveringBytes)+'/s':'—';
  var deg=(typeof state.cluster.pgDegraded==='number')?state.cluster.pgDegraded:'—';
- return pageH('存储池','副本 / EC 配置、容量水位与 PG 分布')+card('存储池列表','<div class="tbl-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>size / min_size</th><th>PG</th><th>已用</th><th>水位</th><th>应用</th></tr></thead><tbody>'+rows+'</tbody></table></div>','',false)+
+ return pageH('存储池','副本 / EC 配置、容量水位与 PG 分布',
+   '<button class="btn pri" data-act="pool-open">'+ic('plus',14)+' 创建存储池</button>')+
+  card('存储池列表','<div class="tbl-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>size / min_size</th><th>PG</th><th>已用</th><th>水位</th><th>应用</th></tr></thead><tbody>'+rows+'</tbody></table></div>','',false)+
   '<div class="grid g3" style="margin-top:14px">'+card('副本与冗余','<div class="stat-line"><span>池数量</span><b class="mono">'+state.pools.length+'</b></div><div class="stat-line"><span>副本 / EC 池</span><b class="mono">'+(state.pools.length-ec)+' / '+ec+'</b></div><div class="stat-line"><span>size 范围</span><b class="mono">'+sizeRange('size')+'</b></div><div class="stat-line"><span>min_size 范围</span><b class="mono">'+sizeRange('minSize')+'</b></div>')+
   card('回填 / 恢复','<div class="stat-line"><span>回填 / 恢复中 PG</span><b class="mono '+(typeof bf==='number'&&bf>0?'tw':'t')+'">'+bf+'</b></div><div class="stat-line"><span>degraded / undersized</span><b class="mono '+(typeof deg==='number'&&deg>0?'tw':'t')+'">'+deg+'</b></div><div class="stat-line"><span>恢复速率</span><b class="mono">'+rec+'</b></div><div class="stat-line"><span>数据来源</span><b class="mono">pgmap 实时</b></div>')+
   card('容量增长（真实采样）','<div class="stat-line"><span>采样跨度</span><b class="mono">'+(ct.span>0?spanText(ct.span*3600):'累积中')+'</b></div><div class="stat-line"><span>增长速率</span><b class="mono">'+gTxt+'</b></div><div class="stat-line"><span>预计达到 nearfull</span><b class="mono tw">'+etaTxt+'</b></div><div class="stat-line"><span>nearfull / full</span><b class="mono">'+state.settings.nearfull+'% / '+state.settings.full+'%</b></div>')+'</div>';}

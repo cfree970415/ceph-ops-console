@@ -463,33 +463,77 @@ function quickPaintModal(){
     '<button class="btn pri" data-act="q-resume">'+ic('check',14)+' 磁盘已换好，继续执行</button>';
   }else foot='<div class="sp"></div><button class="btn dan" data-act="q-abort">中止</button>';
  }else if(q.phase==='done'){
-  var badVerify=(q.kind==='kick'||q.kind==='replace')&&q.verify&&q.verify.ok===false;
-  b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+(badVerify?'td':'t')+'">'+
+  var v=q.verify||null,badVerify=(q.kind==='kick'||q.kind==='replace')&&v&&v.ok===false;
+  /* 复核结论分三种：没复用编号（真失败，等也没用）、编排器还在部署（可自动复核）、成功。
+     「OSD up 慢」只属于第二种；把第一种也显示成「未完全生效」会误导成等待即可。 */
+  var pending=!!(badVerify&&v.pending),hardFail=badVerify&&!pending;
+  var stateColor=hardFail?'td':pending?'tw':'t';
+  var headline=hardFail?(q.kind==='replace'&&v.newOsd?'未复用原编号':'未完全生效'):
+               pending?'已提交，等待编排器重建':'流程已完成';
+  b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+stateColor+'">'+
    ic(badVerify?'alert':'check',38)+'</div>'+
-   '<div style="font-size:16px;font-weight:700;margin-top:8px">'+quickTitle(q.kind)+(badVerify?'未完全生效':'流程已完成')+'</div>'+
+   '<div style="font-size:16px;font-weight:700;margin-top:8px">'+quickTitle(q.kind)+headline+'</div>'+
    '<div class="note" style="margin-top:6px">'+
    (q.kind==='init'?esc(q.dev)+' @ '+esc(q.host):
     q.kind==='replace'?'osd.'+q.osdId+' · '+esc(q.oldDev||'原盘')+' → '+esc(q.dev||'新盘'):'osd.'+q.osdId)+' · '+
    (q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':
     q.kind==='init'?'已初始化并加入集群，数据开始回填；新 OSD 会在 OSD 列表出现':
-    q.kind==='kick'?(badVerify?esc(q.verify.message):'已停服务并标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群'):
-    q.kind==='replace'?(badVerify?esc(q.verify.message):'新盘已用原编号 osd.'+q.osdId+' 重建并上线，数据开始回填'):
+    q.kind==='kick'?(badVerify?'复核结论见下方':'已停服务并标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群'):
+    q.kind==='replace'?(badVerify?'原编号必须仍是 osd.'+q.osdId+'，详见下方复核结论':'新盘已用原编号 osd.'+q.osdId+' 重建并上线，数据开始回填'):
     '命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
-   (badVerify?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div>后端复核未通过：'+esc(q.verify.message)+
-    '</div></div>':'')+
+   (hardFail?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>换盘复核未通过'+
+     (v.newOsd?'：新盘被分配为 osd.'+v.newOsd:'')+'</b><br>'+esc(v.message)+
+     (v.newOsd?'<br>一键换盘要求「编号不变」，这次等同于新增磁盘。确认数据无碍后清理多出的 OSD，检查 OSDSpec 再重试。':'')+
+     '</div></div>':
+    pending?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>编排器仍在部署，不是失败</b><br>'+esc(v.message)+
+     '<br>每 5 秒自动复核一次'+(q.recheckLeft?'（已复核 '+q.recheckLeft+' 次）':'')+
+     (q.recheckDone?'，自动复核已结束，可手动点「重新复核」。':'。')+'</div></div>':'')+
    '<div class="grid g2"><div><div class="stat-line"><span>执行步骤</span><b class="mono">'+q.steps.length+'</b></div>'+
    '<div class="stat-line"><span>集群版本</span><b class="mono">'+esc(liveProfile().version||'-')+'</b></div></div>'+
-   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'关联告警')+'</span><b class="'+((q.kind==='kick'||badVerify)?'tw':'t')+'">'+
+   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'编号复核')+'</span><b class="'+
+   (hardFail?'td':pending?'tw':'t')+'">'+
    (q.kind==='init'?'待同步（列表刷新后可见）':
-    q.kind==='replace'?(q.verify&&q.verify.ok?'osd.'+q.osdId+' 已 up/in':'待复核（后端已回读 osd dump）'):
+    q.kind==='replace'?(v&&v.ok?'osd.'+q.osdId+' 已 up/in（编号不变）':
+     hardFail&&v.newOsd?'未复用：新盘成了 osd.'+v.newOsd:pending?'等待 osd.'+q.osdId+' 上线':'待复核'):
     q.kind==='kick'?'待复核（后端已回读 osd dump）':'已自动恢复')+'</b></div>'+
    '<div class="stat-line"><span>审计记录</span><b class="t">已写入</b></div></div></div>'+
    '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>真实环境请回到「告警中心」确认告警已清除，并在「变更审计」复核完整命令序列与返回码。</div></div>';
-  foot='<div class="sp"></div><button class="btn" data-act="q-alerts">查看告警</button>'+
+  foot='<div class="sp"></div>'+
+   (badVerify?'<button class="btn" data-act="q-recheck"'+(q.recheckBusy?' disabled':'')+'>'+ic('refresh',14)+
+    (q.recheckBusy?' 复核中…':' 重新复核')+'</button>':'')+
+   '<button class="btn" data-act="q-alerts">查看告警</button>'+
    '<button class="btn" data-act="q-audit">变更审计</button><button class="btn pri" data-act="q-close">完成</button>';
  }
  openModal(qHead()+'<div class="modal-b">'+b+'</div><div class="modal-f">'+foot+'</div>','lg');
  if(q.phase==='running'||q.phase==='paused')quickPaintLogs();
+}
+/* 只读重新复核：zap 后由 OSDSpec 异步重建，OSD 起来有延迟。
+   不重跑流程、不下发任何写命令，只回读 osd dump / metadata 看编号有没有复用。 */
+function qRecheck(q,cb){
+ if(!state.quick||state.quick!==q)return;
+ if(state.mode!=='live'||!state.auth.authenticated){toast('演示模式没有后端可复核','w');if(cb)cb();return;}
+ q.recheckBusy=true;quickPaintModal();
+ apiFetch('POST','/api/osd/verify',{osd_id:q.osdId,dev:q.dev||''}).then(function(r){
+  if(!state.quick||state.quick!==q)return;
+  q.recheckBusy=false;q.recheckLeft=(q.recheckLeft||0)+1;
+  q.verify=r.verify||q.verify;
+  quickPaintModal();
+  if(q.verify.ok){toast('复核通过：'+q.verify.message,'ok');setTimeout(function(){syncState(true);},800);}
+  else if(!q.verify.pending)toast('复核结论：'+q.verify.message,'e');
+  if(cb)cb();
+ }).catch(function(e){
+  if(!state.quick||state.quick!==q)return;
+  q.recheckBusy=false;toast('重新复核失败：'+e.message,'e');quickPaintModal();
+  if(cb)cb();
+ });
+}
+function qAutoRecheck(q,left){
+ if(!state.quick||state.quick!==q||q.phase!=='done'||!q.verify||!q.verify.pending)return;
+ if(left<=0){q.recheckDone=true;quickPaintModal();return;}
+ setTimeout(function(){
+  if(!state.quick||state.quick!==q||q.phase!=='done'||!q.verify||!q.verify.pending)return;
+  qRecheck(q,function(){qAutoRecheck(q,left-1);});
+ },5000);
 }
 function qLog(cls,text){var q=state.quick;if(!q)return;q.logs.push({cls:cls,text:text});quickPaintLogs();}
 function quickPaintLogs(){
@@ -532,7 +576,8 @@ function quickApply(){
 }
 function quickExec(stage){
  var q=state.quick;if(!q)return;
- q.phase='running';q.stage=stage;q.aborted=false;q.logs=[];q.progress=0;q.pending=[];q.verify=null;quickPaintModal();
+ q.phase='running';q.stage=stage;q.aborted=false;q.logs=[];q.progress=0;q.pending=[];q.verify=null;
+ q.recheckLeft=0;q.recheckDone=false;q.recheckBusy=false;quickPaintModal();
  qLog('d','# Ceph Ops Console · '+(q.dryRun?'DRY-RUN':'EXECUTE')+' · '+dt(Date.now()));
  qLog('d','# target '+(q.kind==='init'?q.dev+' @ '+q.host:
   'osd.'+q.osdId+' @ '+q.host+' '+(q.kind==='replace'?(q.oldDev||'?')+' → '+q.dev:q.dev))+
@@ -572,8 +617,11 @@ function quickExec(stage){
     }
     qLog('c','✓ 全部步骤完成');
     quickApply();q.phase='done';quickPaintModal();
-    if(r.verify&&!r.verify.ok)toast('踢盘未完全生效：'+r.verify.message,'e');
-    else toast(quickTitle(q.kind)+' 流程完成','ok');
+    if(r.verify&&!r.verify.ok){
+     if(r.verify.pending)toast('流程已提交，等待编排器用原编号重建（自动复核中）','w');
+     else toast(r.verify.newOsd?'换盘未复用原编号：新盘成了 osd.'+r.verify.newOsd:'复核未通过：'+r.verify.message,'e');
+    }else toast(quickTitle(q.kind)+' 流程完成','ok');
+    if(r.verify&&r.verify.pending&&state.mode==='live'&&state.auth.authenticated)qAutoRecheck(q,12);
     if(state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState(true);},1500);
     return;}
    var c=String(cmds[i]);qLog(c.charAt(0)==='#'?'d':'p',c.charAt(0)==='#'?c:'$ '+c);
@@ -840,6 +888,7 @@ function quickAction(act,el){
    quickExec(q.kind==='init'?'auto':'pre');return;
   case 'q-resume':if(q)quickExec('post');return;
   case 'q-abort':if(q){q.aborted=true;toast('已发送中止请求','w');}return;
+  case 'q-recheck':if(q)qRecheck(q,null);return;
   case 'q-alerts':state.quick=null;closeModal();state.view='alerts';render();return;
   case 'q-audit':state.quick=null;closeModal();state.view='audit';render();return;
   default:return;

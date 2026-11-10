@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.19"
+VERSION = "1.1.20"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -870,27 +870,85 @@ def check_downout(cfg, oid):
             "message": "osd.%d %s" % (oid, "；".join(reasons))}
 
 
-def check_replace(cfg, oid):
-    """换盘后复核：编号是否被复用、是否真的重新上线。
+def _dev_key(path):
+    """把分区路径归一到整盘：/dev/nvme0n2p1、/dev/sda1 -> /dev/nvme0n2、/dev/sda。"""
+    p = str(path or "").strip()
+    p = re.sub(r"p\d+$", "", p)
+    p = re.sub(r"^(/dev/(?:sd|vd|hd)[a-z]+)\d+$", r"\1", p)
+    return p
 
-    「编号不变」是换盘的核心承诺，所以不能只报「命令都返回 0」：
-    必须回读 osd dump，确认 osd.<id> 仍存在且 up/in。
+
+def device_owner(cfg, dev):
+    """这块盘现在被哪个 OSD 占用（按 osd metadata 的真实设备路径反查）。"""
+    if not dev:
+        return None
+    key = _dev_key(dev)
+    dev_by_id, _ = osd_used_devices(cfg)
+    for i, d in (dev_by_id or {}).items():
+        if d and _dev_key(d) == key:
+            try:
+                return int(i)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def check_replace(cfg, oid, dev=None):
+    """换盘后复核：新盘到底挂在哪个编号上、原编号有没有真的回来。
+
+    只盯 `osd.<old_id>` 的 up/in 会误判最常见的一种真实情况：cephadm 的
+    `daemon add osd` 给新盘分了新编号，旧编号仍以 down/out 留在 osdmap 里。
+    这时旧编号永远等不到 up，报「守护进程没起来」是错的，加长等待也没用。
+    所以先看「新盘现在属于谁」，再分三种结论：
+      新盘挂在别的编号 -> 编号没复用（等价于新增磁盘），需人工处理旧记录
+      新盘挂在原编号但还没 up -> 部署中，稍后重新复核即可
+      新盘还没被任何 OSD 认领 -> 部署中 / 采集不到，稍后重新复核
     """
     st = osd_upin_state(cfg, oid)
+    owner = device_owner(cfg, dev)
+    base = {"ok": False, "up": (st or {}).get("up"), "in": (st or {}).get("in"),
+            "reused": False, "pending": False, "newOsd": None, "action": None}
+    if owner is not None and owner != oid:
+        base.update({"newOsd": owner, "action": "cleanup"})
+        base["message"] = (
+            "新盘 %s 已作为 osd.%d 加入集群，但原编号 osd.%d 没有被复用"
+            "（当前 %s）。这不是「OSD 启动慢」：等再久 osd.%d 也不会 up。"
+            "若本意是扩容，请用「新增磁盘」入口；若要 1:1 换盘，需检查 cephadm "
+            "--replace 是否保留了原编号。旧记录 osd.%d 请在确认数据无碍后清理。"
+            % (dev, owner, oid,
+               ("down/out" if st and not st["up"] and not st["in"] else "仍在 osdmap"),
+               oid, oid))
+        return base
     if st is None:
-        return {"ok": False, "up": None, "in": None, "reused": False,
-                "message": "osd.%d 不在 osd dump 中：新盘没有复用原编号，"
-                           "可能被分配了新编号（去 OSD 列表按设备名确认）" % oid}
+        base.update({"pending": True, "action": "recheck"})
+        base["message"] = ("osd.%d 已不在 osd dump，且新盘 %s 还没被任何 OSD 认领："
+                           "OSD 可能仍在部署 / 设备信息还没采到，稍后点「重新复核」"
+                           % (oid, dev or "<新盘>"))
+        return base
     if st["up"] and st["in"]:
-        return {"ok": True, "up": True, "in": True, "reused": True,
-                "message": "osd.%d 已用原编号重新上线（up/in），数据开始回填" % oid}
-    reasons = []
+        base.update({"ok": True, "reused": True})
+        base["message"] = "osd.%d 已用原编号重新上线（up/in），数据开始回填" % oid
+        return base
+    reasons, pending = [], False
     if not st["up"]:
-        reasons.append("仍为 down：新盘上的 OSD 守护进程没起来（看 ceph orch ps 或 systemctl status ceph-osd@%d）" % oid)
+        if owner == oid:
+            reasons.append("新盘已挂到原编号 osd.%d，但守护进程还没 up（cephadm 拉起容器常需几十秒）" % oid)
+            pending = True
+        elif owner is None:
+            reasons.append("仍为 down：无法确认新盘归属（设备信息未采到），看 ceph orch ps 或 ceph osd tree")
+            pending = True
+        else:
+            reasons.append("仍为 down：新盘上的 OSD 守护进程没起来（看 ceph orch ps 或 systemctl status ceph-osd@%d）" % oid)
     if not st["in"]:
-        reasons.append("仍为 out：执行 ceph osd in %d" % oid)
-    return {"ok": False, "up": st["up"], "in": st["in"], "reused": True,
-            "message": "osd.%d 已用原编号重建，但%s" % (oid, "；".join(reasons))}
+        reasons.append("仍为 out：执行 ceph osd in %d（或点 OSD 列表里的「IN」）" % oid)
+    base.update({"reused": True, "pending": pending,
+                 "action": "recheck" if pending else "in"})
+    if pending:
+        base["message"] = ("osd.%d 仍在上线中：%s。这是部署延迟，不是失败，"
+                           "稍后点「重新复核」即可" % (oid, "；".join(reasons)))
+    else:
+        base["message"] = "osd.%d 已用原编号重建，但%s" % (oid, "；".join(reasons))
+    return base
 
 
 def osd_used_devices(cfg):
@@ -2329,18 +2387,24 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             else:
                 add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace"],
                     "--replace 让 osd.%d 这个编号不被回收，cephadm 会等回填完成后再销毁 daemon" % oid)
+            add("确认 OSD 服务规约（编号复用的前提）",
+                ["ceph", "orch", "ls", "--service-type", "osd", "--format=json"],
+                "cephadm 只有在新盘匹配 OSDSpec 时，才会用 --replace 保留的原编号自动重建；"
+                "spec 不存在或 unmanaged=true 时 zap 之后不会重建，需先配置 spec")
             add("轮询移除进度", ["ceph", "orch", "osd", "rm", "status", "--format=json"],
                 "确认该 OSD 已离开移除队列（destroyed，且编号留作替换）")
             add("物理更换故障盘", None,
                 "现场操作：按盘位 / SN 换上同规格新盘；不要换盘位、不要改主机，否则编号无法沿用")
             add("确认新盘已被编排器识别", ["ceph", "orch", "device", "ls", str(host), "--format=json"],
                 "新盘应出现在 %s 的设备列表里（available 可能为 false，因为还带着旧签名）" % host)
-            add("清理新盘残留签名", ["ceph", "orch", "device", "zap", str(host), str(dev), "--force"],
-                "清掉分区表 / LVM / 文件系统签名；只作用于 %s，执行前请核对盘位与 SN" % dev)
-            add("用原编号重建 OSD（cephadm 复用编号）",
-                ["ceph", "orch", "daemon", "add", "osd", "%s:%s" % (host, dev)],
-                "cephadm 会优先复用被 --replace 保留的编号 osd.%d；若它已自动重建，本步会提示已被管理，可忽略"
-                % oid)
+            add("清理新盘残留签名（触发按原编号自动重建）",
+                ["ceph", "orch", "device", "zap", str(host), str(dev), "--force"],
+                "只作用于 %s；zap 后由 OSDSpec 自动部署，新盘复用 destroyed 的编号 osd.%d。"
+                "不要改用 ceph orch daemon add osd：那是命令式添加，会分配新编号，"
+                "把 1:1 换盘变成「新增一块盘」" % (dev, oid))
+            add("等待编排器用原编号重建 OSD",
+                ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
+                "只读查看；cephadm 拉起容器常需几十秒，daemon 必须是 osd.%d 而不是新编号" % oid)
         else:
             if purge:
                 add("移除 OSD 但留作替换（purge）", ["ceph", "osd", "purge", str(oid), "--yes-i-really-mean-it"],
@@ -2443,7 +2507,7 @@ def plan_strings(plan):
 TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止故障 OSD 守护进程",
                   "预检设备是否可加入集群", "预检设备是否未被占用",
                   "轮询移除进度", "确认新盘已被编排器识别",
-                  "用原编号重建 OSD（cephadm 复用编号）",
+                  "确认 OSD 服务规约（编号复用的前提）", "等待编排器用原编号重建 OSD",
                   # 建池：预检 / autoscale / 复核失败都不应中断（池可能已经建好）
                   "检查池名是否已被占用", "启用 PG 自动扩缩", "复核池配置")
 
@@ -3041,24 +3105,35 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "%s 当前被 %s 使用，不能当作新盘重建；"
                                             "请核对设备路径" % (dev, others)}, 400)
         if intent == "replace" and allow and stage == "post":
-            # cephadm 的 --replace 会在新盘出现后自动重建：这时再 zap + add 会把
-            # 刚建好的 OSD 又抹掉。所以 post 阶段先回读状态，已经回来了就直接收工。
+            # cephadm 的 --replace 会在新盘出现后由 OSDSpec 自动重建：这时再 zap
+            # 会把刚建好的 OSD 抹掉。但「原编号 up/in」不足以证明重建完成——
+            # 旧 OSD 还在移除队列里时它也是 up/in。必须确认新盘已挂到原编号。
             st0 = osd_upin_state(self.cfg, oid)
-            if st0 and st0.get("up") and st0.get("in"):
-                verify = check_replace(self.cfg, oid)
+            if (st0 and st0.get("up") and st0.get("in")
+                    and device_owner(self.cfg, dev) == oid):
+                verify = check_replace(self.cfg, oid, dev)
                 _STATE_CACHE["data"] = None
                 _STATE_CACHE["ts"] = 0
                 audit("OSD_REPLACE", "osd.%d" % oid, "-", "SKIP",
-                      "cephadm 已自动用原编号重建并上线，跳过重复 zap / 重建",
+                      "OSDSpec 已用原编号在新盘上自动重建并上线，跳过重复 zap",
                       self._client(), self._user())
                 return self._json({"ok": True, "commands": [],
-                                   "results": ["skip: cephadm 已复用原编号 osd.%d 自动重建，"
-                                               "无需再 zap / 重建" % oid],
+                                   "results": ["skip: OSDSpec 已用原编号 osd.%d 在新盘上自动重建，"
+                                               "无需再 zap" % oid],
                                    "target": "osd.%d" % oid, "verify": verify,
                                    "dry_run": False, "version": self.probe.version,
                                    "orchestrator": self.probe.orchestrator,
                                    "stage": stage, "pause": False, "pending_commands": [],
                                    "manual_step": None})
+            elif st0 and st0.get("up") and st0.get("in"):
+                # 旧 OSD 可能还在 --replace 的移除队列里（此时它也是 up/in），
+                # 也可能已经在新盘上重建完成但设备信息还没采到。两种情况都
+                # 不能盲目 zap：宁可停下来让人确认，也不能抹掉正在用的盘。
+                return self._json({"error":
+                    "osd.%d 仍为 up/in，且无法确认新盘 %s 是否已挂到该编号；"
+                    "为避免误 zap 正在使用的盘，post 阶段已暂停。"
+                    "请执行 ceph orch osd rm status 与 ceph osd metadata %d 确认后重试"
+                    % (oid, dev or "<新盘>", oid)}, 409)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
         verify = None
         if intent == "downout" and not dry:
@@ -3070,7 +3145,7 @@ class Handler(BaseHTTPRequestHandler):
         if intent == "replace" and not dry and stage != "pre":
             # 换盘的核心承诺是「编号不变 + 真的回来了」，只能靠回读 osd dump 证明。
             # stage=pre 时 OSD 刚被移除、新盘还没换，此刻复核必然失败，不能当成结论。
-            verify = check_replace(self.cfg, oid)
+            verify = check_replace(self.cfg, oid, dev)
             if verify["message"]:
                 results.append("verify: " + verify["message"])
         if not dry:
@@ -3162,6 +3237,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True, "alert": res})
 
     def api_post(self, path, body):
+        if path == "/api/osd/verify":
+            # 只读复核：换盘后 OSD 起来有延迟，前端用它重新回读，不必重跑流程。
+            # 只看 ceph osd dump / metadata，不执行任何写命令。
+            try:
+                oid = int(str(body.get("osd_id", "")).replace("osd.", ""))
+            except (TypeError, ValueError):
+                raise ValueError("invalid osd id")
+            dev = str(body.get("dev", "") or "")
+            if ".." in dev or (dev and not DEV_RE.match(dev)):
+                raise ValueError("invalid device path")
+            st = osd_upin_state(self.cfg, oid)
+            return self._json({"ok": True, "verify": check_replace(self.cfg, oid, dev),
+                               "up": (st or {}).get("up"), "in": (st or {}).get("in"),
+                               "ts": int(time.time())})
         if path == "/api/alert/ack":
             return self._alert_ack(body)
         if path == "/api/security":

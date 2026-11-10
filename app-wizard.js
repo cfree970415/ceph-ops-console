@@ -69,11 +69,12 @@ function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cep
   {n:'停止故障 OSD 守护进程',c:'ceph orch daemon stop osd.'+id,d:'盘已坏时可能直接失败；还在跑必须先停，否则 out 会被心跳改回 up'},
   {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'先把 PG 迁走，再动盘'},
   {n:'移除 OSD 并保留编号',c:'ceph orch osd rm '+id+' --replace'+(((state.osds.filter(function(x){return x.id===id;})[0]||{}).up)?'':' --force'),d:'--replace 保留 osd.'+id+' 编号供新盘复用；盘已 down 时加 --force 跳过回填等待'},
+  {n:'确认 OSD 服务规约（编号复用的前提）',c:'ceph orch ls --service-type osd --format=json',d:'cephadm 只有在新盘匹配 OSDSpec 时才会用保留的原编号自动重建；spec 不存在或 unmanaged=true 时 zap 后不会重建'},
   {n:'轮询移除进度',c:'ceph orch osd rm status --format=json',d:'确认该 OSD 已离开移除队列（编号留作替换）'},
   {n:'物理更换故障盘',c:'# 现场操作：按盘位 / SN 换上同规格新盘，装回原盘位',d:'需人工确认，平台在此暂停等待'},
   {n:'确认新盘已被编排器识别',c:'ceph orch device ls '+w.host+' --format=json',d:'新盘应出现在设备列表（available 可能为 false，还带着旧签名）'},
-  {n:'清理新盘残留签名',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',d:'只作用于新盘，执行前核对盘位与 SN'},
-  {n:'用原编号重建 OSD',c:'ceph orch daemon add osd '+w.host+':'+w.dev,d:'cephadm 优先复用 --replace 保留的编号 osd.'+id},
+  {n:'清理新盘残留签名（触发按原编号自动重建）',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',d:'zap 后由 OSDSpec 自动用 destroyed 的原编号 osd.'+id+' 重建；不要改用 ceph orch daemon add osd，那会分配新编号'},
+  {n:'等待编排器用原编号重建 OSD',c:'ceph orch ps --daemon-type osd --format=json',d:'只读查看；cephadm 拉起容器常需几十秒，daemon 必须是 osd.'+id+' 而不是新编号'},
   {n:'确认 osd.'+id+' 重新上线',c:'ceph osd dump --format=json',d:'up=true / in=true，且编号必须仍是 osd.'+id},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待所有 PG active+clean，HEALTH_OK'}];
  }else if(rep){var _ow=(state.osds.filter(function(x){return x.id===id;})[0]||{}).weight;

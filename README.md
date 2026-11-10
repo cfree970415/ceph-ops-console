@@ -193,10 +193,28 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 适用：物理盘已换新，要以**原编号**接回（1:1 替换，非扩容）。弹窗默认选中被点的那行，新盘下拉只列该服务器上未被占用的设备，**原盘位路径排第一**（换盘后新盘常还在原路径）；带旧 LVM 签名的盘标「需先清理」，流程会先 zap。
 
 - 确认短语是 `osd.<id>` 而不是设备路径——要保住的是编号
-- cephadm：`ceph orch osd rm <id> --replace`（盘已 down 时附 `--force`）→ `ceph orch device zap <host> <dev> --force` → `ceph orch daemon add osd <host>:<dev>`。`--replace` 把编号留在替换队列里，重建时复用
-- 包安装：`osd purge`（或 crush remove + auth del + osd rm）→ `ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev> --osd-id <id>`；原权重不是 1.0 时补 `ceph osd crush reweight osd.<id> <原权重>`，否则新盘数据会偏少
-- 在「物理更换故障盘」处暂停，装好点「磁盘已换好，继续执行」才跑 zap / 重建
-- 收尾回读 `ceph osd dump`：`osd.<id>` 必须重新出现且 `up/in=true`；编号没复用则报「未完全生效」。cephadm 已自动重建时第二阶段会跳过重复步骤
+**cephadm 换盘不能用 `ceph orch daemon add osd`**：那是命令式添加，会给新盘分配一个**新编号**，把 1:1 换盘变成「新加了一块盘」，原 OSD 仍以 down/out 留在 osdmap 里。编号复用的唯一机制是 `--replace` 留下的 `destroyed` 标记 + OSDSpec 自动部署：
+
+```
+ceph orch osd rm <id> --replace [--force]   # 编号标 destroyed，留作替换
+→ 现场换盘（平台暂停）
+→ ceph orch device zap <host> <dev> --force # 触发 OSDSpec 用保留编号自动重建
+→ 只读等待编排器拉起 osd.<id> → 回读 ceph osd dump 复核
+```
+
+前置条件：存在匹配新盘的 OSD service spec 且不为 `unmanaged`（用 `ceph orch ls --service-type osd` 确认）。没有 spec 时 zap 之后不会重建——先配置 spec（例如 `ceph orch apply osd --all-available-devices` 或按主机/设备定义），再执行换盘。流程会先跑一次 spec 检查并记入步骤说明。
+
+- 包安装：`osd purge`（或 crush remove + auth del + osd rm）→ `ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev> --osd-id <id>`；`--osd-id` 强制复用编号。原权重不是 1.0 时补 `ceph osd crush reweight osd.<id> <原权重>`
+- 在「物理更换故障盘」处暂停，装好点「磁盘已换好，继续执行」才跑 zap
+- 复核按「新盘现在属于谁」分流，不再只盯旧编号的 up/in：
+
+| 结论 | 页面 | 处理 |
+| --- | --- | --- |
+| 新盘挂回 `osd.<id>` 且 up/in | 绿色「编号不变」 | 完成 |
+| 新盘挂回原编号、守护进程还没 up | 黄色「等待编排器重建」 | 部署延迟，不是失败：每 5 秒只读复核一次（最多 12 次），可手动点「重新复核」 |
+| 新盘被分到**别的编号** | 红色「未复用原编号」 | 真失败，等再久旧编号也不会 up；清理多出的 OSD、检查 OSDSpec 后重试 |
+
+只读复核接口 `POST /api/osd/verify`（`osd_id` + `dev`），不重跑流程、不下发写命令。若本意是**扩容**，请用下一节的「新增磁盘」入口，它才分配新编号。
 
 ### 新增磁盘（扩容 · 分配新编号）
 
@@ -438,6 +456,7 @@ sudo python3 ~/ceph-ops-console/ceph-console.py \
 | POST | `/api/quick/kick` | 踢盘（停服务 + down + out，返回 `verify`） |
 | POST | `/api/quick/in` | IN 盘（启服务 + in + 回填观察） |
 | POST | `/api/quick/init` | 新增磁盘（zap + 创建，新编号） |
+| POST | `/api/osd/verify` | 只读复核换盘结果：`osd_id` + `dev` → 编号是否复用 / 是否部署中 |
 | POST | `/api/quick/replace` | 换盘保编号（`stage=pre` / `stage=post`） |
 | POST | `/api/execute` | 高级向导执行 |
 | GET | `/api/pool/options` | 建池下拉项：OSD 数、池名、CRUSH rule、EC profile、PG 建议 |
@@ -515,10 +534,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.19-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.20-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.19-20261110`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.20-20261110`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 
@@ -555,7 +574,18 @@ journalctl -u ceph-console -n 50 --no-pager
 
 ### 常见问题
 
-**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.16-20261110` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.20-20261110` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+
+**换完盘多出一块 OSD，原编号还是 down/out？** 这是 1.1.19 及以前 cephadm 换盘用了 `ceph orch daemon add osd` 的后果：它给新盘分配了新编号，旧编号一直留在 osdmap 里（down/out），复核等再久也不会 up。1.1.20 起换盘已改为「`--replace` + OSDSpec 自动重建」，不再有这条命令。已经多出来的盘按下面顺序收尾（**先确认没有不可恢复的数据**）：
+
+```bash
+ceph osd tree                          # 认出多出的编号，例如 osd.2
+ceph orch osd rm 2                     # 退役该 OSD，等回填完成
+ceph orch ls --service-type osd         # 确认有匹配新盘的 spec、且未设 unmanaged
+ceph orch osd rm status                # 确认原编号处于 destroyed / 可替换
+```
+
+之后在 OSD 页对原编号重新走「一键换盘」。**不要直接 zap 正在被使用的盘**；若只是想扩容，用「新增磁盘」入口即可，不必清理。
 
 **点了一键踢盘，只有 out 没有 down？** `ceph osd down` 只改 osdmap 标记，守护进程还在跑心跳会改回 `up`。1.1.4 起第一步就是停守护进程，执行后回读 `osd dump` 复核。提示「未完全生效」说明停服务失败（多半是后端不是 root，或 orch 未接管），按提示在集群节点手工停一次。
 

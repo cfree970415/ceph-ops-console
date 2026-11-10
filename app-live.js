@@ -252,18 +252,19 @@ function isolationCard(){
   '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>原生 Dashboard 继续按原地址和原账号使用；本控制台只是通过只读命令与独立 client 凭证观察集群。写操作同样经该凭证下发，不会修改 mgr dashboard 的任何配置。</div></div>',head);
 }
 
-/* ---------- one-click kick / replace ---------- */
-function quickTitle(k){return k==='kick'?'一键踢盘（退役）':'一键换盘（保留 OSD ID）';}
+/* ---------- one-click kick / replace / in ---------- */
+function quickTitle(k){return k==='kick'?'一键踢盘（退役）':k==='in'?'一键 IN 盘（恢复上线）':'一键换盘（保留 OSD ID）';}
+function quickIntent(k){return k==='kick'?'remove':k==='in'?'in':'replace';}
 function quickPlan(k,w){
  if(state.mode==='live'&&state.auth.authenticated){
-  return apiFetch('POST','/api/plan',{intent:k==='kick'?'remove':'replace',osd_id:w.osdId,host:w.host,dev:w.dev})
+  return apiFetch('POST','/api/plan',{intent:quickIntent(k),osd_id:w.osdId,host:w.host,dev:w.dev})
    .then(function(r){return (r.steps||[]).map(function(s){
      return {n:s.name,c:s.command||('# '+s.name+'：'+s.note),note:s.note||'',manual:!!s.manual};});});
  }
- return Promise.resolve(wizardPlan({osdId:w.osdId,host:w.host,dev:w.dev,intent:k==='kick'?'remove':'replace'}));
+ return Promise.resolve(wizardPlan({osdId:w.osdId,host:w.host,dev:w.dev,intent:quickIntent(k)}));
 }
 function quickOpen(kind,osdId){
- var n=osdId==null?(faultOsd()||{}).id:Number(osdId);
+ var n=osdId==null?(kind==='in'?(inOsd()||{}).id:(faultOsd()||{}).id):Number(osdId);
  var o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[0];
  if(!o){toast('没有可用的 OSD','e');return;}
  state.quick={kind:kind,osdId:o.id,host:o.host,dev:o.dev,serial:o.serial||'',phase:'loading',steps:[],logs:[],
@@ -296,10 +297,12 @@ function quickPaintModal(){
     '<div class="note" style="margin-top:12px">请确认已登录、后端为 CLI 通道且 /api/plan 可访问。</div>';
   foot='<div class="sp"></div><button class="btn" data-act="q-close">关闭</button><button class="btn" data-act="q-retry">重试</button>';
  }else if(q.phase==='confirm'){
-  var used=o.size?pct(o.used,o.size):0;
-  b='<div class="'+(q.kind==='kick'?'dangerbox':'warnbox')+'" style="margin-bottom:14px">'+ic('alert')+
-   '<div><b>即将'+(q.kind==='kick'?'把 osd.'+q.osdId+' 永久踢出集群':'踢出并更换 osd.'+q.osdId+' 的磁盘')+'</b><br>'+
-   (q.kind==='replace'?'流程：移除 OSD → 清理磁盘元数据 → <b>人工换盘（平台暂停）</b> → 原 ID 重建 → 回填观察。':'流程：标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证。')+
+  var used=o.size?pct(o.used,o.size):0,isKick=q.kind==='kick',isIn=q.kind==='in';
+  b='<div class="'+(isKick?'dangerbox':'warnbox')+'" style="margin-bottom:14px">'+ic(isIn?'check':'alert')+
+   '<div><b>'+(isKick?'即将把 osd.'+q.osdId+' 永久踢出集群':isIn?'即将把 osd.'+q.osdId+' 重新加入集群':'踢出并更换 osd.'+q.osdId+' 的磁盘')+'</b><br>'+
+   (isKick?'流程：标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证。':
+    isIn?'流程：确认 OSD 仍在 CRUSH → 取消 OUT 标记（osd in）→ 恢复权重并回填 → 健康验证。':
+    '流程：标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD → 清理磁盘元数据 → <b>人工换盘（平台暂停）</b> → 原 ID 重建 → 回填观察。')+
    '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
    '<div class="grid g2" style="margin-bottom:14px"><div>'+
     '<div class="stat-line"><span>目标 OSD</span><b class="mono">osd.'+q.osdId+'</b></div>'+
@@ -319,8 +322,8 @@ function quickPaintModal(){
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
-   '<button class="btn" data-act="q-wizard" title="改用带自动预检的完整向导">高级向导</button>'+
-   '<button class="btn '+(q.kind==='kick'?'dan':'pri')+'" data-act="q-run">'+ic('zap',14)+' 立即执行'+(q.kind==='kick'?'踢盘':'换盘')+'</button>';
+   (isIn?'':'<button class="btn" data-act="q-wizard" title="改用带自动预检的完整向导">高级向导</button>')+
+   '<button class="btn '+(isKick?'dan':'pri')+'" data-act="q-run">'+ic('zap',14)+' 立即执行'+(isKick?'踢盘':isIn?'IN 盘':'换盘')+'</button>';
  }else if(q.phase==='running'||q.phase==='paused'){
   b='<div class="flex" style="margin-bottom:10px"><span class="tag '+(q.dryRun?'warn':'err')+'">'+(q.dryRun?'DRY-RUN':'EXECUTE')+'</span>'+
     '<span class="tag info">stage: '+esc(q.stage)+'</span><div class="sp"></div><b class="mono" id="q-pct">'+q.progress+'%</b></div>'+
@@ -356,15 +359,20 @@ function quickPaintLogs(){
  if(p)p.style.width=state.quick.progress+'%';if(x)x.textContent=state.quick.progress+'%';
 }
 function quickApply(){
- var q=state.quick,o=state.osds.filter(function(x){return x.id===q.osdId;})[0];
+ var q=state.quick,o=state.osds.filter(function(x){return x.id===q.osdId;})[0],isIn=q.kind==='in';
  if(q.kind==='kick'){state.osds=state.osds.filter(function(x){return x.id!==q.osdId;});
   state.cluster.osds=Math.max(0,state.cluster.osds-1);}
+ else if(isIn){if(o){o.inn=true;o.up=true;}
+  state.cluster.osdsIn=Math.min(state.cluster.osds,(state.cluster.osdsIn||0)+1);}
  else if(o){o.up=true;o.inn=true;o.smart='OK';o.used=Math.round(o.used*0.55);}
- state.alerts.forEach(function(a){if(a.osd===q.osdId&&a.status!=='resolved')a.status='resolved';});
+ state.alerts.forEach(function(a){if(a.osd!==q.osdId||a.status==='resolved')return;
+  /* IN 只清掉「被标记 OUT」类告警；盘仍 down 的硬件告警不能假装恢复。 */
+  if(isIn&&a.code!=='OSD_OUT'&&a.code!=='OSD_IN')return;
+  a.status='resolved';});
  state.cluster.osdsUp=state.osds.filter(function(x){return x.up;}).length+
   Math.max(0,state.cluster.osds-state.osds.length);
  state.cluster.health=healthInfo().t;state.lastRefresh=Date.now();
- addAudit(q.kind==='kick'?'OSD_KICK_1CLICK':'OSD_REPLACE_1CLICK','osd.'+q.osdId,
+ addAudit(q.kind==='kick'?'OSD_KICK_1CLICK':isIn?'OSD_IN_1CLICK':'OSD_REPLACE_1CLICK','osd.'+q.osdId,
   q.steps.map(function(s){return s.c;}).join(' ; '),
   (q.dryRun?'DRY-RUN 演示 · ':'一键执行 · ')+(state.mode==='live'?state.auth.user:'本地演示'));
 }
@@ -378,7 +386,7 @@ function quickExec(stage){
   allow_write:!q.dryRun,stage:stage};
  var req;
  if(state.mode==='live'&&state.auth.authenticated){
-  req=apiFetch('POST',q.kind==='kick'?'/api/quick/kick':'/api/quick/replace',body);
+  req=apiFetch('POST',q.kind==='kick'?'/api/quick/kick':q.kind==='in'?'/api/quick/in':'/api/quick/replace',body);
  }else{
   var manualIdx=-1;q.steps.forEach(function(s,i){if(manualIdx<0&&(s.manual||String(s.c).charAt(0)==='#'))manualIdx=i;});
   var slice=stage==='pre'&&manualIdx>=0?q.steps.slice(0,manualIdx):
@@ -428,7 +436,8 @@ function quickAction(act,el){
   case 'q-open':quickOpen(el.getAttribute('data-kind')||'replace',el.getAttribute('data-id'));return;
   case 'q-close':state.quick=null;closeModal();render();return;
   case 'q-retry':if(q)quickOpen(q.kind,q.osdId);return;
-  case 'q-wizard':if(q){var k=q.kind,id=q.osdId;state.quick=null;closeModal();startWizard(id,k==='kick'?'remove':'replace');}return;
+  case 'q-wizard':if(q){if(q.kind==='in'){toast('IN 盘只涉及 osd in 与回填观察，直接执行即可','w');return;}
+   var k=q.kind,id=q.osdId;state.quick=null;closeModal();startWizard(id,k==='kick'?'remove':'replace');}return;
   case 'q-run':
    if(!q)return;
    if(q.phrase!=='osd.'+q.osdId||!q.confirmed){toast('请输入 osd.'+q.osdId+' 并勾选盘位确认','e');return;}

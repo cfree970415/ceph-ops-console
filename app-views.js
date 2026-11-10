@@ -45,7 +45,7 @@ function osdRow(o){var s=osdStatus(o),p=pct(o.used,o.size),pc=p>=85?'var(--dange
   '<td><span class="tag '+s.c+'"><span class="dot '+(s.c==='err'?'err':s.c==='warn'?'warn':'ok')+'"></span>'+s.t+'</span></td><td class="mono mini">'+o.pgs+'</td>'+
   '<td>'+(o.smart==='OK'?'<span class="tag ok">OK</span>':o.smart==='WARN'?'<span class="tag warn">WARN</span>':'<span class="tag err">FAIL</span>')+'</td>'+
  '<td><div class="btn-row" style="flex-wrap:nowrap;gap:5px"><button class="btn sm" data-act="osd-detail" data-id="'+o.id+'">详情</button>'+
- (o.inn?'<button class="btn sm" data-act="osd-out" data-id="'+o.id+'">OUT</button>':'<button class="btn sm" data-act="osd-in" data-id="'+o.id+'">IN</button>')+
+ (o.inn?'<button class="btn sm" data-act="osd-out" data-id="'+o.id+'">OUT</button>':'<button class="qbtn" data-act="q-open" data-kind="in" data-id="'+o.id+'">'+ic('refresh',12)+'一键 IN 盘</button>')+
  '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',12)+'一键踢盘</button>'+
  '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+o.id+'">'+ic('zap',12)+'一键换盘</button></div></td></tr>';}
 function osdTable(){var f=state.filters,list=state.osds.filter(function(o){
@@ -186,7 +186,7 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
    '<div class="fgrp"><label class="fld">degraded PG 阈值</label><input class="inp" type="number" data-bind="settings.pgDegraded" value="'+s.pgDegraded+'"></div>'+
    '<div class="fgrp"><label class="fld">慢请求阈值（ms）</label><input class="inp" type="number" data-bind="settings.slowOps" value="'+s.slowOps+'"></div></div>'+
    '<div class="hint">阈值保存在浏览器会话内；生产环境由后端读取 /etc/ceph-console/config.json 并周期评估。</div>')+
-  card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.4</b></div>'+
+  card('关于','<div class="stat-line"><span>控制台版本</span><b class="mono">1.0.5</b></div>'+
    '<div class="stat-line"><span>前端构建</span><b class="mono t">'+esc(UI_BUILD)+'</b></div>'+
    '<div class="stat-line"><span>当前运行模式</span><b class="mono '+(state.mode==='live'?'t':'tw')+'">'+(state.mode==='live'?'LIVE 真实控制台':'DEMO 离线演示')+'</b></div>'+
    '<div class="stat-line"><span>登录状态</span><b class="mono '+(state.auth.authenticated?'t':'tw')+'">'+(state.auth.authenticated?esc(state.auth.user)+' · 已登录':'未登录')+'</b></div>'+

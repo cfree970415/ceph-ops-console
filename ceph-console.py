@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -633,14 +633,20 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     oid = validate_target(osd_id, host, dev)
     orch = probe.caps.get("orch", False)
     purge = probe.caps.get("purge", False)
-    if not dev and (not orch or intent == "remove"):
+    if intent not in ("remove", "replace", "in"):
+        raise ValueError("unknown intent: %s" % intent)
+    # Bringing an OSD back (osd in) only needs its id: no device, no host.
+    if intent != "in" and not dev and (not orch or intent == "remove"):
         raise ValueError("device path is required for this operation")
     plan = []  # (name, argv_or_None, note)
 
     def add(name, argv, note=""):
         plan.append((name, argv, note))
 
+    DOWN_NOTE = "先停服务再摘盘：避免故障盘抖动产生 slow ops；已 down 时该命令幂等"
+
     if intent == "replace" and orch:
+        add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("移除故障 OSD 并保留 ID", ["ceph", "orch", "osd", "rm", str(oid), "--replace"], "cephadm 自动 zap 并保留 CRUSH 位置")
         add("轮询移除任务状态", ["ceph", "orch", "osd", "rm", "status", "--format=json"])
         add("物理更换故障盘", None, "现场操作：按 SN / 盘位更换磁盘")
@@ -648,6 +654,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         add("等待 cephadm 自动部署", ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"])
         add("集群健康验证", ["ceph", "-s", "--format=json"])
     elif intent == "replace":
+        add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)])
         add("等待回填完成", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
         if purge:
@@ -669,6 +676,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         add("重新加入集群", ["ceph", "osd", "in", str(oid)])
         add("集群健康验证", ["ceph", "-s", "--format=json"])
     elif intent == "remove":
+        add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)])
         add("等待回填完成", ["ceph", "-s", "--format=json"], "确认数据已迁出")
         if purge:
@@ -682,6 +690,14 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         elif dev:
             add("清除磁盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"])
         add("集群健康验证", ["ceph", "-s", "--format=json"])
+    elif intent == "in":
+        add("确认 OSD 仍在 CRUSH map", ["ceph", "osd", "tree", "--format=json"],
+            "已被 purge / rm 的 OSD 无法 in，只能重新部署")
+        add("重新加入集群（osd in）", ["ceph", "osd", "in", str(oid)],
+            "取消 out 标记，恢复 CRUSH 权重并触发数据回填")
+        add("确认 OSD 处于 up/in", ["ceph", "osd", "tree", "--format=json"],
+            "状态应为 up 且权重非 0；仍 down 说明进程未起来")
+        add("集群健康验证", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
     else:
         raise ValueError("unknown intent: %s" % intent)
     return plan
@@ -1222,12 +1238,14 @@ class Handler(BaseHTTPRequestHandler):
                                "orchestrator": self.probe.orchestrator,
                                "allow_write": self.cfg.allow_write and self._can_write(),
                                "read_only": self.cfg.read_only})
-        if path in ("/api/quick/kick", "/api/quick/replace", "/api/execute"):
+        if path in ("/api/quick/kick", "/api/quick/replace", "/api/quick/in", "/api/execute"):
             override = None
             if path == "/api/quick/kick":
                 override = "remove"
             elif path == "/api/quick/replace":
                 override = "replace"
+            elif path == "/api/quick/in":
+                override = "in"
             return self._execute(body, override, str(body.get("stage", "auto")))
         if path.startswith("/api/osd/") and path.endswith(("/out", "/in")):
             parts = path.split("/")

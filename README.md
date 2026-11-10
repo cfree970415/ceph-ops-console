@@ -3,13 +3,13 @@
 面向运维团队的 **Ceph 集群监控告警 + 磁盘运维控制台**。
 
 - 兼容 Ceph 12.x ~ 19.x 与主流 Linux 发行版，一键部署并对接**现有**集群；
-- Web 页面直接 **一键踢盘 / 一键换盘**，带告警中心与变更审计；
+- Web 页面直接 **一键踢盘 / 一键换盘 / 一键 IN 盘**，带告警中心与变更审计；
 - 真实后端（Ceph CLI / mgr Dashboard REST），不是演示数据；
 - **完全不改动、不占用原生 Ceph Dashboard**；
 - 支持「管理节点一体化启动」和「前端与后端分离部署」两种形态；
 - 后端仅依赖 Python 3.6+ 标准库，前端零 CDN、零构建、可离线运行。
 
-> ⚠️ 快速开始的安装命令带 `--allow-write`，装完即可**真实下发**踢盘 / 换盘命令；去掉该参数则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。执行闸门与风险控制见 [一键踢盘 / 一键换盘](#一键踢盘--一键换盘)。
+> ⚠️ 快速开始的安装命令带 `--allow-write`，装完即可**真实下发**踢盘 / 换盘命令；去掉该参数则默认 DRY-RUN（只生成命令 + 写审计，不改集群）。执行闸门与风险控制见 [一键踢盘 / 换盘 / IN 盘](#一键踢盘--一键换盘--一键-in-盘)。
 
 ---
 
@@ -20,7 +20,7 @@
 - [兼容性](#兼容性)
 - [快速开始](#快速开始)
 - [登录与权限](#登录与权限)
-- [一键踢盘 / 一键换盘](#一键踢盘--一键换盘)
+- [一键踢盘 / 换盘 / IN 盘](#一键踢盘--一键换盘--一键-in-盘)
 - [告警中心](#告警中心)
 - [与原生 Ceph Dashboard 的隔离](#与原生-ceph-dashboard-的隔离)
 - [安全设计](#安全设计)
@@ -42,10 +42,11 @@
 | --- | --- |
 | 集群概览 | HEALTH 状态、OSD 上下线、容量与 PG 状态、活跃告警、待处置故障盘、SVG 趋势图 |
 | 告警中心 | 四级告警分级统计、筛选/确认/静默、告警直达故障 OSD 的一键处置入口 |
-| OSD / 磁盘 | OSD 列表、主机与设备映射、元数据查询、标记 out / in |
+| OSD / 磁盘 | OSD 列表、主机与设备映射、元数据查询、标记 out、一键 IN 盘 |
 | 存储池 / 主机 | 存储池用量、主机与 MON 视图 |
-| 一键踢盘 | 标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证 |
-| 一键换盘 | 移除 OSD → 清理元数据 → **暂停等待人工换盘** → 原 OSD ID 重建 → 回填观察 |
+| 一键踢盘 | 标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证 |
+| 一键换盘 | 标记 DOWN/OUT → 移除 OSD → 清理元数据 → **暂停等待人工换盘** → 原 OSD ID 重建 → 回填观察 |
+| 一键 IN 盘 | 确认仍在 CRUSH → `ceph osd in` → 恢复权重并回填 → 健康验证（OUT 状态时才显示入口） |
 | 高级向导 | 5 步流程，逐步展示命令、预检项与执行结果 |
 | 变更审计 | jsonl 全量记录（时间、用户、目标、命令、DRY-RUN / EXECUTED / REJECTED、来源 IP） |
 | 部署与对接 | 页面内展示部署模式、原生 Dashboard 隔离自检、后端地址与登录态 |
@@ -131,7 +132,7 @@ cd ~/ceph-ops-console && sudo bash deploy.sh --local \
 http://192.168.27.134:8780/
 ```
 
-登录后即可查看告警、执行一键踢盘 / 换盘。
+登录后即可查看告警、执行一键踢盘 / 换盘 / IN 盘。
 
 ### 形态 B：前后端分离
 
@@ -223,25 +224,37 @@ unset PW
 
 ---
 
-## 一键踢盘 / 一键换盘
+## 一键踢盘 / 一键换盘 / 一键 IN 盘
 
 从「告警中心」的故障告警、概览页的「待处置故障盘」，或「OSD / 磁盘」页均可发起。
 
 **一键踢盘（退役 OSD）**
 
 ```
-标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证
+标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证
 ```
+
+先 `ceph osd down <id>` 让故障盘立刻停止服务（避免坏盘反复抖动产生 slow ops），再 `ceph osd out` 摘出 CRUSH 触发回填，最后才 purge / 清理。对已经 down 的 OSD，`osd down` 是幂等的，不会报错。
 
 **一键换盘（保留原 OSD ID）**
 
 ```
-移除 OSD → 清理磁盘元数据
+标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD → 清理磁盘元数据
    ↓  平台暂停，提示「物理更换故障盘」
 现场换盘后点击「磁盘已换好，继续执行」
    ↓
-原 ID 重建 → 回填观察 → HEALTH_OK / PG active+clean 确认
+原 ID 重建 → 重新 IN → 回填观察 → HEALTH_OK / PG active+clean 确认
 ```
+
+**一键 IN 盘（维护结束 / 误 out 后恢复）**
+
+```
+确认 OSD 仍在 CRUSH map → ceph osd in <id> → 确认 up/in → 集群健康验证
+```
+
+适用于磁盘维护、临时下线后恢复，或误执行 OUT 的回滚。已被 `purge` / `osd rm` 的 OSD 无法 IN，只能重新部署。IN 只会清掉「被标记 OUT」类告警，硬件类告警（SMART、心跳丢失）仍保留，不会假装磁盘已经修好。
+
+入口位置：概览页「快捷运维」、OSD 列表每行的操作列、OSD 详情弹窗；只有处于 OUT 状态的 OSD 才会显示「一键 IN 盘」。
 
 后端按探测到的 Ceph 版本与编排器自动选择命令模板；人工换盘由 `stage=pre` / `stage=post` 两段执行，**不会假装自动完成物理换盘**。
 
@@ -327,7 +340,8 @@ unset PW
 | GET | `/api/isolation` | 原生 Dashboard 隔离自检 |
 | GET | `/api/audit` | 审计记录 |
 | GET | `/api/osd/<id>/meta` | OSD 元数据 |
-| POST | `/api/quick/kick` | 一键踢盘 |
+| POST | `/api/quick/kick` | 一键踢盘（先 `osd down` 再 `osd out`） |
+| POST | `/api/quick/in` | 一键 IN 盘（`osd in` + 回填观察） |
 | POST | `/api/quick/replace` | 一键换盘（`stage=pre` / `post`） |
 | POST | `/api/execute` | 高级向导执行 |
 | POST | `/api/osd/<id>/out` `/in` | 标记 OSD out / in |
@@ -459,11 +473,11 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 ### 10 秒确认是否真的更新了
 
 ```bash
-grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.4+ = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.0.4-20261109'
+grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.5+ = 1，旧版 = 0
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.0.5-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.0.4-20261109`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.0.5-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
@@ -515,7 +529,7 @@ journalctl -u ceph-console -n 50 --no-pager
 **Q：登录 admin 后页面还是 DEMO？**
 先看顶栏：显示 `DEMO` 才是演示模式；显示 `LIVE` 但没有数据，属于[登录后没有真实数据](#登录后没有真实数据)，按诊断页的自检结果处理，不是模式问题。确实是 `DEMO` 时按顺序排查：
 
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.0.4-20261109`。不是这个号（或没有这一行）就是**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.0.5-20261110`。不是这个号（或没有这一行）就是**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但仍 DEMO**：确认是 HTTP 页面而非本地 `file://` 双击、URL 没带 `?demo=1`，然后点设置页「运行模式 → LIVE 对接集群」；已保存的会话会自动恢复，通常无需重新输密码。
 3. 只要浏览器里存在有效登录会话，刷新就一定会回到 LIVE，DEMO 选择不会压过登录态。
 
@@ -529,6 +543,9 @@ journalctl -u ceph-console -n 50 --no-pager
 
 **Q：点了一键踢盘但集群没变化？**
 先确认服务是否处于 DRY-RUN：按快速开始安装时带了 `--allow-write`，应已开启真实执行；检查 `/api/session` 是否返回 `allow_write: true`、登录角色是否为 admin。若当初去掉了 `--allow-write`，改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console` 即可，无需重装。
+
+**Q：踢完盘后 OSD 一直显示 out，怎么恢复？**
+维护结束后在 OSD 列表或概览页点「一键 IN 盘」，等价于 `ceph osd in <id>`，会恢复 CRUSH 权重并开始回填。注意 IN 只能让 OSD 重新参与数据分布；如果进程本身起不来（`down`），需要先修硬件 / 重启 OSD 服务。
 
 **Q：`rest` 后端为什么不能换盘？**
 REST 通道是 mgr dashboard 的只读代理；OSD 写操作需要 `cli` 后端与 ceph CLI。
@@ -563,7 +580,7 @@ sudo python3 ~/ceph-ops-console/ceph-console.py \
 ├── app-core.js               # 状态、API 客户端、图表、概览与顶栏
 ├── app-views.js              # 告警 / OSD / 存储池 / 主机 / 审计 / 部署 / 设置
 ├── app-wizard.js             # 高级 5 步向导、弹窗与事件绑定
-└── app-live.js               # 登录、跨机后端连接、一键踢盘 / 换盘
+└── app-live.js               # 登录、跨机后端连接、一键踢盘 / 换盘 / IN 盘
 ```
 
 ---

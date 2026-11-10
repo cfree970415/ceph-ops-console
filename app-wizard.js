@@ -19,7 +19,7 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
   '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">相关告警</div>'+
   (state.alerts.filter(function(a){return a.osd===o.id;}).map(function(a){return '<div class="ck"><div class="ck-i '+(a.sev==='critical'?'f':'w')+'">!</div><div><div class="ck-n">'+esc(a.title)+'</div><div class="ck-d mono">'+a.id+' · '+ago(a.since)+'</div></div></div>';}).join('')||'<div class="note">暂无关联告警</div>');
  openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host)+' · '+esc(o.dev))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
-  '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
+  '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="qbtn" data-act="q-open" data-kind="in" data-id="'+o.id+'">'+ic('refresh',13)+'一键 IN 盘</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
   '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
 function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)return;
@@ -27,7 +27,7 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
   '<div style="font-size:15px;font-weight:650;margin-bottom:10px">'+esc(a.title)+'</div><div class="note" style="font-size:12.5px;color:var(--muted);margin-bottom:16px">'+esc(a.msg)+'</div>'+
   '<div class="grid g2"><div><div class="stat-line"><span>告警代码</span><b class="mono">'+a.code+'</b></div><div class="stat-line"><span>来源</span><b class="mono">'+esc(a.src)+'</b></div><div class="stat-line"><span>首次出现</span><b class="mono">'+dt(a.since)+'</b></div></div>'+
   '<div><div class="stat-line"><span>持续</span><b>'+ago(a.since).replace('前','')+'</b></div><div class="stat-line"><span>触发次数</span><b class="mono">'+a.count+'</b></div><div class="stat-line"><span>关联 OSD</span><b class="mono">'+(a.osd!=null?'osd.'+a.osd:'-')+'</b></div></div></div>'+
-  '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 进入踢盘换盘向导（自动预检 + 二次确认）\n# 3. 观察回填至 active+clean':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
+  '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 先置 DOWN 停止服务，再 OUT 摘盘（或直接用页面上的「一键踢盘」）\nceph osd down '+a.osd+'\nceph osd out '+a.osd+'\n# 3. 观察回填至 active+clean；维护结束后可用「一键 IN 盘」恢复':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
  openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div><button class="btn" data-act="modal-close">关闭</button>'+
   (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',13)+'一键踢盘</button>'+
    '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+a.osd+'">'+ic('zap',13)+'一键换盘</button>':'')+'</div>','md');}
@@ -35,6 +35,7 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
 /* ---------- command plan / preflight ---------- */
 function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cephadm'&&p.caps.orch,rep=w.intent==='replace',s=[];
  if(rep&&orch){s=[
+  {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
   {n:'移除故障 OSD 并保留 ID',c:'ceph orch osd rm '+id+' --replace',d:'cephadm 自动 zap 设备并保留 CRUSH 位置'},
   {n:'轮询移除任务状态',c:'ceph orch osd rm status --format=json',d:'确认移除任务完成'},
   {n:'物理更换故障盘',c:'# 现场操作：按 SN / 盘位更换磁盘',d:'需人工确认，平台在此暂停等待'},
@@ -42,6 +43,7 @@ function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cep
   {n:'等待 cephadm 自动部署',c:'ceph orch ps --daemon-type osd --format=json',d:'同 ID OSD 自动重建并开始回填'},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待所有 PG active+clean，HEALTH_OK'}];
  }else if(rep){s=[
+  {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
   {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'停止数据写入，开始数据重平衡'},
   {n:'等待回填完成',c:'ceph -s --format=json',d:'观察 PG 回到 active+clean'},
   {n:(p.caps.purge?'移除 OSD（purge）':'三步式移除 OSD'),c:p.caps.purge?'ceph osd purge '+id+' --yes-i-really-mean-it':'ceph osd crush remove osd.'+id+' && ceph auth del osd.'+id+' && ceph osd rm '+id,d:p.caps.purge?'14+ 单行完成移除':'12.x/13.x 兼容写法'},
@@ -50,7 +52,13 @@ function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cep
   {n:'用原 ID 重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+id,d:'13+ 支持 --osd-id；12.x 用 ceph-disk prepare/activate'},
   {n:'重新加入集群',c:'ceph osd in '+id,d:'恢复 CRUSH 权重'},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待 all PGs active+clean'}];
+ }else if(w.intent==='in'){s=[
+  {n:'确认 OSD 仍在 CRUSH map',c:'ceph osd tree --format=json',d:'已被 purge / rm 的 OSD 无法 in，只能重新部署'},
+  {n:'重新加入集群（osd in）',c:'ceph osd in '+id,d:'取消 out 标记，恢复 CRUSH 权重并触发回填'},
+  {n:'确认 OSD 处于 up/in',c:'ceph osd tree --format=json',d:'状态应为 up 且权重非 0；仍 down 说明进程未起来'},
+  {n:'集群健康验证',c:'ceph -s --format=json',d:'观察 PG 回到 active+clean'}];
  }else{s=[
+  {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},
   {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'停止写入并触发数据重平衡'},
   {n:'等待回填完成',c:'ceph -s --format=json',d:'确认数据已迁出，避免数据丢失'},
   {n:(p.caps.purge?'永久移除 OSD':'三步式移除 OSD'),c:p.caps.purge?'ceph osd purge '+id+' --yes-i-really-mean-it':'ceph osd crush remove osd.'+id+' && ceph auth del osd.'+id+' && ceph osd rm '+id,d:'移除认证与 CRUSH 条目'},
@@ -208,9 +216,25 @@ function simulateFailure(){var o=state.osds.filter(function(x){return x.up&&x.sm
  var id='A-'+Math.floor(1000+Math.random()*9000);
  state.alerts.unshift({id:id,sev:'critical',code:'OSD_DOWN',title:'OSD.'+o.id+' 心跳丢失',msg:'模拟注入：'+o.host+' 上的 '+o.dev+' 无响应，请确认是否为真实故障。',src:'osd.'+o.id,osd:o.id,since:Date.now(),status:'active',count:1});
  addAudit('SIMULATE','osd.'+o.id,'-','演示模式注入模拟故障');render();toast('已注入模拟告警：osd.'+o.id+' 下线','w');}
-function osdMark(id,inn){var o=state.osds.filter(function(x){return x.id===Number(id);})[0];if(!o)return;o.inn=inn;
- addAudit(inn?'OSD_IN':'OSD_OUT','osd.'+o.id,inn?'ceph osd in '+o.id:(liveProfile().orchestrator==='cephadm'?'ceph orch osd rm '+o.id:'ceph osd out '+o.id),(state.settings.allowWrite?'真实执行':'DRY-RUN 演示'));
- toast('osd.'+o.id+(inn?' 已加入集群':' 已标记 OUT（DRY-RUN）'),'ok');closeModal();render();}
+function osdMark(id,inn){
+ var o=state.osds.filter(function(x){return x.id===Number(id);})[0];if(!o)return;
+ var act=inn?'in':'out',cmd='ceph osd '+act+' '+o.id;
+ function done(dry,detail){
+  /* A live DRY-RUN must not pretend the flag changed on the cluster. */
+  if(!dry||state.mode!=='live'){o.inn=inn;if(inn)o.up=true;}
+  addAudit(inn?'OSD_IN':'OSD_OUT','osd.'+o.id,cmd,(dry?'DRY-RUN 演示':'真实执行')+(detail?' · '+detail:''));
+  toast('osd.'+o.id+(inn?' IN':' OUT')+(dry?(state.mode==='live'?' 已生成命令（DRY-RUN，未下发集群）':' 演示完成（DRY-RUN）'):' 已下发并执行'),'ok');
+  closeModal();render();
+  if(!dry&&state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState();},800);
+ }
+ if(state.mode==='live'&&state.auth.authenticated){
+  apiFetch('POST','/api/osd/'+o.id+'/'+act,{confirm_phrase:'osd.'+o.id,allow_write:!!state.settings.allowWrite})
+   .then(function(r){done(!!r.dry_run,String(r.detail||r.command||'').slice(0,90));})
+   .catch(function(e){toast('操作失败：'+((e&&e.message)||e),'e');});
+  return;
+ }
+ done(true,'');
+}
 function testConn(){if(state.mode==='demo'){toast('当前为 DEMO 模式；切换到 LIVE 并部署后端后可测试连接','w');return;}
  API.call('GET','/api/probe').then(function(r){state.profile=r.profile||r;state.lastRefresh=Date.now();render();syncState();toast('连接成功 · '+esc((state.profile.version||'未知')+' / '+(state.profile.orchestrator||'')),'ok');})
  .catch(function(e){toast('连接失败：'+e.message,'e');});}

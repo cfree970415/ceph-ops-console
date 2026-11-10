@@ -44,8 +44,8 @@
 | 告警中心 | 四级告警分级统计、筛选/确认/静默、告警直达故障 OSD 的一键处置入口 |
 | OSD / 磁盘 | OSD 列表（服务器名 + IP + 真实设备映射）、元数据查询、行内 OUT / IN 切换、一键踢盘换盘 |
 | 存储池 / 主机 | 存储池用量、主机与 MON 视图 |
-| 一键踢盘 | 标记 DOWN → 标记 OUT → 确认 down/out → 健康验证（**不退役**，不清 CRUSH 条目、不清盘） |
-| 一键换盘 | 标记 DOWN/OUT → 移除 OSD → 清理元数据 → **暂停等待人工换盘** → 原 OSD ID 重建 → 回填观察 |
+| 一键踢盘 | 停止 OSD 守护进程 → 标记 DOWN → 标记 OUT → 健康验证 → 回读复核（**不退役**，不清 CRUSH 条目、不清盘） |
+| 一键换盘 | 预检新盘 → 清理元数据 → 创建 OSD → 等待上线 → 健康验证（插入新盘后一键初始化） |
 | 一键 IN 盘 | 确认仍在 CRUSH → `ceph osd in` → 恢复权重并回填 → 健康验证（OUT 状态时才显示入口） |
 | 高级向导 | 5 步流程，逐步展示命令、预检项与执行结果 |
 | 变更审计 | jsonl 全量记录（时间、用户、目标、命令、DRY-RUN / EXECUTED / REJECTED、来源 IP） |
@@ -265,33 +265,37 @@ unset PW
 
 从「告警中心」的故障告警、概览页的「待处置故障盘」，或「OSD / 磁盘」页均可发起。
 
-**一键踢盘（DOWN + OUT，不退役 OSD）**
+**一键踢盘（停服务 + DOWN + OUT，不退役 OSD）**
 
 ```
-标记 DOWN → 标记 OUT → 确认 down / out 生效 → 集群健康验证
+停止 OSD 守护进程 → 标记 DOWN → 标记 OUT → 集群健康验证 → 回读 osd dump 复核
 ```
 
-先 `ceph osd down <id>` 让故障盘立刻停止服务（避免坏盘反复抖动产生 slow ops），再 `ceph osd out` 把它摘出 CRUSH 触发数据回填。到这一步就结束：**不执行** `purge` / `crush remove` / `auth del` / `lvm zap`，OSD 身份与盘上数据都保留，之后点 **IN** 就能原样加回集群。对已经 down 的 OSD，`osd down` 是幂等的，不会报错。
+**为什么必须先停服务**：`ceph osd down <id>` 只是把 `osdmap` 里的标记改成 down，守护进程还活着时心跳会在几秒内把它改回 `up`——这就是「踢完只剩 out、down 没生效」的原因。所以第一步是停进程（cephadm：`ceph orch daemon stop osd.<id>`；包安装：`systemctl stop ceph-osd@<id>`），再 `osd down` 让 MON 立即标记，最后 `osd out` 摘出 CRUSH 触发回填。
 
-需要真正把 OSD 从集群抹掉（换盘或永久下线）时，用「换盘向导」的 `remove`（完整退役，含 purge / 清盘）意图，那条路径才是不可逆的。
+执行完后端会**回读 `ceph osd dump` 复核**该 OSD 是否真的 `up=false / in=false`：复核不通过（例如权限不足没停掉服务）时，界面会直接显示「未完全生效」并给出需要手工执行的命令，而不是假装成功。到这一步就结束：**不执行** `purge` / `crush remove` / `auth del` / `lvm zap`，OSD 身份与盘上数据都保留，之后点 **IN** 就能加回集群。
 
-**一键换盘（保留原 OSD ID）**
+需要真正把 OSD 从集群抹掉（永久下线）时，用「换盘向导」的 `remove`（完整退役，含 purge / 清盘）意图，那条路径才是不可逆的。
+
+**一键换盘（插入新盘后一键初始化）**
 
 ```
-标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD → 清理磁盘元数据
-   ↓  平台暂停，提示「物理更换故障盘」
-现场换盘后点击「磁盘已换好，继续执行」
-   ↓
-原 ID 重建 → 重新 IN → 回填观察 → HEALTH_OK / PG active+clean 确认
+预检设备（是否空闲 / 可加入集群）→ 清理旧元数据 → 创建 OSD → 等待上线 → 健康验证
 ```
+
+适用于「坏盘已踢出、现场插上新盘」之后：在弹窗里选一块**新盘**（下拉框列出 `ceph orch device ls` 中 available 的设备，也可手工填 `/dev/sdX`），平台会清掉该盘的分区表 / LVM / 文件系统签名，然后创建 OSD 并加入 CRUSH。不碰任何已有 OSD，也不需要先选某个 OSD。
+
+- cephadm：`ceph orch device zap <host> <dev> --force` → `ceph orch daemon add osd <host>:<dev>`
+- 包安装：`ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev>`
+- 安全闸：后端在执行前会比对现有 OSD 的设备名，若该设备已被占用则直接拒绝（zap 不可逆）；前端还要输入设备路径二次确认。
 
 **一键 IN 盘（维护结束 / 误 out 后恢复）**
 
 ```
-确认 OSD 仍在 CRUSH map → ceph osd in <id> → 确认 up/in → 集群健康验证
+启动 OSD 守护进程 → 确认 OSD 仍在 CRUSH map → ceph osd in <id> → 确认 up/in → 集群健康验证
 ```
 
-适用于磁盘维护、临时下线后恢复，或误执行 OUT 的回滚。已被 `purge` / `osd rm` 的 OSD 无法 IN，只能重新部署。IN 只会清掉「被标记 OUT」类告警，硬件类告警（SMART、心跳丢失）仍保留，不会假装磁盘已经修好。
+适用于磁盘维护、临时下线后恢复，或误执行 OUT 的回滚。因为踢盘时停过服务，IN 会先尝试启动 OSD 守护进程（cephadm `orch daemon start` / `systemctl start`），否则 `osd in` 只会恢复权重、状态仍是 down。已被 `purge` / `osd rm` 的 OSD 无法 IN，只能重新部署。IN 只会清掉「被标记 OUT」类告警，硬件类告警（SMART、心跳丢失）仍保留，不会假装磁盘已经修好。
 
 入口位置：概览页「快捷运维」、OSD 列表每行的操作列、OSD 详情弹窗。OSD 列表里按钮是二态的：`in` 时显示 **OUT**，`out` 后同一位置显示同款 **IN** 按钮，点击直接执行 `ceph osd in <id>`，不再经过向导。状态以 `ceph osd dump` 为准，执行成功会立即丢弃后端状态缓存并强制刷新，不会出现点完 OUT 几秒后又跳回 OUT 的情况（DRY-RUN 未真实下发时不会改按钮，只提示命令未执行）。
 
@@ -379,10 +383,12 @@ unset PW
 | GET | `/api/progress` | 回填 / 任务进度 |
 | GET | `/api/isolation` | 原生 Dashboard 隔离自检 |
 | GET | `/api/audit` | 审计记录 |
+| GET | `/api/devices` | 可加入集群的空闲磁盘（一键换盘时选新盘用） |
 | GET | `/api/osd/<id>/meta` | OSD 元数据 |
-| POST | `/api/quick/kick` | 一键踢盘（`osd down` + `osd out`，不退役） |
-| POST | `/api/quick/in` | 一键 IN 盘（`osd in` + 回填观察） |
-| POST | `/api/quick/replace` | 一键换盘（`stage=pre` / `post`） |
+| POST | `/api/quick/kick` | 一键踢盘（停服务 + `osd down` + `osd out`，不退役，返回 `verify` 复核结论） |
+| POST | `/api/quick/in` | 一键 IN 盘（启动守护进程 + `osd in` + 回填观察） |
+| POST | `/api/quick/init` | 一键换盘（新盘初始化：zap + 创建 OSD） |
+| POST | `/api/quick/replace` | 换盘并保留原 OSD ID（旧流程，需人工换盘中转） |
 | POST | `/api/execute` | 高级向导执行 |
 | POST | `/api/osd/<id>/out` `/in` | 标记 OSD out / in |
 | POST | `/api/alert/ack` | 告警确认 |
@@ -514,10 +520,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 
 ```bash
 grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.6+ = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.3-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.4-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.3-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.4-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
@@ -566,7 +572,7 @@ journalctl -u ceph-console -n 50 --no-pager
 ## 常见问题
 
 **Q：登录 admin 后看到的还是旧数据 / 空页面？**
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.3-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.4-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但页面空白**：属于[登录后没有真实数据](#登录后没有真实数据)，点「运行后端自检」看 `ceph status` 的真实报错，不是模式问题。
 3. 分离部署时确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
 
@@ -575,6 +581,9 @@ journalctl -u ceph-console -n 50 --no-pager
 
 **Q：登录后看不到集群状态？**
 同上一个问题。最常见的是后端主机 `ceph -s` 跑不通（没装 ceph CLI / 不在管理节点 / 没有真实集群）、专用 keyring 缺失或 caps 不足，其次是形态 B 的后端地址与 CORS 配置。
+
+**Q：点了一键踢盘，按钮 / 状态里只有 out，没有 down？**
+因为 `ceph osd down` 只改 osdmap 标记，OSD 守护进程还在跑时心跳会把它改回 `up`。1.1.4 起踢盘计划第一步就是停守护进程（cephadm `ceph orch daemon stop osd.<id>`，包安装 `systemctl stop ceph-osd@<id>`），并在执行后回读 `ceph osd dump` 复核。如果界面提示「未完全生效」，说明停服务那步失败（多半是后端进程不是 root、或 orch 未接管），按提示在集群节点手工执行一次停服务命令即可。
 
 **Q：点了一键踢盘但集群没变化？**
 先确认服务是否处于 DRY-RUN：按快速开始安装时带了 `--allow-write`，应已开启真实执行；检查 `/api/session` 是否返回 `allow_write: true`、登录角色是否为 admin。若当初去掉了 `--allow-write`，改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console` 即可，无需重装。

@@ -242,20 +242,32 @@ function isolationCard(){
   '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>原生 Dashboard 继续按原地址和原账号使用；本控制台只是通过只读命令与独立 client 凭证观察集群。写操作同样经该凭证下发，不会修改 mgr dashboard 的任何配置。</div></div>',head);
 }
 
-/* ---------- one-click kick / replace / in ---------- */
-function quickTitle(k){return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':'一键换盘（保留 OSD ID）';}
-function quickIntent(k){return k==='kick'?'downout':k==='in'?'in':'replace';}
+/* ---------- one-click kick / init new disk / in ---------- */
+function quickTitle(k){return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':k==='init'?'一键换盘（新盘初始化）':'一键换盘';}
+function quickIntent(k){return k==='kick'?'downout':k==='in'?'in':k==='init'?'init':'replace';}
 function quickPlan(k,w){
  if(state.mode==='live'&&state.auth.authenticated){
   return apiFetch('POST','/api/plan',{intent:quickIntent(k),osd_id:w.osdId,host:w.host,dev:w.dev})
    .then(function(r){return (r.steps||[]).map(function(s){
      return {n:s.name,c:s.command||('# '+s.name+'：'+s.note),note:s.note||'',manual:!!s.manual};});});
  }
+ if(k==='init')return Promise.resolve([
+  {n:'预检设备',c:'# 预检设备是否空闲、可加入集群',note:'确认设备未被 OSD 占用',manual:true},
+  {n:'清理元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',note:'清掉分区表 / LVM / 文件系统签名'},
+  {n:'创建 OSD',c:'ceph-volume lvm create --data '+w.dev,note:'创建 OSD 并加入 CRUSH'},
+  {n:'健康验证',c:'ceph -s --format=json',note:'观察 PG 回到 active+clean'}]);
  return Promise.resolve(wizardPlan({osdId:w.osdId,host:w.host,dev:w.dev,intent:quickIntent(k)}));
+}
+/* 新盘初始化：目标是「设备」，不是某个 OSD；先探测可用的空闲盘再生成命令 */
+function loadFreeDevices(q){
+ if(!(state.mode==='live'&&state.auth.authenticated))return Promise.resolve([]);
+ return apiFetch('GET','/api/devices',null).then(function(r){return (r&&r.devices)||[];})
+  .catch(function(){return [];});
 }
 function quickOpen(kind,osdId){
  var n=osdId==null?(kind==='in'?(inOsd()||{}).id:(faultOsd()||{}).id):Number(osdId);
  var o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[0];
+ if(kind==='init'){return quickOpenInit(o);}
  if(!o){toast('没有可用的 OSD','e');return;}
  state.quick={kind:kind,osdId:o.id,host:o.host,dev:o.dev,serial:o.serial||'',phase:'loading',steps:[],logs:[],
   progress:0,phrase:'',confirmed:false,busy:false,error:'',stage:'pre',aborted:false,pending:[],hasManual:false,
@@ -274,7 +286,45 @@ function quickOpen(kind,osdId){
   if(!state.quick||state.quick!==mine)return;
   var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
-function qHead(){var q=state.quick;return modalHead(quickTitle(q.kind)+' · osd.'+q.osdId,
+function quickOpenInit(o){
+ state.quick={kind:'init',osdId:o?o.id:null,host:(o&&o.host)||'',
+  dev:'',serial:'',devices:[],phase:'loading',steps:[],logs:[],progress:0,phrase:'',confirmed:false,
+  busy:false,error:'',stage:'auto',aborted:false,pending:[],hasManual:false,
+  dryRun:!state.settings.allowWrite,role:state.auth.role||'admin'};
+ state.wizard=null;
+ var mine=state.quick;
+ quickPaintModal();
+ loadFreeDevices(mine).then(function(list){
+  if(!state.quick||state.quick!==mine)return;
+  var q=mine,host=q.host;
+  var usable=list.filter(function(d){return d.available&&(!host||!d.host||d.host===host);});
+  if(!usable.length)usable=list.filter(function(d){return d.available;});
+  q.devices=usable;
+  q.dev=usable.length?usable[0].dev:'';
+  if(!q.dev){q.phase='confirm';quickPaintModal();return;}
+  return quickPlan('init',q).then(function(steps){
+   if(!state.quick||state.quick!==q)return;
+   q.steps=steps;q.hasManual=false;q.phase='confirm';
+   if(!state.settings.confirm){q.phrase=q.dev;q.confirmed=true;}
+   quickPaintModal();});
+ }).catch(function(e){
+  if(!state.quick||state.quick!==mine)return;
+  var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
+}
+/* 换了一块新盘 / 改了设备路径：重新向后端要命令序列 */
+function replanInit(q){
+ q.phase='loading';q.phrase='';quickPaintModal();
+ return quickPlan('init',q).then(function(steps){
+  if(state.quick!==q)return;
+  q.steps=steps;q.phase='confirm';
+  if(!state.settings.confirm){q.phrase=q.dev;q.confirmed=true;}
+  quickPaintModal();
+ }).catch(function(e){
+  if(state.quick!==q)return;
+  q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
+}
+function qHead(){var q=state.quick;
+ return modalHead(quickTitle(q.kind)+(q.kind==='init'?' · '+esc(q.dev||'选择新盘'):' · osd.'+q.osdId),
  '后端按 Ceph 版本自动选择命令模板 · '+(q.dryRun?'DRY-RUN 只生成命令':'真实执行'));}
 function quickPaintModal(){
  var q=state.quick;if(!q)return;
@@ -286,12 +336,42 @@ function quickPaintModal(){
   b='<div class="dangerbox">'+ic('alert')+'<div>'+esc(q.error)+'</div></div>'+
     '<div class="note" style="margin-top:12px">请确认已登录、后端为 CLI 通道且 /api/plan 可访问。</div>';
   foot='<div class="sp"></div><button class="btn" data-act="q-close">关闭</button><button class="btn" data-act="q-retry">重试</button>';
+ }else if(q.phase==='confirm'&&q.kind==='init'){
+  /* 一键换盘 = 插入新盘后一键初始化：目标是设备，不需要先选 OSD */
+  b='<div class="warnbox" style="margin-bottom:14px">'+ic('zap')+
+   '<div><b>把新插入的磁盘初始化并加入集群</b><br>'+
+   '流程：预检设备（是否空闲 / 可加入）→ 清理旧元数据（分区表 / LVM / 文件系统签名）→ 创建 OSD → 等待上线 → 健康验证。'+
+   '不改动任何已有 OSD 的数据，也不做退役。<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
+   '<div class="fgrp" style="margin-bottom:12px"><label class="fld">目标服务器</label>'+
+    '<input class="inp mono" data-bind="quick.host" value="'+esc(q.host)+'" placeholder="ceph-single" autocomplete="off"></div>'+
+   '<div class="fgrp" style="margin-bottom:8px"><label class="fld">新盘设备</label>'+
+   (q.devices.length
+    ?'<select class="inp mono" data-bind="quick.dev" data-act="q-dev">'+q.devices.map(function(d){
+       return '<option value="'+esc(d.dev)+'"'+(d.dev===q.dev?' selected':'')+'>'+esc(d.dev)+' · '+bytes(d.size||0)+
+        ' · '+esc(d.host||'本机')+(d.note?' · '+esc(d.note):'')+'</option>';}).join('')+'</select>'
+    :'<input class="inp mono" data-bind="quick.dev" value="'+esc(q.dev)+'" placeholder="/dev/sdb" autocomplete="off">')+'</div>'+
+   '<div class="btn-row" style="margin-bottom:12px;align-items:center"><span class="note">'+
+    (q.devices.length?'只列出未被 OSD 占用的空闲盘，插入新盘后点「重新探测」即可看到。':'未探测到可自动纳管的空闲盘，请手工填写设备路径（如 /dev/sdb），并确认该盘未被占用。')+
+    '</span><div class="sp"></div><button class="btn sm" data-act="q-replan">'+ic('refresh',12)+' 重新生成命令</button>'+
+    '<button class="btn sm" data-act="q-dev-refresh">'+ic('disk',12)+' 重新探测</button></div>'+
+   '<div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">后端生成的命令序列（'+esc(liveProfile().version||'')+' / '+esc(liveProfile().orchestrator||'')+'）</div>'+
+   '<div class="cmdbox" style="max-height:190px;overflow:auto">'+q.steps.map(function(s,i){
+     return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
+      (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('')+'</div>';
+  if(state.settings.confirm){
+   b+='<div class="hr"></div><div class="fgrp"><label class="fld">输入设备路径 <span class="mono" style="color:var(--accent2)">'+esc(q.dev||'/dev/sdb')+'</span> 确认</label>'+
+    '<input class="inp mono" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="'+esc(q.dev)+'" autocomplete="off"></div>'+
+    '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对盘位与设备名 <span class="mono">'+esc(q.dev)+'</span></span></label>';
+  }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
+  if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
+  foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
+   '<button class="btn pri" data-act="q-run">'+ic('zap',14)+' 立即执行初始化</button>';
  }else if(q.phase==='confirm'){
   var used=o.size?pct(o.used,o.size):0,isKick=q.kind==='kick',isIn=q.kind==='in';
   b='<div class="'+(isKick?'dangerbox':'warnbox')+'" style="margin-bottom:14px">'+ic(isIn?'check':'alert')+
    '<div><b>'+(isKick?'即将把 osd.'+q.osdId+' 停掉并从集群摘出（DOWN + OUT）':isIn?'即将把 osd.'+q.osdId+' 重新加入集群':'踢出并更换 osd.'+q.osdId+' 的磁盘')+'</b><br>'+
-   (isKick?'流程：标记 DOWN（停止服务）→ 标记 OUT（从 CRUSH 摘出，触发回填）→ 状态复核 → 健康验证。<b>不做退役</b>：不 purge、不删认证、不清盘，数据与 OSD 身份保留，随时可点 IN 恢复。':
-    isIn?'流程：确认 OSD 仍在 CRUSH → 取消 OUT 标记（osd in）→ 恢复权重并回填 → 健康验证。':
+   (isKick?'流程：停止 OSD 守护进程 → 标记 DOWN → 标记 OUT（从 CRUSH 摘出，触发回填）→ 状态复核 → 健康验证。<b>不做退役</b>：不 purge、不删认证、不清盘，随时可点 IN 恢复。':
+    isIn?'流程：启动 OSD 守护进程 → 确认 OSD 仍在 CRUSH → 取消 OUT 标记（osd in）→ 恢复权重并回填 → 健康验证。':
     '流程：标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD → 清理磁盘元数据 → <b>人工换盘（平台暂停）</b> → 原 ID 重建 → 回填观察。')+
    '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+
    '<div class="grid g2" style="margin-bottom:14px"><div>'+
@@ -326,12 +406,21 @@ function quickPaintModal(){
     '<button class="btn pri" data-act="q-resume">'+ic('check',14)+' 磁盘已换好，继续执行</button>';
   }else foot='<div class="sp"></div><button class="btn dan" data-act="q-abort">中止</button>';
  }else if(q.phase==='done'){
-  b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="t">'+ic('check',38)+'</div>'+
-   '<div style="font-size:16px;font-weight:700;margin-top:8px">'+quickTitle(q.kind)+'流程已完成</div>'+
-   '<div class="note" style="margin-top:6px">osd.'+q.osdId+' · '+(q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':(q.kind==='kick'?'已标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群':'命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean'))+'</div></div>'+
+  var badVerify=q.kind==='kick'&&q.verify&&q.verify.ok===false;
+  b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+(badVerify?'td':'t')+'">'+
+   ic(badVerify?'alert':'check',38)+'</div>'+
+   '<div style="font-size:16px;font-weight:700;margin-top:8px">'+quickTitle(q.kind)+(badVerify?'未完全生效':'流程已完成')+'</div>'+
+   '<div class="note" style="margin-top:6px">'+(q.kind==='init'?esc(q.dev)+' @ '+esc(q.host):'osd.'+q.osdId)+' · '+
+   (q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':
+    q.kind==='init'?'已初始化并加入集群，数据开始回填；新 OSD 会在 OSD 列表出现':
+    q.kind==='kick'?(badVerify?esc(q.verify.message):'已停服务并标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群'):
+    '命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
+   (badVerify?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div>后端复核未通过：'+esc(q.verify.message)+
+    '</div></div>':'')+
    '<div class="grid g2"><div><div class="stat-line"><span>执行步骤</span><b class="mono">'+q.steps.length+'</b></div>'+
    '<div class="stat-line"><span>集群版本</span><b class="mono">'+esc(liveProfile().version||'-')+'</b></div></div>'+
-   '<div><div class="stat-line"><span>关联告警</span><b class="'+(q.kind==='kick'?'tw':'t')+'">'+(q.kind==='kick'?'待复核（OSD 已 down）':'已自动恢复')+'</b></div>'+
+   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'关联告警')+'</span><b class="'+(q.kind==='kick'?'tw':'t')+'">'+
+   (q.kind==='init'?'待同步（列表刷新后可见）':q.kind==='kick'?'待复核（后端已回读 osd dump）':'已自动恢复')+'</b></div>'+
    '<div class="stat-line"><span>审计记录</span><b class="t">已写入</b></div></div></div>'+
    '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>真实环境请回到「告警中心」确认告警已清除，并在「变更审计」复核完整命令序列与返回码。</div></div>';
   foot='<div class="sp"></div><button class="btn" data-act="q-alerts">查看告警</button>'+
@@ -350,10 +439,16 @@ function quickPaintLogs(){
 }
 function quickApply(){
  var q=state.quick,o=state.osds.filter(function(x){return x.id===q.osdId;})[0],isIn=q.kind==='in';
+ if(q.kind==='init'){
+  /* 新盘初始化：新 OSD 的 id / 容量只有后端知道，本地不猜，等强制刷新带回真实值。 */
+  addAudit('OSD_INIT_1CLICK',q.dev||'-',q.steps.map(function(s){return s.c;}).join(' ; '),
+   (q.dryRun?'DRY-RUN 演练 · ':'一键执行 · ')+(state.auth.user||'console'));
+  return;}
  if(q.kind==='kick'){/* 踢盘 = down + out：OSD 仍在集群里，不能从列表删掉，
-   只把本地状态标成 down / out，真实值由随后的强制刷新覆盖。 */
-  if(o){o.up=false;o.inn=false;}
-  state.cluster.osdsIn=Math.max(0,(state.cluster.osdsIn||0)-1);}
+   只把本地状态标成 down / out，真实值由随后的强制刷新覆盖。
+   后端复核没过时不能往前端写成 down——那会让界面说谎。 */
+  if(!q.verify||q.verify.ok!==false){if(o){o.up=false;o.inn=false;}
+   state.cluster.osdsIn=Math.max(0,(state.cluster.osdsIn||0)-1);}}
  else if(isIn){if(o){o.inn=true;o.up=true;}
   state.cluster.osdsIn=Math.min(state.cluster.osds,(state.cluster.osdsIn||0)+1);}
  else if(o){o.up=true;o.inn=true;o.smart='OK';o.used=Math.round(o.used*0.55);}
@@ -372,15 +467,18 @@ function quickApply(){
 }
 function quickExec(stage){
  var q=state.quick;if(!q)return;
- q.phase='running';q.stage=stage;q.aborted=false;q.logs=[];q.progress=0;q.pending=[];quickPaintModal();
+ q.phase='running';q.stage=stage;q.aborted=false;q.logs=[];q.progress=0;q.pending=[];q.verify=null;quickPaintModal();
  qLog('d','# Ceph Ops Console · '+(q.dryRun?'DRY-RUN':'EXECUTE')+' · '+dt(Date.now()));
- qLog('d','# target osd.'+q.osdId+' @ '+q.host+' '+q.dev+' · '+liveProfile().version+' / '+liveProfile().orchestrator);
+ qLog('d','# target '+(q.kind==='init'?q.dev+' @ '+q.host:'osd.'+q.osdId+' @ '+q.host+' '+q.dev)+
+  ' · '+liveProfile().version+' / '+liveProfile().orchestrator);
  qLog('d','# stage='+stage+' · 所有命令参数化执行，不经 shell');qLog('d','');
- var body={osd_id:q.osdId,host:q.host,dev:q.dev,confirm_phrase:'osd.'+q.osdId,
-  allow_write:!q.dryRun,stage:stage};
+ var body=q.kind==='init'
+  ?{host:q.host,dev:q.dev,confirm_phrase:q.phrase,allow_write:!q.dryRun,stage:'auto'}
+  :{osd_id:q.osdId,host:q.host,dev:q.dev,confirm_phrase:'osd.'+q.osdId,allow_write:!q.dryRun,stage:stage};
  var req;
  if(state.mode==='live'&&state.auth.authenticated){
-  req=apiFetch('POST',q.kind==='kick'?'/api/quick/kick':q.kind==='in'?'/api/quick/in':'/api/quick/replace',body);
+  req=apiFetch('POST',q.kind==='kick'?'/api/quick/kick':q.kind==='in'?'/api/quick/in':
+   q.kind==='init'?'/api/quick/init':'/api/quick/replace',body);
  }else{
   var manualIdx=-1;q.steps.forEach(function(s,i){if(manualIdx<0&&(s.manual||String(s.c).charAt(0)==='#'))manualIdx=i;});
   var slice=stage==='pre'&&manualIdx>=0?q.steps.slice(0,manualIdx):
@@ -400,9 +498,16 @@ function quickExec(stage){
    if(i>=cmds.length){
     if(r.pause||(q.kind==='replace'&&stage==='pre'&&q.hasManual)){
      q.pending=r.pending_commands||[];q.phase='paused';quickPaintModal();return;}
-    q.progress=100;qLog('c','✓ 全部步骤完成');
+    q.progress=100;
+    if(r.verify){
+     q.verify=r.verify;
+     if(r.verify.ok)qLog('c','✓ 复核通过：'+r.verify.message);
+     else qLog('e','! 复核未通过：'+r.verify.message);
+    }
+    qLog('c','✓ 全部步骤完成');
     quickApply();q.phase='done';quickPaintModal();
-    toast(quickTitle(q.kind)+' 流程完成','ok');
+    if(r.verify&&!r.verify.ok)toast('踢盘未完全生效：'+r.verify.message,'e');
+    else toast(quickTitle(q.kind)+' 流程完成','ok');
     if(state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState(true);},1500);
     return;}
    var c=String(cmds[i]);qLog(c.charAt(0)==='#'?'d':'p',c.charAt(0)==='#'?c:'$ '+c);
@@ -432,11 +537,29 @@ function quickAction(act,el){
   case 'q-retry':if(q)quickOpen(q.kind,q.osdId);return;
   case 'q-wizard':if(q){if(q.kind==='in'){toast('IN 盘只涉及 osd in 与回填观察，直接执行即可','w');return;}
    var k=q.kind,id=q.osdId;state.quick=null;closeModal();startWizard(id,k==='kick'?'remove':'replace');}return;
+  case 'q-dev':/* 选了另一块新盘：重新生成命令序列 */
+   if(q&&q.kind==='init'){q.dev=el.value||q.dev;replanInit(q);}return;
+  case 'q-replan':
+   if(q&&q.kind==='init'){replanInit(q);}return;
+  case 'q-dev-refresh':
+   if(q&&q.kind==='init'){
+    var keep=q;
+    loadFreeDevices(keep).then(function(list){
+     if(state.quick!==keep)return;
+     var usable=list.filter(function(d){return d.available&&(!keep.host||!d.host||d.host===keep.host);});
+     if(!usable.length)usable=list.filter(function(d){return d.available;});
+     keep.devices=usable;
+     if(usable.length)keep.dev=usable[0].dev;
+     if(keep.dev)replanInit(keep);else{keep.steps=[];quickPaintModal();}
+    });}return;
   case 'q-run':
    if(!q)return;
-   if(q.phrase!=='osd.'+q.osdId||!q.confirmed){toast('请输入 osd.'+q.osdId+' 并勾选盘位确认','e');return;}
+   if(q.kind==='init'){
+    if(!q.dev){toast('请先选择或填写新盘设备','e');return;}
+    if(state.settings.confirm&&(q.phrase!==q.dev||!q.confirmed)){toast('请输入设备路径 '+q.dev+' 并勾选盘位确认','e');return;}
+   }else if(q.phrase!=='osd.'+q.osdId||!q.confirmed){toast('请输入 osd.'+q.osdId+' 并勾选盘位确认','e');return;}
    if(state.mode==='live'&&state.auth.role!=='admin'){toast('只读账号无法执行写操作，请用管理员登录','e');return;}
-   quickExec('pre');return;
+   quickExec(q.kind==='init'?'auto':'pre');return;
   case 'q-resume':if(q)quickExec('post');return;
   case 'q-abort':if(q){q.aborted=true;toast('已发送中止请求','w');}return;
   case 'q-alerts':state.quick=null;closeModal();state.view='alerts';render();return;

@@ -21,7 +21,7 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
  openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host||'—')+' · '+esc(o.dev||'—'))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
-  '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
+  '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
 function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)return;
  var body='<div class="flex" style="gap:10px;margin-bottom:14px">'+sevTag(a.sev)+stTag(a.status)+'<span class="tag mute mono">'+a.id+'</span></div>'+
   '<div style="font-size:15px;font-weight:650;margin-bottom:10px">'+esc(a.title)+'</div><div class="note" style="font-size:12.5px;color:var(--muted);margin-bottom:16px">'+esc(a.msg)+'</div>'+
@@ -30,7 +30,7 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
   '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 先置 DOWN 停止服务，再 OUT 摘盘（或直接用页面上的「一键踢盘」）\nceph osd down '+a.osd+'\nceph osd out '+a.osd+'\n# 3. 观察回填至 active+clean；维护结束后可用「一键 IN 盘」恢复':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
  openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div><button class="btn" data-act="modal-close">关闭</button>'+
   (a.osd!=null?'<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+a.osd+'">'+ic('trash',13)+'一键踢盘</button>'+
-   '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+a.osd+'">'+ic('zap',13)+'一键换盘</button>':'')+'</div>','md');}
+   '<button class="qbtn" data-act="q-open" data-kind="init" data-id="'+a.osd+'">'+ic('zap',13)+'一键换盘</button>':'')+'</div>','md');}
 
 /* ---------- command plan / preflight ---------- */
 function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cephadm'&&p.caps.orch,rep=w.intent==='replace',s=[];
@@ -338,7 +338,9 @@ function boot(){
   if(act==='overlay'){if(!e.target.closest('.modal'))onAct('overlay',el);return;}
   if(el.disabled)return;onAct(act,el);});
  document.addEventListener('input',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
- document.addEventListener('change',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
+ document.addEventListener('change',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
+  /* 下拉框本身带 data-act（例如换盘时切换新盘设备）时也要触发动作 */
+  var a=e.target.closest('select[data-act]');if(a&&!a.disabled)onAct(a.getAttribute('data-act'),a);});
  if(typeof liveBoot==='function'){liveBoot();return;}
  render();
  if(state.mode==='live')syncState();

@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.3-20261110';
+var UI_BUILD='1.1.4-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -385,7 +385,7 @@ function vOverview(){if(liveNoData())return noDataPage();
  var fq=faultOsd();
  var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>检测到待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'，可一键 <b>DOWN + OUT</b> 摘出（不退役，随时可 IN 恢复）。</div></div>'+
   '<div class="btn-row" style="margin-bottom:14px"><button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fq.id+'">'+ic('trash',14)+'一键踢盘</button>'+
-  '<button class="qbtn lg" data-act="q-open" data-kind="replace" data-id="'+fq.id+'">'+ic('zap',14)+'一键换盘</button>'+
+  '<button class="qbtn lg" data-act="q-open" data-kind="init" data-id="'+fq.id+'">'+ic('zap',14)+'一键换盘</button>'+
   '<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+'查看告警页面</button></div><div class="hr"></div>':'';
  /* An OSD left in OUT state (maintenance / drained) can be put back with one click. */
  var iq=liveNoData()?null:inOsd();
@@ -400,5 +400,5 @@ function vOverview(){if(liveNoData())return noDataPage();
     :'<div class="empty" style="padding:16px">'+ic('check',22)+'<div>当前没有活跃告警</div></div>',
    '<button class="btn sm" data-act="nav" data-view="alerts">查看全部 '+ic('arrow',12)+'</button>',false);
  var quick=card('快捷运维',quickOps+'<div class="note" style="margin-bottom:12px">磁盘故障处理推荐走「踢盘换盘向导」：自动完成版本适配、预检、二次确认、执行与回填观察。</div><div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
- return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="replace">'+ic('zap',14)+' 一键换盘</button>')+
+ return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="init">'+ic('zap',14)+' 一键换盘</button>')+
   noData+'<div class="grid g4" style="margin-bottom:14px">'+kh+'</div><div class="grid g21" style="margin-bottom:14px">'+trend+donutCard+'</div><div class="grid g2" style="margin-bottom:14px">'+io+pg+'</div><div class="grid g2">'+recent+quick+'</div>';}

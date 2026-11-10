@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -501,6 +501,132 @@ def _dev_path(d):
     if not d:
         return ""
     return d if d.startswith("/") else "/dev/" + d
+
+
+def _run_argv(cfg, argv, timeout=60):
+    """ceph 命令需要注入 conf / keyring；systemctl 等系统命令原样执行。"""
+    if argv and argv[0] == "ceph":
+        return ceph_run(cfg, list(argv[1:]), timeout)
+    return run(argv, timeout)
+
+
+def osd_daemon_cmd(probe, action, oid):
+    """停 / 起 OSD 守护进程（action = stop / start）。
+
+    `ceph osd down` 只是把 osdmap 里的标记改成 down，守护进程还活着时心跳会
+    立刻把它改回 up —— 这就是「踢盘只生效了 out、down 没生效」的原因。
+    要让 down 真正保持住，必须停掉进程本身：cephadm 走 orch，包安装走 systemctl。
+    """
+    if probe.caps.get("orch") or probe.orchestrator == "cephadm":
+        return ["ceph", "orch", "daemon", action, "osd.%d" % oid]
+    return ["systemctl", action, "ceph-osd@%d" % oid]
+
+
+def osd_upin_state(cfg, oid):
+    """单个 OSD 的权威 up / in（来自 ceph osd dump，df 里没有这两个字段）。"""
+    doc, _ = ceph_json(cfg, ["osd", "dump"], 30)
+    if isinstance(doc, dict):
+        for o in (doc.get("osds") or []):
+            if not isinstance(o, dict):
+                continue
+            try:
+                if int(o.get("osd")) == int(oid):
+                    return {"up": bool(o.get("up")), "in": bool(o.get("in"))}
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def check_downout(cfg, oid):
+    """踢盘后复核：down 与 out 是否真的都生效了。"""
+    st = osd_upin_state(cfg, oid)
+    if st is None:
+        return {"ok": False, "up": None, "in": None,
+                "message": "osd.%d 状态读取失败（ceph osd dump 无返回）" % oid}
+    if (not st["up"]) and (not st["in"]):
+        return {"ok": True, "up": False, "in": False,
+                "message": "osd.%d 已 down 且 out" % oid}
+    reasons = []
+    if st["up"]:
+        reasons.append("仍为 up：OSD 守护进程没停掉（或权限不足），心跳把它改回了 up。"
+                       "在集群节点执行 ceph orch daemon stop osd.%d 或 systemctl stop ceph-osd@%d 后重试"
+                       % (oid, oid))
+    if st["in"]:
+        reasons.append("仍为 in：osd out 未生效")
+    return {"ok": False, "up": st["up"], "in": st["in"],
+            "message": "osd.%d %s" % (oid, "；".join(reasons))}
+
+
+def osd_used_devices(cfg):
+    """osd id -> 设备 / 主机，用来判断某块盘是否已经被 OSD 占用。"""
+    ids = []
+    doc, _ = ceph_json(cfg, ["osd", "dump"], 20)
+    if isinstance(doc, dict):
+        for o in (doc.get("osds") or []):
+            if not isinstance(o, dict):
+                continue
+            try:
+                ids.append(int(o.get("osd")))
+            except (TypeError, ValueError):
+                continue
+    dev_by_id, host_by_id, _ = osd_device_map(cfg, ids)
+    return dev_by_id, host_by_id
+
+
+def read_free_devices(cfg, probe):
+    """可加入集群的空闲磁盘，供「一键换盘（新盘初始化）」选择。"""
+    out, seen = [], set()
+    if cfg.backend != "cli":
+        return out
+    if probe.caps.get("orch"):
+        doc, _ = ceph_json(cfg, ["orch", "device", "ls"], 30)
+        for it in (doc if isinstance(doc, list) else []):
+            if not isinstance(it, dict):
+                continue
+            host = it.get("hostname") or it.get("host") or ""
+            devs = it.get("devices")
+            if isinstance(devs, list) and devs and isinstance(devs[0], dict):
+                for d in devs:
+                    dev = _dev_path(d.get("path") or d.get("dev") or "")
+                    if not dev or dev in seen:
+                        continue
+                    seen.add(dev)
+                    out.append({"host": host, "dev": dev,
+                                "size": d.get("size") or 0,
+                                "available": bool(d.get("available")),
+                                "note": ",".join(d.get("rejected_reasons") or [])})
+            else:
+                for p in (devs or []):
+                    dev = _dev_path(p)
+                    if not dev or dev in seen:
+                        continue
+                    seen.add(dev)
+                    out.append({"host": host, "dev": dev,
+                                "size": it.get("size") or 0,
+                                "available": bool(it.get("available")),
+                                "note": ""})
+        return sorted(out, key=lambda x: (x.get("host") or "", x.get("dev") or ""))
+
+    # 包安装 / legacy：用 lsblk 找没有分区、没有文件系统、没有挂载的整盘，
+    # 再排掉已经被 OSD 用掉的设备（宁可少列，也不能把在用的盘当成新盘）。
+    used = set(osd_used_devices(cfg)[0].values())
+    rc, txt, _ = run(["lsblk", "-J", "-b", "-o",
+                      "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL"], 10)
+    if rc == 0 and txt.strip():
+        try:
+            doc = json.loads(txt)
+        except ValueError:
+            doc = {}
+        for d in (doc.get("blockdevices") or []):
+            if not isinstance(d, dict):
+                continue
+            dev = _dev_path(d.get("name"))
+            if (d.get("type") != "disk" or not dev or dev in used
+                    or d.get("fstype") or d.get("mountpoint") or d.get("children")):
+                continue
+            out.append({"host": "", "dev": dev, "size": d.get("size") or 0,
+                        "available": True, "note": d.get("model") or ""})
+    return out
 
 
 def osd_device_map(cfg, want=None):
@@ -1074,13 +1200,23 @@ def validate_target(osd_id, host, dev):
 
 
 def build_plan(cfg, probe, intent, osd_id, host, dev):
-    oid = validate_target(osd_id, host, dev)
     orch = probe.caps.get("orch", False)
     purge = probe.caps.get("purge", False)
-    if intent not in ("remove", "replace", "in", "downout"):
+    if intent not in ("remove", "replace", "in", "downout", "init"):
         raise ValueError("unknown intent: %s" % intent)
-    # osd in / down+out 只按 id 操作，不碰磁盘，也就不需要设备路径。
-    if intent not in ("in", "downout") and not dev and (not orch or intent == "remove"):
+    # 一键换盘（init）针对的是「新插入的盘」，没有 OSD id，只认 host + 设备路径。
+    if intent == "init":
+        oid = None
+        if not dev:
+            raise ValueError("device path is required for a new disk")
+        if host and not HOST_RE.match(str(host)):
+            raise ValueError("invalid host")
+        if ".." in dev or not DEV_RE.match(str(dev)):
+            raise ValueError("invalid device path")
+    else:
+        oid = validate_target(osd_id, host, dev)
+    # osd in / down+out / 新盘初始化只按 id 或设备操作，不要求「先有 OSD」的设备路径。
+    if intent not in ("in", "downout", "init") and not dev and (not orch or intent == "remove"):
         raise ValueError("device path is required for this operation")
     plan = []  # (name, argv_or_None, note)
 
@@ -1137,20 +1273,46 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     elif intent == "downout":
         # 一键踢盘的真实语义：把盘停掉并从 CRUSH 摘出，保留 OSD 身份与数据。
         # 不走 purge / crush remove / zap —— 这些是「退役」，是不可逆的。
+        # 必须先停守护进程：只发 osd down 时，进程的心跳会在几秒内把它改回 up，
+        # 结果就是「只 out 了、down 没生效」。
+        add("停止 OSD 守护进程", osd_daemon_cmd(probe, "stop", oid),
+            "只改 osdmap 标记不够：进程还在跑时心跳会把 down 立刻改回 up，必须先停服务")
         add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
             "从 CRUSH 摘出并触发数据回填；不 purge、不清盘，随时可 osd in 恢复")
-        add("确认 down / out 已生效", ["ceph", "osd", "tree", "--format=json"],
-            "该 OSD 应为 down 且 reweight 为 0，其它 OSD 分担其 PG")
         add("集群健康验证", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
     elif intent == "in":
+        # 踢盘时停过守护进程，IN 必须把它拉起来，否则 osd in 之后仍是 down。
+        add("启动 OSD 守护进程", osd_daemon_cmd(probe, "start", oid),
+            "踢盘时停过服务；进程没起来时 osd in 只会恢复权重，状态仍是 down")
         add("确认 OSD 仍在 CRUSH map", ["ceph", "osd", "tree", "--format=json"],
             "已被 purge / rm 的 OSD 无法 in，只能重新部署")
         add("重新加入集群（osd in）", ["ceph", "osd", "in", str(oid)],
             "取消 out 标记，恢复 CRUSH 权重并触发数据回填")
-        add("确认 OSD 处于 up/in", ["ceph", "osd", "tree", "--format=json"],
-            "状态应为 up 且权重非 0；仍 down 说明进程未起来")
+        add("确认 OSD 处于 up/in", ["ceph", "osd", "dump", "--format=json"],
+            "osds[] 中该 OSD 的 up / in 都应为 true")
         add("集群健康验证", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
+    elif intent == "init":
+        # 一键换盘 = 插入新盘后一键完成初始化：预检 -> 清元数据 -> 创建 OSD -> 等上线。
+        # 不碰任何已有 OSD，也不需要先踢掉旧 OSD。
+        if orch:
+            add("预检设备是否可加入集群", ["ceph", "orch", "device", "ls", "--format=json"],
+                "确认 %s 的 available 为 true，且没有被其它 OSD 占用" % dev)
+            add("清理新盘旧元数据", ["ceph", "orch", "device", "zap", host, dev, "--force"],
+                "清掉分区表 / LVM / 文件系统签名；只作用于 %s，执行前请核对盘位与 SN" % dev)
+            add("初始化并部署 OSD", ["ceph", "orch", "daemon", "add", "osd", "%s:%s" % (host, dev)],
+                "由 cephadm 在该设备上创建并启动 OSD；若已 apply osd 自动纳管，可能提示已被管理")
+            add("等待 OSD 上线", ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
+                "新 OSD 应为 running，且 ceph osd tree 中显示 up / in")
+        else:
+            add("预检设备是否未被占用", ["ceph-volume", "lvm", "list", "--format=json"],
+                "确认 %s 不在已用设备列表里" % dev)
+            add("清理新盘旧元数据", ["ceph-volume", "lvm", "zap", dev, "--destroy"],
+                "清掉分区表 / LVM / 文件系统签名；执行前请核对盘位与 SN")
+            add("初始化并创建 OSD", ["ceph-volume", "lvm", "create", "--data", dev],
+                "在该设备上创建 OSD 并自动加入 CRUSH，随后开始回填")
+        add("集群健康验证", ["ceph", "-s", "--format=json"],
+            "新 OSD 上线后数据开始回填，观察 PG 回到 active+clean")
     else:
         raise ValueError("unknown intent: %s" % intent)
     return plan
@@ -1161,6 +1323,12 @@ def plan_strings(plan):
     for name, argv, note in plan:
         out.append(cmd_str(argv) if argv else "# %s：%s" % (name, note or "人工步骤"))
     return out
+
+
+# 这些步骤失败不应中断整个流程（权限不足 / 服务本来就没跑 / 编排器未接管），
+# 失败只记警告，后续步骤继续，最后由状态复核给出真实结论。
+TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "预检设备是否可加入集群",
+                  "预检设备是否未被占用")
 
 
 def execute_plan(cfg, probe, plan, allow_write):
@@ -1182,6 +1350,9 @@ def execute_plan(cfg, probe, plan, allow_write):
         results.append("rc=%d %s" % (rc, text))
         audit("EXEC", name, cmd_str(argv), "OK" if rc == 0 else "FAIL", text)
         if rc != 0:
+            if name in TOLERANT_STEPS:
+                results.append("warning: %s 未成功，继续执行后续步骤" % name)
+                continue
             results.append("stopped after failure: " + name)
             break
     return commands, results, False
@@ -1646,6 +1817,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(result)
         if path == "/api/audit":
             return self._json({"ok": True, "items": read_audit()})
+        if path == "/api/devices":
+            # 「一键换盘」要先选新盘：只返回未被占用、可直接加入集群的设备。
+            return self._json({"ok": True, "devices": read_free_devices(self.cfg, self.probe),
+                               "orchestrator": self.probe.orchestrator})
         if path == "/api/plan":
             return self._json({"ok": True, "caps": self.probe.caps, "version": self.probe.version})
         if path == "/api/progress":
@@ -1666,9 +1841,15 @@ class Handler(BaseHTTPRequestHandler):
         host = str(body.get("host", "") or "")
         dev = str(body.get("dev", "") or "")
         phrase = str(body.get("confirm_phrase", "") or "")
-        oid = validate_target(oid, host, dev)
-        if phrase != "osd.%d" % oid:
-            return self._json({"error": "confirm_phrase mismatch (expected osd.%d)" % oid}, 403)
+        # 新盘初始化没有 OSD id，确认短语是设备路径；其余意图仍是 osd.<id>。
+        if intent == "init":
+            oid = None
+            expected = dev
+        else:
+            oid = validate_target(oid, host, dev)
+            expected = "osd.%d" % oid
+        if phrase != expected:
+            return self._json({"error": "confirm_phrase mismatch (expected %s)" % expected}, 403)
         # A viewer may rehearse the whole flow in DRY-RUN, but may never ask
         # for real execution. Server-side --allow-write is a second gate.
         if not self._authorized():
@@ -1689,17 +1870,31 @@ class Handler(BaseHTTPRequestHandler):
         else:
             plan, pending, pause = full, [], False
         allow = bool(body.get("allow_write")) and self.cfg.allow_write and self._can_write()
+        if intent == "init" and allow:
+            # 安全闸：不允许把已经在用的盘当新盘初始化（zap 是不可逆的）。
+            used = set(osd_used_devices(self.cfg)[0].values())
+            if dev in used:
+                return self._json({"error": "%s 已被现有 OSD 使用，拒绝初始化；请确认新盘设备路径" % dev}, 400)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
+        verify = None
+        if intent == "downout" and not dry:
+            # 命令返回码为 0 不等于 down 真的生效（心跳会把标记改回 up），
+            # 必须回读 ceph osd dump 复核，并把真实结论回给前端。
+            verify = check_downout(self.cfg, oid)
+            if verify["message"]:
+                results.append("verify: " + verify["message"])
         if not dry:
             # 真正下发过命令：丢掉状态缓存，下一次 /api/state 必须重新读取，
             # 否则前端会拿 20 秒内的旧快照把刚改的 up/in 覆盖回去。
             _STATE_CACHE["data"] = None
             _STATE_CACHE["ts"] = 0
-        audit("OSD_%s" % intent.upper(), "osd.%d" % oid, " ; ".join(commands),
+        target = "osd.%d" % oid if oid is not None else dev
+        audit("OSD_%s" % intent.upper(), target, " ; ".join(commands),
               "DRY-RUN" if dry else "EXECUTED",
               "remote=%s ceph=%s stage=%s" % (self._client(), self.probe.version, stage),
               self._client(), self._user())
         return self._json({"ok": True, "commands": commands, "results": results,
+                           "target": target, "verify": verify,
                            "dry_run": dry, "version": self.probe.version,
                            "orchestrator": self.probe.orchestrator,
                            "stage": stage, "pause": pause, "pending_commands": pending,
@@ -1714,7 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
             oid = body.get("osd_id")
             host = str(body.get("host", "") or "")
             dev = str(body.get("dev", "") or "")
-            oid = validate_target(oid, host, dev)
+            # 校验交给 build_plan：init 意图没有 osd_id，只认 host + dev。
             plan = build_plan(self.cfg, self.probe, intent, oid, host, dev)
             return self._json({"ok": True, "steps": plan_detail(plan),
                                "commands": plan_strings(plan),
@@ -1722,15 +1917,19 @@ class Handler(BaseHTTPRequestHandler):
                                "orchestrator": self.probe.orchestrator,
                                "allow_write": self.cfg.allow_write and self._can_write(),
                                "read_only": self.cfg.read_only})
-        if path in ("/api/quick/kick", "/api/quick/replace", "/api/quick/in", "/api/execute"):
+        if path in ("/api/quick/kick", "/api/quick/replace", "/api/quick/in",
+                    "/api/quick/init", "/api/execute"):
             override = None
             if path == "/api/quick/kick":
-                # 踢盘 = down + out，不是退役；退役走 /api/quick/replace 之外的 remove 意图。
+                # 踢盘 = 停服务 + down + out，不是退役。
                 override = "downout"
             elif path == "/api/quick/replace":
                 override = "replace"
             elif path == "/api/quick/in":
                 override = "in"
+            elif path == "/api/quick/init":
+                # 一键换盘 = 插入新盘后一键初始化（清元数据 + 创建 OSD + 等上线）
+                override = "init"
             return self._execute(body, override, str(body.get("stage", "auto")))
         if path.startswith("/api/osd/") and path.endswith(("/out", "/in")):
             parts = path.split("/")
@@ -1745,6 +1944,15 @@ class Handler(BaseHTTPRequestHandler):
                       self._client(), self._user())
                 return self._json({"error": "write operations disabled"}, 403)
             if self.cfg.allow_write and body.get("confirm_phrase") == "osd.%d" % oid:
+                daemon = ""
+                if action == "in":
+                    # 踢盘时停过守护进程：只做 osd in 会恢复权重但状态仍是 down。
+                    d_argv = osd_daemon_cmd(self.probe, "start", oid)
+                    drc, dout, derr = _run_argv(self.cfg, d_argv, 90)
+                    daemon = "rc=%d %s" % (drc, (dout.strip() or derr.strip() or "")[:160])
+                    audit("OSD_DAEMON_START", "osd.%d" % oid, cmd_str(d_argv),
+                          "OK" if drc == 0 else "FAIL", daemon,
+                          self._client(), self._user())
                 rc, out, err = ceph_run(self.cfg, argv[1:], 30)
                 res = "OK" if rc == 0 else "FAIL"
                 if rc == 0:
@@ -1754,7 +1962,8 @@ class Handler(BaseHTTPRequestHandler):
                     _STATE_CACHE["ts"] = 0
                 audit("OSD_%s" % action.upper(), "osd.%d" % oid, cmd_str(argv), res, err[:200],
                       self._client(), self._user())
-                return self._json({"ok": rc == 0, "result": res, "detail": (out or err)[:300]})
+                return self._json({"ok": rc == 0, "result": res, "daemon": daemon,
+                                   "detail": (out or err)[:300]})
             audit("OSD_%s" % action.upper(), "osd.%d" % oid, cmd_str(argv), "DRY-RUN", "not executed",
                   self._client(), self._user())
             return self._json({"ok": True, "dry_run": True, "command": cmd_str(argv)})

@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.0.6-20261110';
+var UI_BUILD='1.0.7-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -61,46 +61,36 @@ var DISTROS=[
  ['其他 / 老旧 SysVinit','Python 3.6+','SysV init','iptables','自动生成 /etc/init.d 脚本']];
 
 /* ---- state ---- */
-var HOSTS=['node-ceph-01','node-ceph-02','node-ceph-03','node-ceph-04','node-ceph-05','node-ceph-06','node-ceph-07','node-ceph-08'];
-var DEVS=['/dev/sdb','/dev/sdc','/dev/sdd','/dev/sde','/dev/sdf','/dev/nvme0n1','/dev/nvme1n1'];
 var T=Date.now();
-function mkOsds(){var a=[];for(var i=0;i<36;i++){var h=HOSTS[i%HOSTS.length],dev=DEVS[Math.floor(i/HOSTS.length)],nv=dev.indexOf('nvme')>=0;
- var size=nv?3.84e12:(i%7===0?8e12:4e12),used=Math.round(size*(0.42+((i*37)%47)/100)),up=true,inn=true,smart='OK';
- if(i===7){up=false;smart='FAIL';}if(i===19){up=false;smart='WARN';}if(i===23){inn=false;}if(i===3||i===16||i===28){used=Math.round(size*(0.87+(i%4)/100));}
- a.push({id:i,host:h,dev:dev,type:nv?'NVMe':(i%7===0?'HDD':'SSD'),size:size,used:used,up:up,inn:inn,pgs:180+((i*53)%260),weight:1,smart:smart,serial:'S3X'+('000000'+i).slice(-6)+((i*7919)%10000)});}return a;}
-function mkAlerts(){return [
- {id:'A-1042',sev:'critical',code:'OSD_DOWN',title:'OSD.7 已下线，PG 处于降级状态',msg:'node-ceph-08 上的 /dev/sdb 无响应，SMART 报告介质错误。该 OSD 承载 312 个 PG，副本集当前为 2/3。',src:'osd.7',osd:7,since:T-42*60000,status:'active',count:3},
- {id:'A-1041',sev:'critical',code:'SMART_FAIL',title:'磁盘 SMART 预失效：osd.7',msg:'Reallocated_Sector_Ct 超过阈值，建议立即安排换盘。',src:'/dev/sdb @ node-ceph-08',osd:7,since:T-45*60000,status:'active',count:1},
- {id:'A-1039',sev:'warning',code:'OSD_NEARFULL',title:'osd.3 使用率 87%，接近 nearfull 阈值',msg:'当前 87.0%，阈值 85%。持续写入可能触发 backfill 停止。',src:'osd.3',osd:3,since:T-3*3600000,status:'active',count:7},
- {id:'A-1038',sev:'warning',code:'OSD_DOWN',title:'OSD.19 心跳超时',msg:'node-ceph-04 报告 osd.19 心跳丢失 13 分钟，等待现场确认。',src:'osd.19',osd:19,since:T-13*60000,status:'acked',count:1},
- {id:'A-1036',sev:'warning',code:'PG_DEGRADED',title:'12 个 PG 处于 degraded 状态',msg:'pg 3.4f / 3.1a2 等处于 active+undersized+degraded，与 osd.7 下线相关。',src:'pg',osd:null,since:T-40*60000,status:'active',count:12},
- {id:'A-1032',sev:'warning',code:'SLOW_OPS',title:'检测到 4 个慢请求',msg:'osd.28 提交延迟 1.8s，超过 1s 告警阈值。',src:'osd.28',osd:28,since:T-2*3600000,status:'silenced',count:4},
- {id:'A-1028',sev:'info',code:'POOL_NEARFULL',title:'存储池 cephfs_data 使用率 71%',msg:'已用 312 TiB / 440 TiB，建议评估扩容计划。',src:'cephfs_data',osd:null,since:T-8*3600000,status:'active',count:1},
- {id:'A-1021',sev:'info',code:'MON_CLOCK_SKEW',title:'MON 时钟偏移已恢复',msg:'node-ceph-02 与 mon leader 偏移 0.08s，已自动恢复。',src:'mon.b',osd:null,since:T-26*3600000,status:'resolved',count:1}];}
 var state={
- view:'overview',theme:'dark',mode:'demo',apiBase:'',token:'',autoRefresh:true,lastRefresh:T,
- cluster:{name:'prod-ceph-01',fsid:'c8f3a1d2-4b67-11ee-a2c1-005056b8e3f0',version:'18.2.4',codename:'Reef',total:1.18e15,used:7.82e14,health:'HEALTH_WARN',mons:3,monInQuorum:3,osds:96,osdsUp:94,osdsIn:95,pools:6,pgs:4096,iops:18420,throughput:2.64e9,deploy:'cephadm'},
- osds:mkOsds(),alerts:mkAlerts(),
- pools:[{name:'rbd',type:'replicated',size:3,minSize:2,pgs:1024,used:4.12e14,pct:66,app:'rbd'},{name:'cephfs_data',type:'replicated',size:3,minSize:2,pgs:1024,used:3.12e14,pct:71,app:'cephfs'},{name:'cephfs_metadata',type:'replicated',size:3,minSize:2,pgs:128,used:1.8e12,pct:1,app:'cephfs'},{name:'backup',type:'erasure',size:'4+2',minSize:5,pgs:512,used:5.4e13,pct:15,app:'rgw'},{name:'.rgw.root',type:'replicated',size:3,minSize:2,pgs:32,used:2.1e9,pct:1,app:'rgw'},{name:'k8s-csi',type:'replicated',size:3,minSize:2,pgs:256,used:9.6e13,pct:18,app:'csi'}],
- hosts:HOSTS.map(function(h,i){return {name:h,ip:'192.168.27.'+(141+i),mons:i<3,osds:12,up:i===7?11:12,mem:62+((i*13)%28),cpu:18+((i*7)%45),ver:'18.2.4'};}),
- audit:[{id:uid(),ts:T-5*3600000,user:'admin@ops',act:'ALERT_ACK',target:'A-1038',cmd:'-',result:'OK',note:'确认 osd.19 心跳超时告警'},
-  {id:uid(),ts:T-9*3600000,user:'admin@ops',act:'OSD_OUT',target:'osd.23',cmd:'ceph orch osd rm 23',result:'DRY-RUN',note:'演示模式，未下发真实命令'},
-  {id:uid(),ts:T-27*3600000,user:'svc-deploy',act:'CONFIG',target:'alert rule',cmd:'-',result:'OK',note:'nearfull 阈值由 90% 调整为 85%'}],
- metrics:{cap:Array.from({length:24},function(_,i){return 62+i*0.42+Math.sin(i/2.4)*1.4;}),iops:Array.from({length:24},function(_,i){return 11+Math.sin(i/1.7)*4+((i*13)%7);})},
- /* LIVE 模式下由 /api/state 的每次同步真实累积，不使用演示曲线 */
+ view:'overview',theme:'dark',mode:'live',apiBase:'',token:'',autoRefresh:true,lastRefresh:T,
+ /* 没有任何内置集群数据：所有数值都来自后端 /api/state，未同步前显示诊断页。 */
+ cluster:{name:'',fsid:'',version:'',codename:'',total:0,used:0,health:'UNKNOWN',mons:0,monInQuorum:0,
+  osds:0,osdsUp:0,osdsIn:0,pools:0,pgs:0,iops:0,throughput:0,deploy:'',
+  monList:[],monLeader:'',mgrActive:'',mgrStandbys:[],mgrAvailable:false,
+  pgActiveClean:null,pgDegraded:null,pgBackfill:null,recoveringBytes:0,objects:0},
+ osds:[],alerts:[],pools:[],hosts:[],audit:[],
  ioReal:{iops:false,thr:false},samples:{iops:[],cap:[]},lastStateTs:0,
+ /* 真实 24h 历史：来自后端 /api/history（后端每分钟采样并落盘）。 */
+ history:{points:[],at:0,span:0,interval:60,loaded:false,err:'',unsupported:false},
  filters:{alertSev:'all',alertStatus:'all',alertQ:'',osdStatus:'all',osdQ:''},
  settings:{nearfull:85,full:95,downMin:10,pgDegraded:1,slowOps:1000,webhook:'',notifyWebhook:true,notifyMail:false,notifyWecom:false,notifyDing:false,deployMode:'auto',forceVersion:'auto',allowWrite:false,confirm:true},
- deploy:{host:'192.168.27.134',user:'root',port:'8780',dir:'/opt/ceph-console',keytype:'full',restUrl:''},
+ deploy:{host:'',user:'root',port:'8780',dir:'/opt/ceph-console',keytype:'full',restUrl:''},
  profile:null,wizard:null,modal:null,
+ /* 登录态：未登录时不渲染任何集群数值（由 app-live.js 的 render 包装处理）。 */
+ auth:{required:true,authenticated:false,user:'',role:'viewer',allowWrite:false,
+  readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false},
  link:{apiBase:'',stateOk:false,stateError:'',stateHttp:0,stateAt:0,diag:null,diagBusy:false,diagError:''}};
 
 /* ---- shared helpers (must exist before the first render) ---- */
 function backendBase(){return state.apiBase||(state.link&&state.link.apiBase)||'';}
 function faultOsd(){
+ /* 只有真的故障（SMART FAIL / down）才算「待处置」。以前没有故障盘时
+    fallback 到 state.osds[0]，会把健康的 osd.0 当成故障盘弹处置横幅。 */
  var bad=state.osds.filter(function(o){return o.smart==='FAIL'||!o.up;});
- if(bad.length){bad.sort(function(a,b){return (b.smart==='FAIL'?1:0)-(a.smart==='FAIL'?1:0);});return bad[0];}
- return state.osds[0]||null;}
+ if(!bad.length)return null;
+ bad.sort(function(a,b){return (b.smart==='FAIL'?1:0)-(a.smart==='FAIL'?1:0);});
+ return bad[0];}
 /* First OSD that is marked OUT: the one-click "in" target. */
 function inOsd(){return state.osds.filter(function(o){return !o.inn;})[0]||null;}
 
@@ -117,9 +107,25 @@ function seriesOf(arr){return arr.map(function(p){return p.v;});}
 function sampleSpan(arr){
  if(arr.length<2)return '0 秒';
  var s=Math.max(0,Math.round((arr[arr.length-1].t-arr[0].t)/1000));
- return s>=120?Math.round(s/60)+' 分钟':(s>=60?(s/60).toFixed(1)+' 分钟':s+' 秒');
+ return spanText(s);
 }
-function resetSamples(){state.samples={iops:[],cap:[]};state.ioReal={iops:false,thr:false};state.lastStateTs=0;}
+/* Human readable duration used for trend axes ("4 分钟" / "3.5 小时"). */
+function spanText(sec){
+ sec=Math.max(0,Math.round(sec||0));
+ if(sec>=3600){var h=sec/3600;return (h>=10?Math.round(h):Math.round(h*10)/10)+' 小时';}
+ if(sec>=60)return Math.round(sec/60)+' 分钟';
+ return sec+' 秒';
+}
+/* Axis ticks are derived from the REAL sample span, never from a fixed -24h. */
+function axisFromSpan(sec){
+ if(!(sec>0))return '<span>现在</span>';
+ var out=[];
+ [0,0.25,0.5,0.75,1].forEach(function(f){
+  out.push(f===1?'<span>现在</span>':'<span>'+spanText(sec*(1-f))+'前</span>');});
+ return out.join('');
+}
+function resetSamples(){state.samples={iops:[],cap:[]};state.ioReal={iops:false,thr:false};state.lastStateTs=0;
+ state.history={points:[],at:0,span:0,interval:60,loaded:false,err:'',unsupported:false};}
 function chartEmpty(txt){
  return '<div style="height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;'+
   'border:1px dashed var(--border);border-radius:8px;color:var(--faint);font-size:11px;line-height:1.6;text-align:center;padding:0 14px">'+
@@ -128,11 +134,51 @@ function chartEmpty(txt){
 /* ---- API layer ---- */
 var API={token:function(){return state.token||sessionStorage.getItem('cc_token')||'';},
  call:function(m,p,b){
-  if(state.mode==='demo')return sleep(120).then(function(){return {ok:true,demo:true};});
+
   var h={'Content-Type':'application/json'},tk=API.token();if(tk)h['X-Console-Token']=tk;
   if(b&&b._confirm)h['X-Confirm-Token']=b._confirm;
   return fetch((state.apiBase||'')+p,{method:m,headers:h,body:b?JSON.stringify(b):undefined}).then(function(r){
-   if(!r.ok)return r.json().catch(function(){return {};}).then(function(j){throw new Error(j.error||('HTTP '+r.status));});return r.json();});}};
+   if(!r.ok)return r.json().catch(function(){return {};}).then(function(j){var er=new Error(j.error||('HTTP '+r.status));er.status=r.status;throw er;});return r.json();});}};
+/* 真实 24 小时趋势：后端每分钟采样并落盘（/api/history），不是前端画出来的。
+   节流 45 秒拉一次；后端版本太旧（404）或字段缺失时如实标注，绝不回落到演示曲线。 */
+var __histAt=0;
+function loadHistory(force){
+ if(state.mode!=='live')return Promise.resolve(false);
+ var now=Date.now();
+ if(!force&&state.history.loaded&&now-__histAt<45000)return Promise.resolve(false);
+ __histAt=now;
+ return API.call('GET','/api/history?hours=24').then(function(r){
+  var d=(r&&r.data)||{};
+  var pts=(d.points||[]).filter(function(p){return p&&typeof p.t==='number';});
+  state.history={points:pts,at:now,span:d.span_sec||0,interval:d.interval||60,
+   loaded:true,err:d.error||'',unsupported:false};
+  return true;
+ }).catch(function(e){
+  __histAt=0;
+  var st=(e&&e.status)||0;
+  state.history={points:[],at:now,span:0,interval:60,loaded:true,
+   err:(e&&e.message)||'请求失败',unsupported:(st===404||/HTTP 404/.test((e&&e.message)||''))};
+  return false;
+ });
+}
+/* 变更审计在 LIVE 下必须读后端 jsonl，不能展示内置的 3 条演示记录。 */
+var __auditAt=0;
+function loadAudit(force){
+ if(state.mode!=='live')return Promise.resolve(false);
+ var now=Date.now();
+ if(!force&&__auditAt&&now-__auditAt<30000)return Promise.resolve(false);
+ __auditAt=now;
+ return API.call('GET','/api/audit').then(function(r){
+  var items=(r&&r.items)||[];
+  state.audit=items.map(function(a,i){
+   var ms=a.epoch?a.epoch*1000:(Date.parse(a.ts)||Date.now());
+   return {id:String(a.epoch||ms)+'-'+i,ts:ms,user:a.user||'console',
+    act:a.action||'-',target:a.target||'-',cmd:a.command||'-',
+    result:a.result||'-',note:(a.note||'')+(a.remote?' · '+a.remote:'')};
+  }).reverse();
+  return true;
+ }).catch(function(){__auditAt=0;return false;});
+}
 function liveProfile(){return state.profile||{version:state.cluster.version,codename:state.cluster.codename,major:18,orchestrator:'cephadm',backend:'cli',os:'自动识别',python:'3.6+',init:'systemd',detected:false,caps:{orch:true,purge:true,ok_to_stop:true,safe_to_destroy:true,device_ls:true,mgr_services:true}};}
 
 /* ---- charts ---- */
@@ -167,12 +213,12 @@ function healthInfo(){
 function renderNav(){var h='';NAV.forEach(function(n){if(n.cap){h+='<div class="nav-cap">'+n.cap+'</div>';return;}var b=n.badge?n.badge():0;
  h+='<button class="nav-i '+(state.view===n.v?'on':'')+'" data-act="nav" data-view="'+n.v+'">'+ic(n.i)+'<span>'+n.t+'</span>'+(b?'<span class="nav-badge">'+b+'</span>':'')+'</button>';});
  document.getElementById('nav').innerHTML=h;var c=state.cluster,nd=liveNoData();
- document.getElementById('side-foot').innerHTML='<div class="row"><span>集群</span><b class="mono tm">'+esc(nd?'—':c.name)+'</b></div><div class="row"><span>Ceph</span><b class="mono" style="color:var(--accent2)">'+esc(nd?'—':c.version+' '+c.codename)+'</b></div><div class="row"><span>OSD</span><b class="mono '+(nd?'':(c.osdsUp<c.osds?'tw':'t'))+'">'+(nd?'—':c.osdsUp+' / '+c.osds)+'</b></div><div class="row" style="margin-top:9px"><span><span class="dot '+(nd?'off':(state.mode==='live'?'ok':'off'))+'"></span>'+(nd?'数据未就绪':(state.mode==='live'?'已对接集群':'演示数据'))+'</span><span class="mono">:'+state.deploy.port+'</span></div>';}
+ document.getElementById('side-foot').innerHTML='<div class="row"><span>集群</span><b class="mono tm">'+esc(nd?'—':(c.fsid?String(c.fsid).slice(0,8):'—'))+'</b></div><div class="row"><span>Ceph</span><b class="mono" style="color:var(--accent2)">'+esc(nd?'—':c.version+' '+c.codename)+'</b></div><div class="row"><span>OSD</span><b class="mono '+(nd?'':(c.osdsUp<c.osds?'tw':'t'))+'">'+(nd?'—':c.osdsUp+' / '+c.osds)+'</b></div><div class="row" style="margin-top:9px"><span><span class="dot '+(nd?'off':'ok')+'"></span>'+(nd?'数据未就绪':'已对接集群')+'</span><span class="mono">:'+state.deploy.port+'</span></div>';}
 var TITLES={overview:'集群概览',alerts:'告警中心',osds:'OSD / 磁盘',pools:'存储池',hosts:'主机与 MON',audit:'变更审计',deploy:'部署与对接',settings:'系统设置'};
 function renderTop(){var H=healthInfo(),c=state.cluster,
- liveLabel=(state.link&&state.link.stateOk)?'LIVE · '+esc(c.name):'LIVE · 等待后端数据';
- document.getElementById('topbar').innerHTML='<div class="crumb">'+TITLES[state.view]+'<small>'+(state.mode==='demo'?'DEMO 数据 · 可直接体验全部流程':liveLabel)+'</small></div><div class="sp"></div>'+
-  '<span class="pill '+H.cl+'"><span class="dot '+H.dot+'"></span>'+H.t+'</span><span class="pill '+(state.mode==='live'?'ok':'acc')+'">'+ic(state.mode==='live'?'link':'db',13)+' '+(state.mode==='live'?'LIVE':'DEMO')+'</span>'+
+ liveLabel=(state.link&&state.link.stateOk)?'LIVE · '+esc(c.fsid?('集群 '+String(c.fsid).slice(0,8)):'已连接后端'):'LIVE · 等待后端数据';
+ document.getElementById('topbar').innerHTML='<div class="crumb">'+TITLES[state.view]+'<small>'+liveLabel+'</small></div><div class="sp"></div>'+
+  '<span class="pill '+H.cl+'"><span class="dot '+H.dot+'"></span>'+H.t+'</span><span class="pill ok">'+ic('link',13)+' LIVE</span>'+
   (state.settings.allowWrite?'':'<span class="pill warn">'+ic('shield',13)+' DRY-RUN</span>')+'<span class="tiny mono">'+dt(state.lastRefresh).slice(11)+'</span>'+
   '<button class="ib" data-act="refresh" title="刷新">'+ic('refresh')+'</button><button class="ib" data-act="theme" title="切换主题">'+ic(state.theme==='dark'?'sun':'moon')+'</button>';}
 /* ---- keep unsaved form input across re-renders ----
@@ -242,8 +288,7 @@ function noDataPage(){
   '<button class="btn pri" data-act="diag-retry">'+ic('refresh',14)+' 重新同步</button>'+
   '<button class="btn" data-act="diag-run">'+ic('wrench',14)+' 运行后端自检</button>'+
   (authGone?'<button class="btn" data-act="logout">重新登录</button>':'')+
-  '<button class="btn" data-act="nav" data-view="settings">系统设置</button>'+
-  '<button class="btn gho" data-act="diag-demo">切换到 DEMO 演示</button></div>';
+  '<button class="btn" data-act="nav" data-view="settings">系统设置</button></div>';
  var diagHtml='';
  if(L.diagBusy)diagHtml='<div class="empty" style="padding:18px">'+ic('refresh',26)+'<div>正在运行后端自检…</div></div>';
  else if(L.diagError)diagHtml='<div class="warnbox">'+ic('alert')+'<div>自检请求失败：'+esc(L.diagError)+'</div></div>';
@@ -259,6 +304,7 @@ function noDataPage(){
    '<div class="stat-line"><span>探测错误</span><b class="mono">'+esc(pr.error||'无')+'</b></div>'+
    '<div class="stat-line"><span>写操作</span><b class="mono">'+(d.allow_write?'已启用':'DRY-RUN')+'</b></div>'+
    '<div class="stat-line"><span>后端平台</span><b class="mono">'+esc(d.python||'-')+'</b></div>'+
+   (d.history?'<div class="stat-line"><span>历史采样</span><b class="mono">'+esc(d.history.points||0)+' 点 · '+(d.history.window_hours||24)+'h 窗口'+(d.history.error?' · '+esc(d.history.error):'')+'</b></div>':'')+
    '<div class="stat-line"><span>执行命令</span><b class="mono mini">'+esc(st.command||'-')+'</b></div></div></div>'+
    (st.error?'<div class="warnbox" style="margin-top:12px">'+ic('alert')+'<div><b>ceph 报错原文</b><br><span class="mono">'+esc(st.error)+'</span></div></div>':'')+
    '<div class="note" style="margin-top:12px"><b>自检结论</b> · '+esc(d.hint||'-')+'</div>';
@@ -270,7 +316,7 @@ function noDataPage(){
   '<div class="card"><div class="card-b">'+
   '<div class="warnbox" style="margin-bottom:14px">'+ic('alert')+'<div><b>暂未链接任何存储集群，链接并同步成功后自动恢复。</b></div></div>'+
   rows+btns+'<div class="hr"></div>'+diagHtml+cmdCard+
-  '<div class="note" style="margin-top:12px">只想体验界面和流程可点「切换到 DEMO 演示」——DEMO 会明确标注，且不会向后端下发任何写操作。</div>'+
+
   '</div></div>';
 }
 
@@ -282,42 +328,60 @@ function vOverview(){if(liveNoData())return noDataPage();
   {l:'OSD 状态',i:'disk',v:c.osdsUp+'<small>/ '+c.osds+'</small>',s:'<b class="tw">'+(c.osds-c.osdsUp)+' 个 down</b> · '+(c.osds-c.osdsIn)+' 个 out',bar:pct(c.osdsUp,c.osds),color:'var(--warn)'},
   {l:'活跃告警',i:'bell',v:String(active.length),s:'<b class="td">'+crit+' 严重</b> · '+(active.length-crit)+' 其他'}];
  var kh=K.map(function(k){return '<div class="card kpi"><div class="kpi-l">'+ic(k.i,14)+k.l+'</div><div class="kpi-v">'+k.v+'</div><div class="kpi-s">'+k.s+'</div>'+(k.bar!=null?'<div class="bar"><i style="width:'+k.bar+'%;background:'+k.color+'"></i></div>':'')+'</div>';}).join('');
- var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div><div style="margin-top:8px;color:var(--faint)">原始容量 '+bytes(c.total)+' · 副本 3<br>逻辑可用约 '+bytes((c.total-c.used)/3)+'</div></div></div>');
- var live=state.mode==='live';
- var capS=live?state.samples.cap.slice(-24):state.metrics.cap;
- var ioS=live?state.samples.iops.slice(-24):state.metrics.iops;
- var capV=live?seriesOf(capS):capS;
- var ioV=live?seriesOf(ioS):ioS;
+ /* 副本数来自真实池配置，不再固定写 3；拿不到就不估算逻辑可用容量。 */
+ var poolRep=(function(){var xs=state.pools.map(function(p){return p.size;}).filter(function(v){return typeof v==='number';});
+  return xs.length?Math.max.apply(null,xs):null;})();
+ var repNote=poolRep?('原始容量 '+bytes(c.total)+' · 副本数 '+poolRep+'<br>逻辑可用约 '+bytes(Math.max(0,(c.total-c.used)/poolRep)))
+  :('原始容量 '+bytes(c.total)+' · 副本数未采集，不做逻辑容量估算');
+ var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div><div style="margin-top:8px;color:var(--faint)">'+repNote+'</div></div></div>');
+ var live=true;
+ /* 趋势只有一种数据来源：真实采样。优先后端 /api/history（每分钟落盘，
+    能给出真实时间轴），其次本次会话的本地采样；不足 2 点就显示空态。 */
+ var hp=(state.history&&state.history.points)||[];
+ var useHist=hp.length>=2;
+ var useHistIo=useHist&&state.ioReal.iops;
+ var locCap=state.samples.cap.slice(-24),locIo=state.samples.iops.slice(-24);
+ var capV=useHist?hp.map(function(p){return p.pct;}):seriesOf(locCap);
+ var ioV=useHistIo?hp.map(function(p){return p.iops;}):seriesOf(locIo);
+ var capSec=useHist?(hp[hp.length-1].t-hp[0].t):(locCap.length>=2?Math.round((locCap[locCap.length-1].t-locCap[0].t)/1000):0);
+ var ioSec=useHistIo?capSec:(locIo.length>=2?Math.round((locIo[locIo.length-1].t-locIo[0].t)/1000):0);
  var capCur=capV.length?capV[capV.length-1]:null;
  var capDelta=capV.length>=2?(capV[capV.length-1]-capV[0]):null;
- var capSpan=live?sampleSpan(capS):'24 小时';
- var ioSpan=live?sampleSpan(ioS):'24 小时';
- /* 标题、副标题和坐标轴都必须如实反映数据来源：DEMO 就是 DEMO，
-    LIVE 只有攒到 2 个真实样本才画线，绝不用演示曲线兜底。 */
- var trendSub=live
-  ?(capV.length>=2?'当前 <b class="mono" style="color:var(--accent2)">'+capCur.toFixed(1)+'%</b> · 最近 '+capSpan+' '+(capDelta>=0?'+':'')+capDelta.toFixed(2)+' pt · '+capV.length+' 个真实样本'
-    :'已采集 <b class="mono">'+capV.length+'</b> 个真实样本，至少 2 个点后绘制曲线')
-  :'当前 <b class="mono" style="color:var(--accent2)">'+state.metrics.cap[23].toFixed(1)+'%</b> · 24h 增长 +'+(state.metrics.cap[23]-state.metrics.cap[0]).toFixed(1)+' pt';
- var trendAxis=live?'<span>'+capSpan+'前</span><span>现在</span>':'<span>-24h</span><span>-18h</span><span>-12h</span><span>-6h</span><span>现在</span>';
- var trend=card(live?'容量使用率（本地真实采样）':'近 24 小时容量使用率',
+ var histErr=(state.history&&state.history.unsupported)?'后端未提供 /api/history，请升级后端到 1.0.7+ 后重启服务':'';
+ var waitTxt=histErr||'暂无真实历史数据（后端每 60 秒采样一次，至少 2 个点后绘制）';
+ var srcTag=useHist?'<span class="tag info">后端真实采样 · 60s/点</span>':'<span class="tag info">本地真实采样 · 15s/点</span>';
+ var trendTitle=useHist?'容量使用率（近 '+spanText(capSec)+' 真实历史）':'容量使用率（本地真实采样）';
+ var trendSub=useHist
+  ?'当前 <b class="mono" style="color:var(--accent2)">'+capCur.toFixed(1)+'%</b> · 近 '+spanText(capSec)+' '+(capDelta>=0?'+':'')+capDelta.toFixed(2)+' pt · '+capV.length+' 个后端采样点'
+  :(histErr?esc(histErr):(capV.length?'已采集 <b class="mono">'+capV.length+'</b> 个本地样本 · 最近 '+spanText(capSec)+'，后端历史积累中':'等待后端历史数据'));
+ var trend=card(trendTitle,
   '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">'+trendSub+'</div>'+
-  (capV.length>=2?spark(capV,'var(--accent)',true):chartEmpty('等待真实采样（每 15 秒同步一次，服务端缓存窗口内的重复样本自动跳过）'))+
-  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+trendAxis+'</div>',
-  live?'<span class="tag info">真实采样</span>':'<span class="tag mute">DEMO 模拟曲线</span>');
- var iopsTxt=live?(state.ioReal.iops?c.iops.toLocaleString():'—'):c.iops.toLocaleString();
- var thrTxt=live?(state.ioReal.thr?bytes(c.throughput)+'<small>/s</small>':'—'):bytes(c.throughput)+'<small>/s</small>';
- var ioSub=live
-  ?(ioV.length>=2?'最近 '+ioSpan+' · '+ioV.length+' 个真实样本'
-    :(state.ioReal.iops?'已采集 <b class="mono">'+ioV.length+'</b> 个真实样本，至少 2 个点后绘制曲线'
-      :'后端 /api/state 未返回 IOPS / 吞吐字段，无法绘制真实曲线'))
-  :'DEMO 模拟曲线（非集群真实数据）';
+  (capV.length>=2?spark(capV,'var(--accent)',true):chartEmpty(waitTxt))+
+  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+axisFromSpan(capSec)+'</div>',srcTag);
+ var iopsTxt=state.ioReal.iops?c.iops.toLocaleString():'—';
+ var thrTxt=state.ioReal.thr?bytes(c.throughput)+'<small>/s</small>':'—';
+ var ioSub=useHistIo?'最近 '+spanText(ioSec)+' · '+ioV.length+' 个后端采样点（每 60 秒）'
+  :(state.ioReal.iops?'本地采样 '+(ioV.length>=2?'最近 '+spanText(ioSec):'已采集 '+ioV.length+' 个点')+' · 后端历史积累中'
+    :'后端 /api/state 未返回 IOPS / 吞吐字段，无法绘制真实曲线');
  var io=card('集群 IO 性能',
   '<div class="grid g2" style="gap:10px;margin-bottom:14px"><div><div class="tiny">IOPS</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+iopsTxt+'</div></div><div><div class="tiny">吞吐</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+thrTxt+'</div></div></div>'+
-  (ioV.length>=2?spark(ioV,'var(--info)',true):chartEmpty(state.ioReal.iops?'等待真实采样（每 15 秒同步一次）':'后端未返回 IOPS / 吞吐字段'))+
-  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)"><span>'+(live?ioSpan+'前':'-24h')+'</span><span>现在</span></div>'+
-  '<div class="note" style="margin-top:8px">'+ioSub+'</div>',
-  live?'<span class="tag info">真实采样</span>':'<span class="tag mute">DEMO 模拟曲线</span>');
- var pg=card('PG 与 MON 状态','<div class="stat-line"><span>PG 总数</span><b class="mono">'+c.pgs.toLocaleString()+'</b></div><div class="stat-line"><span>active + clean</span><b class="mono t">4084</b></div><div class="stat-line"><span>undersized / degraded</span><b class="mono tw">12</b></div><div class="stat-line"><span>MON 法定人数</span><b class="mono t">'+c.monInQuorum+' / '+c.mons+'</b></div><div class="stat-line"><span>存储池</span><b class="mono">'+c.pools+'</b></div><div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy)+'</b></div>');
+  (ioV.length>=2?spark(ioV,'var(--info)',true):chartEmpty(waitTxt))+
+  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+axisFromSpan(ioSec)+'</div>'+
+  '<div class="note" style="margin-top:8px">'+ioSub+'</div>',srcTag);
+ /* PG / MON 卡片全部来自后端真实字段；后端没给的（例如 REST 只读通道）
+    显示 “—”，不再用 4084 / 12 / 6 之类的演示常量冒充。 */
+ var pgAC=(typeof c.pgActiveClean==='number')?c.pgActiveClean.toLocaleString():'—';
+ var pgBadN=(typeof c.pgDegraded==='number')?c.pgDegraded:null;
+ var poolN=(typeof c.pools==='number')?c.pools:((state.pools&&state.pools.length)||0);
+ var monQ=(typeof c.monInQuorum==='number')?c.monInQuorum:'—';
+ var monN=(typeof c.mons==='number')?c.mons:'—';
+ var pgTotal=(typeof c.pgs==='number')?c.pgs.toLocaleString():'—';
+ var pg=card('PG 与 MON 状态','<div class="stat-line"><span>PG 总数</span><b class="mono">'+pgTotal+'</b></div>'+
+  '<div class="stat-line"><span>active + clean</span><b class="mono '+(pgAC==='—'?'':'t')+'">'+pgAC+'</b></div>'+
+  '<div class="stat-line"><span>undersized / degraded</span><b class="mono '+(pgBadN?(pgBadN>0?'tw':'t'):'')+'">'+(pgBadN==null?'—':pgBadN)+'</b></div>'+
+  '<div class="stat-line"><span>MON 法定人数</span><b class="mono '+((typeof c.monInQuorum==='number'&&typeof c.mons==='number'&&c.monInQuorum<c.mons)?'tw':'t')+'">'+monQ+' / '+monN+'</b></div>'+
+  '<div class="stat-line"><span>存储池</span><b class="mono">'+poolN+'</b></div>'+
+  '<div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy)+'</b></div>');
  var fq=faultOsd();
  var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>检测到待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'，可从平台直接一键处置。</div></div>'+
   '<div class="btn-row" style="margin-bottom:14px"><button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fq.id+'">'+ic('trash',14)+'一键踢盘</button>'+
@@ -331,6 +395,6 @@ function vOverview(){if(liveNoData())return noDataPage();
     above); kept empty so no stale "placeholder numbers" banner survives. */
  var noData='';
  var p=liveProfile(),recent=card('告警速览 · 点击查看全部',state.alerts.slice(0,5).map(function(a){return alertRow(a,true);}).join(''),'<button class="btn sm" data-act="nav" data-view="alerts">查看全部 '+ic('arrow',12)+'</button>',false);
- var quick=card('快捷运维',quickOps+'<div class="note" style="margin-bottom:12px">磁盘故障处理推荐走「踢盘换盘向导」：自动完成版本适配、预检、二次确认、执行与回填观察。</div><div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="simulate">'+ic('zap',14)+' 模拟一次磁盘故障</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
+ var quick=card('快捷运维',quickOps+'<div class="note" style="margin-bottom:12px">磁盘故障处理推荐走「踢盘换盘向导」：自动完成版本适配、预检、二次确认、执行与回填观察。</div><div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
  return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="replace">'+ic('zap',14)+' 一键换盘</button>')+
   noData+'<div class="grid g4" style="margin-bottom:14px">'+kh+'</div><div class="grid g21" style="margin-bottom:14px">'+trend+donutCard+'</div><div class="grid g2" style="margin-bottom:14px">'+io+pg+'</div><div class="grid g2">'+recent+quick+'</div>';}

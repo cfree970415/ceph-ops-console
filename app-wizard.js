@@ -84,7 +84,7 @@ function syncState(force){
   var d=r.data||{},c=d.cluster||{},err=c.error||d.error||'';
   /* HTTP 200 is not enough: the REST proxy only returns a summary, so a
      payload without capacity / OSD counters must not be treated as usable
-     state, or the demo fixtures (711 TiB / 96 OSD) would stay on screen. */
+     state, otherwise stale/zero numbers would look like a real cluster. */
   if(!err&&typeof c.total!=='number'&&typeof c.osds!=='number'){
    err='后端返回的数据不含集群容量 / OSD 计数'+(c.note?'（'+c.note+'）':'')+'；REST 只读通道仅代理 summary，请改用 CLI 后端';
   }
@@ -93,8 +93,10 @@ function syncState(force){
   if(state.link){state.link.stateOk=!err;state.link.stateError=err?String(err):'';
    state.link.stateHttp=200;state.link.stateAt=Date.now();}
   ['health','version','codename','deploy'].forEach(function(k){if(c[k])state.cluster[k]=c[k];});
-  ['total','used','osds','osdsUp','osdsIn','mons','monInQuorum','pgs','pools'].forEach(function(k){
-   if(typeof c[k]==='number'&&c[k]>0)state.cluster[k]=c[k];});
+  /* 0 也是有效值（空集群 / 单 MON 无 quorum 时），只有真正同步成功才套用，
+     避免 REST 半残数据把演示值清零，也避免 0 被当成「没有数据」而保留演示值。 */
+  ['total','used','osds','osdsUp','osdsIn','mons','monInQuorum','pgs','pgActiveClean','pgDegraded','pgBackfill','recoveringBytes','objects','pools'].forEach(function(k){
+   if(typeof c[k]==='number'&&isFinite(c[k]))state.cluster[k]=c[k];});
   /* IOPS / 吞吐允许为 0（空闲集群），必须逐字段判断并记录后端是否真的给了，
      否则前端会拿演示值 18420 / 2.6 GiB 冒充真实数据。 */
   if(!err&&typeof c.iops==='number'&&isFinite(c.iops)){state.cluster.iops=c.iops;state.ioReal.iops=true;}
@@ -109,21 +111,38 @@ function syncState(force){
    var capPct=(typeof c.total==='number'&&c.total>0&&typeof c.used==='number')?Math.round(c.used/c.total*1000)/10:null;
    if(capPct!=null)pushSample(state.samples.cap,capPct,ts,60);
   }
+  /* MON / MGR / 恢复速率等结构化字段同样只来自后端。 */
+  if(Array.isArray(c.monList))state.cluster.monList=c.monList;
+  if(c.monLeader)state.cluster.monLeader=c.monLeader;
+  if(c.mgrActive)state.cluster.mgrActive=c.mgrActive;
+  if(Array.isArray(c.mgrStandbys))state.cluster.mgrStandbys=c.mgrStandbys;
+  if(typeof c.mgrAvailable==='boolean')state.cluster.mgrAvailable=c.mgrAvailable;
   if(c.fsid)state.cluster.fsid=c.fsid;
+  /* 告警阈值以后端配置为准，避免前端演示默认值 85/95 冒充真实设置。 */
+  if(!err&&d.settings){
+   if(typeof d.settings.nearfull==='number')state.settings.nearfull=d.settings.nearfull;
+   if(typeof d.settings.full==='number')state.settings.full=d.settings.full;
+   if(typeof d.settings.downMin==='number')state.settings.downMin=d.settings.downMin;
+  }
   if(err)console.warn('backend state:',err);
   if(d.profile)state.profile=d.profile;
-  /* An empty array from the backend is a real answer ("no alerts / no OSDs").
-     Only replacing on non-empty arrays used to leave the built-in demo
-     fixtures behind, e.g. a fabricated red "2" badge on 告警中心. */
+  /* An empty array from the backend is a real answer ("no alerts / no OSDs"),
+     so it must replace the local copy instead of being ignored. */
   if(!err&&Array.isArray(d.osds))state.osds=d.osds.map(function(o){
    return {id:o.id,host:o.host||'',dev:o.dev||'',type:o.type||'SSD',size:o.size||0,used:o.used||0,
-    up:o.up!==false,inn:o.inn!==false,pgs:o.pgs||0,weight:o.weight||1,smart:o.smart||'OK',serial:o.serial||''};});
+    up:o.up!==false,inn:o.inn!==false,pgs:o.pgs||0,weight:o.weight||1,smart:o.smart||'',serial:o.serial||''};});
   if(!err&&Array.isArray(d.alerts))state.alerts=d.alerts.map(function(a){
    return {id:a.id||uid(),sev:a.sev||'warning',code:a.code||'HEALTH_CHECK',title:a.title||a.code||'告警',
     msg:a.msg||'',src:a.src||'ceph',osd:a.osd==null?null:a.osd,since:a.since||Date.now(),status:a.status||'active',count:a.count||1};});
   if(!err&&Array.isArray(d.pools))state.pools=d.pools;
-  if(!err&&Array.isArray(d.hosts))state.hosts=d.hosts;
-  state.lastRefresh=Date.now();if(!state.wizard&&!formBusy())render();
+  if(!err&&Array.isArray(d.hosts))state.hosts=d.hosts.map(function(h){
+   return {name:h.name||'',ip:h.ip||'',mons:!!h.mons,mgr:!!h.mgr,osds:h.osds||0,up:h.up||0,
+    mem:(typeof h.mem==='number')?h.mem:null,cpu:(typeof h.cpu==='number')?h.cpu:null,ver:h.ver||''};});
+  state.lastRefresh=Date.now();
+  /* 24h 趋势来自后端真实采样（/api/history），拿到后再重绘，保证曲线与数字一致。 */
+  return Promise.all([loadHistory(false),loadAudit(false)]).then(function(){
+   if(!state.wizard&&!formBusy())render();
+  });
  }).catch(function(e){
   if(state.link){state.link.stateOk=false;state.link.stateError=(e&&e.message)||'请求失败';
    state.link.stateHttp=(e&&e.status)||0;state.link.stateAt=Date.now();}
@@ -224,12 +243,7 @@ function wApplyResult(){var w=state.wizard;if(w.aborted)return;
  state.lastRefresh=Date.now();}
 
 /* ---------- small actions ---------- */
-function addAudit(act,target,cmd,note){state.audit.unshift({id:uid(),ts:Date.now(),user:'admin@ops',act:act,target:target,cmd:cmd,result:state.settings.allowWrite?'OK':'DRY-RUN',note:note||''});}
-function simulateFailure(){var o=state.osds.filter(function(x){return x.up&&x.smart==='OK';})[Math.floor(Math.random()*20)]||state.osds[2];
- o.up=false;o.smart='WARN';state.cluster.osdsUp=Math.max(0,state.cluster.osdsUp-1);state.cluster.health='HEALTH_WARN';
- var id='A-'+Math.floor(1000+Math.random()*9000);
- state.alerts.unshift({id:id,sev:'critical',code:'OSD_DOWN',title:'OSD.'+o.id+' 心跳丢失',msg:'模拟注入：'+o.host+' 上的 '+o.dev+' 无响应，请确认是否为真实故障。',src:'osd.'+o.id,osd:o.id,since:Date.now(),status:'active',count:1});
- addAudit('SIMULATE','osd.'+o.id,'-','演示模式注入模拟故障');render();toast('已注入模拟告警：osd.'+o.id+' 下线','w');}
+function addAudit(act,target,cmd,note){state.audit.unshift({id:uid(),ts:Date.now(),user:state.auth.user||'console',act:act,target:target,cmd:cmd,result:state.settings.allowWrite?'OK':'DRY-RUN',note:note||''});}
 function osdMark(id,inn){
  var o=state.osds.filter(function(x){return x.id===Number(id);})[0];if(!o)return;
  var act=inn?'in':'out',cmd='ceph osd '+act+' '+o.id;
@@ -237,7 +251,7 @@ function osdMark(id,inn){
   /* A live DRY-RUN must not pretend the flag changed on the cluster. */
   if(!dry||state.mode!=='live'){o.inn=inn;if(inn)o.up=true;}
   addAudit(inn?'OSD_IN':'OSD_OUT','osd.'+o.id,cmd,(dry?'DRY-RUN 演示':'真实执行')+(detail?' · '+detail:''));
-  toast('osd.'+o.id+(inn?' IN':' OUT')+(dry?(state.mode==='live'?' 已生成命令（DRY-RUN，未下发集群）':' 演示完成（DRY-RUN）'):' 已下发并执行'),'ok');
+  toast('osd.'+o.id+(inn?' IN':' OUT')+(dry?' 已生成命令（DRY-RUN，未下发集群）':' 已下发并执行'),'ok');
   closeModal();render();
   if(!dry&&state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState();},800);
  }
@@ -249,8 +263,7 @@ function osdMark(id,inn){
  }
  done(true,'');
 }
-function testConn(){if(state.mode==='demo'){toast('当前为 DEMO 模式；切换到 LIVE 并部署后端后可测试连接','w');return;}
- API.call('GET','/api/probe').then(function(r){state.profile=r.profile||r;state.lastRefresh=Date.now();render();syncState(true);toast('连接成功 · '+esc((state.profile.version||'未知')+' / '+(state.profile.orchestrator||'')),'ok');})
+function testConn(){API.call('GET','/api/probe').then(function(r){state.profile=r.profile||r;state.lastRefresh=Date.now();render();syncState(true);toast('连接成功 · '+esc((state.profile.version||'未知')+' / '+(state.profile.orchestrator||'')),'ok');})
  .catch(function(e){toast('连接失败：'+e.message,'e');});}
 function exportAudit(){var lines=state.audit.map(function(a){return JSON.stringify({ts:dt(a.ts),user:a.user,action:a.act,target:a.target,command:a.cmd,result:a.result,note:a.note});}).join('\n');
  var blob=new Blob([lines+'\n'],{type:'application/x-ndjson'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='ceph-console-audit.jsonl';a.click();URL.revokeObjectURL(u);toast('审计日志已导出','ok');}
@@ -271,10 +284,14 @@ function setBind(path,val,el){var ks=path.split('.'),o=state;
  if(path==='wizard.phrase'||path==='wizard.confirmed'){var b=document.querySelector('[data-act="w-exec"]');var w2=state.wizard;if(b&&w2)b.disabled=!(w2.phrase==='osd.'+w2.osdId&&w2.confirmed);}}
 function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data-value'),w=state.wizard;
  switch(act){
-  case 'nav':state.view=el.getAttribute('data-view');closeModal();render();break;
+  case 'nav':
+   state.view=el.getAttribute('data-view');closeModal();
+   /* 审计页每次都拉取真实 jsonl，避免看到内置演示记录。 */
+   if(state.view==='audit'&&state.mode==='live'&&state.auth.authenticated){
+    loadAudit(true).then(function(){render();});return;}
+   render();break;
   case 'theme':state.theme=state.theme==='dark'?'light':'dark';render();break;
   case 'refresh':state.lastRefresh=Date.now();if(state.mode==='live')testConn();else render();toast('已刷新','ok');break;
-  case 'simulate':simulateFailure();break;
   case 'modal-close':closeModal();break;
   case 'overlay':case 'w-close':return;
   case 'alert-ack':{var a=state.alerts.filter(function(x){return x.id===id;})[0];if(a){a.status='acked';addAudit('ALERT_ACK',a.id,'-','确认告警');render();toast('告警已确认','ok');}break;}
@@ -288,18 +305,6 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
   case 'copy':{var t=document.getElementById(v||el.getAttribute('data-target'));if(t){var btn=t.querySelector('[data-act="copy"]');var txt=t.textContent;if(btn)txt=txt.replace(btn.textContent,'').replace(/\s+$/,'');copy(txt.trim());}break;}
   case 'filter':{var k=el.getAttribute('data-key');state.filters[k]=v;render();break;}
   case 'toggle':{var k2=el.getAttribute('data-key'),ks=k2.split('.'),o=state;for(var i=0;i<ks.length-1;i++)o=o[ks[i]];o[ks[ks.length-1]]=!o[ks[ks.length-1]];render();break;}
-  case 'mode':
-   if(v==='live'){enterLive();}
-   else if(v==='demo'){
-    /* DEMO is an explicit choice; remember it across refreshes. Keep the
-       session id in sessionStorage so enterLive() can resume it silently
-       when the user switches back to LIVE. */
-    try{sessionStorage.setItem('cc_demo','1');}catch(e){}
-    resetSamples();
-    state.mode='demo';state.auth=authReset();state.auth.required=false;
-    state.settings.allowWrite=false;if(state.link)state.link.stateOk=false;
-    render();renderAuth();toast('已切换到离线演示','w');}
-   break;
   case 'wizard':startWizard(id,el.getAttribute('data-intent')||'replace');break;
   case 'w-intent':if(w){w.intent=v;renderWizard();}break;
   case 'w-next':if(!w)break;
@@ -330,7 +335,5 @@ function boot(){
  if(typeof liveBoot==='function'){liveBoot();return;}
  render();
  if(state.mode==='live')syncState();
- setInterval(function(){if(!state.autoRefresh)return;
-  if(state.mode==='demo'){state.lastRefresh=Date.now();state.metrics.cap=state.metrics.cap.slice(1).concat([state.metrics.cap[23]+0.06]);state.cluster.iops=Math.round(17000+Math.random()*3500);
-   if(!state.wizard&&!formBusy())render();}else{syncState();}},15000);}
+ setInterval(function(){if(!state.autoRefresh)return;syncState();},15000);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();

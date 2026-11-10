@@ -32,6 +32,7 @@ CEPH_NAME="client.ceph-console"
 CEPH_KEYRING="/etc/ceph/ceph.client.ceph-console.keyring"
 CONF_DIR="/etc/ceph-console"
 LOG_DIR="/var/log/ceph-console"
+DATA_DIR="/var/lib/ceph-console"
 SERVICE_NAME="ceph-console"
 FILES="ceph-console.py ceph-dashboard.html app-core.js app-views.js app-wizard.js app-live.js"
 FRONTEND_FILES="ceph-dashboard.html app-core.js app-views.js app-wizard.js app-live.js"
@@ -220,7 +221,7 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
   fi
   rm -rf "$DIR"
   if [ "$DO_PURGE" -eq 1 ]; then
-    rm -rf "$CONF_DIR" "$LOG_DIR" "$CEPH_KEYRING"
+    rm -rf "$CONF_DIR" "$LOG_DIR" "$DATA_DIR" "$CEPH_KEYRING"
     ok "config / keyring / logs removed"
   else
     warn "kept $CONF_DIR (use --purge to remove)"
@@ -345,7 +346,7 @@ if [ "$MODE" = "frontend" ]; then
   exit 0
 fi
 
-mkdir -p "$DIR" "$CONF_DIR" "$LOG_DIR"
+mkdir -p "$DIR" "$CONF_DIR" "$LOG_DIR" "$DATA_DIR"
 for f in $FILES; do install -m 0644 "$SCRIPT_DIR/$f" "$DIR/$f"; done
 chmod 0755 "$DIR/ceph-console.py"
 ok "files installed to $DIR"

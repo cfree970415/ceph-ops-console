@@ -24,6 +24,7 @@ import socketserver
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import hmac
 import hashlib
@@ -40,10 +41,17 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
+# Real capacity / IO history. Sampled once a minute by the backend itself, so
+# the 24h trend keeps filling even while nobody has the page open. Persisted as
+# jsonl next to the runtime data, trimmed to a 24h sliding window.
+HISTORY_PATH = "/var/lib/ceph-console/history.jsonl"
+HISTORY_WINDOW = 24 * 3600
+HISTORY_STEP = 60
+HISTORY_MAX_POINTS = 24 * 60 + 60
 SESSION_TTL = 8 * 3600
 LOGIN_WINDOW = 300
 LOGIN_MAX_FAIL = 5
@@ -76,6 +84,7 @@ class Config(object):
         self.ceph_keyring = args.ceph_keyring or ""
         self.dir = args.dir or HERE
         self.users_file = getattr(args, "users_file", "") or os.environ.get("CEPH_CONSOLE_USERS", "") or USERS_PATH
+        self.history_file = getattr(args, "history_file", "") or os.environ.get("CEPH_CONSOLE_HISTORY", "") or HISTORY_PATH
         self.auth_required = not bool(getattr(args, "no_auth", False) or
                                       os.environ.get("CEPH_CONSOLE_NO_AUTH") == "1")
         self.session_ttl = int(getattr(args, "session_ttl", 0) or SESSION_TTL)
@@ -412,15 +421,54 @@ def read_cluster(cfg, probe):
     osds = _g(osdmap, "num_osds") or _g(osdmap, "osdmap", "num_osds") or 0
     up = _g(osdmap, "num_up_osds") or _g(osdmap, "osdmap", "num_up_osds") or 0
     inn = _g(osdmap, "num_in_osds") or _g(osdmap, "osdmap", "num_in_osds") or 0
+    pgs = _g(pgmap, "num_pgs") or 0
+    states = _g(pgmap, "pgs_by_state") or []
+    pg_active_clean = pg_bad = pg_backfill = None
+    if isinstance(states, list) and states:
+        pg_active_clean = pg_bad = pg_backfill = 0
+        for st in states:
+            name = (st.get("state_name") or st.get("name") or "")
+            count = int(st.get("count") or 0)
+            if "active" in name and "clean" in name:
+                pg_active_clean += count
+            if any(k in name for k in ("degraded", "undersized", "incomplete",
+                                       "stale", "peering", "inconsistent", "backfill_toofull")):
+                pg_bad += count
+            if any(k in name for k in ("backfill", "recover", "remapped")):
+                pg_backfill += count
+    # MON / MGR detail: real names, ranks and quorum — never "mon.a / b / c".
+    quorum = _g(monmap, "quorum") or []
+    mon_list = []
+    for m in (monmap.get("mons") or []):
+        if not isinstance(m, dict):
+            continue
+        rank = m.get("rank", 0)
+        mon_list.append({"name": m.get("name", ""), "rank": rank,
+                         "addr": m.get("public_addr") or m.get("addr") or "",
+                         "inQuorum": rank in quorum})
+    mon_leader = ""
+    for m in sorted(mon_list, key=lambda x: x["rank"]):
+        if m["inQuorum"]:
+            mon_leader = m["name"]
+            break
+    mgrmap = doc.get("mgrmap") or {}
+    mgr_active = mgrmap.get("active_name") or ""
+    mgr_standbys = [s.get("name", "") for s in (mgrmap.get("standbys") or [])
+                    if isinstance(s, dict)]
     return {"health": health, "fsid": doc.get("fsid", ""),
             "version": probe.version, "codename": probe.codename,
             "osds": osds, "osdsUp": up, "osdsIn": inn,
             "mons": _g(monmap, "num_mons") or len(monmap.get("mons", []) or []),
-            "monInQuorum": len(_g(monmap, "quorum") or []),
-            "pgs": _g(pgmap, "num_pgs") or 0,
+            "monInQuorum": len(quorum), "monList": mon_list, "monLeader": mon_leader,
+            "mgrActive": mgr_active, "mgrStandbys": mgr_standbys,
+            "mgrAvailable": bool(mgrmap.get("available", False)),
+            "pgs": pgs, "pgActiveClean": pg_active_clean, "pgDegraded": pg_bad,
+            "pgBackfill": pg_backfill,
+            "recoveringBytes": _g(pgmap, "recovering_bytes_per_sec") or 0,
             "used": raw_used, "total": raw_total,
             "iops": (_g(pgmap, "read_op_per_sec") or 0) + (_g(pgmap, "write_op_per_sec") or 0),
             "throughput": (_g(pgmap, "read_bytes_sec") or 0) + (_g(pgmap, "write_bytes_sec") or 0),
+            "objects": _g(pgmap, "num_objects") or 0,
             "deploy": probe.orchestrator}
 
 
@@ -487,13 +535,14 @@ def read_osds(cfg):
         util = n.get("utilization", 0) or 0
         dm = dev_by_id.get(oid, ("", ""))
         cls = str(n.get("device_class") or n.get("type") or "SSD").upper()
+        # SMART 需要 cephadm / node_exporter 侧的真实指标，这里不伪造 "OK"。
         out.append({"id": oid, "host": host_by_id.get(oid, "") or dm[1],
                     "dev": dm[0] or (n.get("device", "") or ""),
                     "type": cls[:8],
                     "size": int(kb * 1024), "used": int(used * 1024),
                     "up": bool(n.get("up", 1)), "inn": bool(n.get("in", 1)),
                     "pgs": n.get("pgs", 0) or 0, "weight": n.get("crush_weight", 1) or 1,
-                    "smart": "OK", "serial": "", "utilization": util})
+                    "smart": "", "serial": "", "utilization": util})
     return out
 
 
@@ -528,6 +577,14 @@ def read_pools(cfg):
     pools = []
     if isinstance(doc, dict):
         pools = doc.get("pools", []) or []
+    # size / min_size / 类型必须来自真实池配置，不能一律填 3 / 2。
+    detail, _ = ceph_json(cfg, ["osd", "pool", "ls", "detail"])
+    meta = {}
+    if isinstance(detail, list):
+        for d in detail:
+            if isinstance(d, dict):
+                key = d.get("poolname") or d.get("pool_name") or ""
+                meta[key] = d
     out = []
     for p in pools:
         if not isinstance(p, dict):
@@ -536,29 +593,53 @@ def read_pools(cfg):
         used = stats.get("bytes_used", 0) or 0
         avail = stats.get("max_avail", 0) or 0
         total = used + avail
-        out.append({"name": p.get("name", ""), "type": "replicated",
-                    "size": 3, "minSize": 2, "pgs": p.get("pg_num", 0) or 0,
+        name = p.get("name", "")
+        d = meta.get(name, {}) or {}
+        ptype = d.get("type")
+        if ptype == 3:
+            type_name = "erasure"
+        elif ptype == 1:
+            type_name = "replicated"
+        elif d:
+            type_name = "erasure" if d.get("erasure_code_profile") else "replicated"
+        else:
+            type_name = ""
+        out.append({"name": name, "type": type_name,
+                    "size": d.get("size"), "minSize": d.get("min_size"),
+                    "pgs": p.get("pg_num", 0) or 0,
                     "used": used, "pct": int(used * 100 / total) if total else 0,
                     "app": p.get("application", "") or ""})
     return out
 
 
-def read_hosts(cfg):
+def read_hosts(cfg, cluster=None):
     if cfg.backend == "rest":
         return []
     doc, _ = ceph_json(cfg, ["osd", "tree"])
     if doc is None:
         return []
+    # cephadm 环境能拿到真实管理地址；非 cephadm 保持空，前端显示 “—”。
+    addr_by_host = {}
+    orch, _ = ceph_json(cfg, ["orch", "host", "ls"])
+    if isinstance(orch, list):
+        for h in orch:
+            if isinstance(h, dict):
+                addr_by_host[h.get("hostname") or h.get("name") or ""] = h.get("addr") or ""
+    cl = cluster or {}
+    mon_names = set(m.get("name") for m in (cl.get("monList") or []) if m.get("inQuorum"))
+    mgr_name = cl.get("mgrActive") or ""
     out = []
     def walk(nodes):
         for n in nodes or []:
             if not isinstance(n, dict):
                 continue
             if n.get("type") == "host":
-                out.append({"name": n.get("name", ""), "ip": "", "mons": False,
-                            "osds": len(n.get("children", []) or []),
-                            "up": len(n.get("children", []) or []),
-                            "mem": 0, "cpu": 0, "ver": ""})
+                name = n.get("name", "")
+                kids = n.get("children", []) or []
+                out.append({"name": name, "ip": addr_by_host.get(name, ""),
+                            "mons": name in mon_names, "mgr": name == mgr_name,
+                            "osds": len(kids), "up": len(kids),
+                            "mem": None, "cpu": None, "ver": ""})
             walk(n.get("children", []))
     walk(doc.get("nodes", []) if isinstance(doc, dict) else doc)
     return out
@@ -606,9 +687,153 @@ def rest_state(cfg):
 
 
 def read_state(cfg, probe, settings):
-    return {"cluster": read_cluster(cfg, probe), "osds": read_osds(cfg),
-            "alerts": read_alerts(cfg, settings), "pools": read_pools(cfg),
-            "hosts": read_hosts(cfg), "profile": probe.as_dict()}
+    cluster = read_cluster(cfg, probe)
+    pools = read_pools(cfg)
+    # read_cluster 不带池数量（避免重复调用 ceph），在这里补齐，前端不再
+    # 依赖内置演示值 "6 个池"。
+    if cfg.backend == "cli" and not cluster.get("error") and isinstance(pools, list):
+        cluster["pools"] = len(pools)
+    return {"cluster": cluster, "osds": read_osds(cfg),
+            "alerts": read_alerts(cfg, settings), "pools": pools,
+            "hosts": read_hosts(cfg, cluster), "profile": probe.as_dict(),
+            # 阈值来自后端配置文件，前端不再用自己的演示默认值 85/95。
+            "settings": {"nearfull": settings.get("nearfull"),
+                         "full": settings.get("full"),
+                         "downMin": settings.get("downMin")}}
+
+
+# --------------------------------------------------------------------------
+# capacity / IO history (24h sliding window, real samples only)
+#   One sample per minute, appended by the request path AND by a background
+#   sampler, so the trend is a genuine 24h timeline instead of a drawing.
+#   Written atomically as jsonl so a restart or crash keeps the history.
+# --------------------------------------------------------------------------
+_HIST = {"points": [], "loaded": False, "path": "", "err": "", "last_save": 0}
+
+
+def history_path(cfg):
+    raw = (getattr(cfg, "history_file", "") or os.environ.get("CEPH_CONSOLE_HISTORY", "")
+           or HISTORY_PATH)
+    folder = os.path.dirname(raw) or "."
+    try:
+        if not os.path.isdir(folder):
+            os.makedirs(folder, 0o755)
+        return raw
+    except OSError:
+        # Unprivileged run (or a read-only root): fall back next to the app.
+        return os.path.join(getattr(cfg, "dir", HERE) or HERE, "history.jsonl")
+
+
+def history_load(cfg):
+    if _HIST["loaded"]:
+        return
+    _HIST["loaded"] = True
+    _HIST["path"] = history_path(cfg)
+    now = time.time()
+    points = []
+    try:
+        with open(_HIST["path"], "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                ts = rec.get("t")
+                if not isinstance(ts, (int, float)):
+                    continue
+                points.append({"t": int(ts),
+                               "pct": float(rec.get("pct") or 0),
+                               "iops": int(rec.get("iops") or 0),
+                               "thr": int(rec.get("thr") or 0)})
+    except (IOError, OSError):
+        pass
+    points.sort(key=lambda p: p["t"])
+    trimmed, seen = [], set()
+    for p in points:
+        if p["t"] in seen or p["t"] < now - HISTORY_WINDOW:
+            continue
+        seen.add(p["t"])
+        trimmed.append(p)
+    _HIST["points"] = trimmed[-HISTORY_MAX_POINTS:]
+    _HIST["last_save"] = int(now)
+
+
+def history_save():
+    path = _HIST.get("path") or ""
+    points = _HIST.get("points") or []
+    if not path:
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            for p in points:
+                f.write(json.dumps(p, separators=(",", ":")) + "\n")
+        try:
+            os.chmod(tmp, 0o644)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except (IOError, OSError) as e:
+        _HIST["err"] = str(e)
+
+
+def history_record(cfg, data):
+    """Store one real sample, bucketed per minute. Never invents numbers."""
+    cluster = (data or {}).get("cluster") or {}
+    if cluster.get("error"):
+        return
+    total, used = cluster.get("total"), cluster.get("used")
+    if not isinstance(total, (int, float)) or isinstance(total, bool) or total <= 0:
+        return
+    if not isinstance(used, (int, float)) or isinstance(used, bool) or used < 0:
+        return
+    history_load(cfg)
+    now = int(time.time())
+    bucket = now - (now % HISTORY_STEP)
+    pct_val = round(float(used) / float(total) * 100.0, 2)
+    iops = int(cluster.get("iops") or 0)
+    thr = int(cluster.get("throughput") or 0)
+    points = _HIST["points"]
+    if points and points[-1]["t"] == bucket:
+        points[-1].update({"pct": pct_val, "iops": iops, "thr": thr})
+    else:
+        points.append({"t": bucket, "pct": pct_val, "iops": iops, "thr": thr})
+    cutoff = now - HISTORY_WINDOW
+    if points and points[0]["t"] < cutoff:
+        points = [p for p in points if p["t"] >= cutoff]
+    _HIST["points"] = points[-HISTORY_MAX_POINTS:]
+    history_save()
+
+
+def history_series(cfg, hours=24, limit=180):
+    history_load(cfg)
+    now = int(time.time())
+    cutoff = now - int(hours * 3600)
+    points = [p for p in _HIST["points"] if p["t"] >= cutoff]
+    if len(points) > limit:
+        step = int(len(points) / float(limit)) + 1
+        reduced = []
+        for i in range(0, len(points), step):
+            chunk = points[i:i + step]
+            reduced.append({"t": chunk[-1]["t"],
+                            "pct": round(sum(p["pct"] for p in chunk) / len(chunk), 2),
+                            "iops": int(sum(p["iops"] for p in chunk) / len(chunk)),
+                            "thr": int(sum(p["thr"] for p in chunk) / len(chunk))})
+        points = reduced
+    return points
+
+
+def history_sampler(cfg, probe, settings, interval=HISTORY_STEP):
+    """Background sampler: keeps the 24h timeline continuous."""
+    while True:
+        try:
+            history_record(cfg, read_state(cfg, probe, settings))
+        except Exception:
+            traceback.print_exc()
+        time.sleep(max(15, int(interval)))
 
 
 # --------------------------------------------------------------------------
@@ -809,6 +1034,9 @@ def diag_info(cfg, probe):
             "keyring_exists": kr_exists, "keyring_mode": kr_mode,
             "allow_write": bool(cfg.allow_write), "read_only": bool(cfg.read_only),
             "rest_url": cfg.rest_url or "", "probe": probe.as_dict(),
+            "history": {"file": history_path(cfg), "points": len(_HIST["points"]),
+                        "interval": HISTORY_STEP, "window_hours": HISTORY_WINDOW // 3600,
+                        "error": _HIST["err"]},
             "status": {}, "hint": ""}
     if cfg.backend == "rest":
         info["status"] = {"ok": bool(cfg.rest_url), "rc": 0,
@@ -1160,10 +1388,26 @@ class Handler(BaseHTTPRequestHandler):
             if force or _STATE_CACHE["data"] is None or now - _STATE_CACHE["ts"] > 20:
                 _STATE_CACHE["data"] = read_state(self.cfg, self.probe, self.settings)
                 _STATE_CACHE["ts"] = now
+                # Every fresh read also feeds the real 24h trend.
+                history_record(self.cfg, _STATE_CACHE["data"])
             # ts 是缓存生成时间，不是响应时间：前端据此跳过缓存窗口内的
             # 重复样本，避免趋势图出现假台阶。
             return self._json({"ok": True, "data": _STATE_CACHE["data"],
                                "ts": int(_STATE_CACHE["ts"]), "served_at": int(now)})
+        if path == "/api/history":
+            hours = 24.0
+            for chunk in (self.path.split("?", 1)[1] if "?" in self.path else "").split("&"):
+                if chunk.startswith("hours="):
+                    try:
+                        hours = max(1.0, min(168.0, float(chunk.split("=", 1)[1])))
+                    except ValueError:
+                        pass
+            points = history_series(self.cfg, hours)
+            span = (points[-1]["t"] - points[0]["t"]) if len(points) >= 2 else 0
+            return self._json({"ok": True, "data": {
+                "points": points, "count": len(points), "span_sec": span,
+                "hours": hours, "interval": HISTORY_STEP,
+                "window_sec": HISTORY_WINDOW, "error": _HIST["err"]}})
         if path.startswith("/api/osd/") and path.endswith("/meta"):
             try:
                 oid = int(path.split("/")[3].replace("osd.", ""))
@@ -1335,6 +1579,8 @@ def parse_args(argv):
     p.add_argument("--ceph-name", default="", help="client name, e.g. client.ceph-console")
     p.add_argument("--ceph-keyring", default="", help="path to client keyring")
     p.add_argument("--users-file", default="", help="JSON user store with PBKDF2 hashes")
+    p.add_argument("--history-file", default="",
+                   help="jsonl file for real capacity/IO samples (default %s)" % HISTORY_PATH)
     p.add_argument("--no-auth", action="store_true", help="disable login (NOT recommended)")
     p.add_argument("--session-ttl", default="", help="session lifetime in seconds (default 8h)")
     p.add_argument("--cors-origin", default="",
@@ -1424,7 +1670,14 @@ def main(argv):
     print("  URL       : http://%s:%d/  (sign in with deploy.sh credentials)" % (public, cfg.port))
     print("  Token     : service token stored in the 0600 env file (not logged here)")
     print("  Audit     : %s" % AUDIT_PATH)
+    print("  History   : %s (1 sample / %ds, %dh window)" %
+          (history_path(cfg), HISTORY_STEP, HISTORY_WINDOW // 3600))
     audit("START", "-", "-", "OK", "backend=%s ceph=%s" % (cfg.backend, probe.version))
+    # Continuous real sampling for the 24h capacity / IO trend.
+    sampler = threading.Thread(target=history_sampler,
+                               args=(cfg, probe, settings, HISTORY_STEP))
+    sampler.daemon = True
+    sampler.start()
     try:
         srv = ThreadedHTTPServer((cfg.bind, cfg.port), Handler)
         srv.serve_forever()

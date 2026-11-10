@@ -59,7 +59,7 @@ function renderAuth(){
   '<div class="hr"></div><div class="grid g2" style="gap:8px;font-size:11px;color:var(--faint)">'+
    '<div>'+ic('shield',13)+' 会话 8 小时 · HttpOnly Cookie</div><div>'+ic('network',13)+' 支持前后端分离部署</div>'+
    '<div>'+ic('db',13)+' 不影响 Ceph 原生 Dashboard</div><div>'+ic('terminal',13)+' 默认 DRY-RUN</div></div>'+
-  '<div style="margin-top:14px;text-align:center"><button class="btn gho sm" data-act="auth-demo">不连接后端，进入离线演示</button></div>'+
+
   '<div style="margin-top:10px;text-align:center;font-size:11px;color:var(--faint)">UI 构建 '+esc(UI_BUILD)+'</div>'+
   '</div></div>';
  root.innerHTML=box;
@@ -71,8 +71,8 @@ function authPayload(){
  return {username:u?u.value.trim():'',password:p?p.value:''};}
 function applySession(r){
  /* Logging in as admin (or any real account) always means the live console.
-    The demo shell is only reachable by explicitly choosing DEMO. */
- state.mode='live';try{sessionStorage.removeItem('cc_demo');}catch(e){}
+    There is no offline demo shell any more. */
+ state.mode='live';
  if(state.link){state.link.stateError='';state.link.stateHttp=0;state.link.diag=null;}
  state.auth.authenticated=true;state.auth.user=r.user||'admin';state.auth.role=r.role||'viewer';
  state.auth.allowWrite=!!r.allow_write&&state.auth.role==='admin';
@@ -97,7 +97,7 @@ function doLogin(){
 }
 function doLogout(){
  apiFetch('POST','/api/logout',{}).catch(function(){});
- try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');sessionStorage.removeItem('cc_demo');}catch(e){}
+ try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');}catch(e){}
  state.token='';state.quick=null;state.profile=null;state.isolation=null;
  if(state.link){state.link.stateOk=false;state.link.stateError='';state.link.stateHttp=0;
   state.link.stateAt=0;state.link.diag=null;state.link.diagError='';}
@@ -119,7 +119,6 @@ function changePassword(){
  }).catch(function(e){show(e.message||'修改失败，请稍后重试',true);});
 }
 function enterLive(){
- try{sessionStorage.removeItem('cc_demo');}catch(e){}
  /* Clicking the LIVE button while already live and signed in must be a no-op.
     Resetting state.auth here used to log the user out and re-open the login
     screen (Settings -> run mode -> LIVE 对接集群). */
@@ -135,7 +134,7 @@ function enterLive(){
  render();
  if(!sid){renderAuth();toast('请填写后端地址并登录','w');return;}
  /* Try to resume the saved session before showing the login form, so a
-    DEMO -> LIVE round trip does not force a password re-entry. */
+    A page refresh must not force a password re-entry. */
  apiFetch('GET','/api/session').then(function(r){
   if(r.authenticated){applySession(r);signedIn();}
   else{renderAuth();toast('会话已失效，请重新登录','w');}
@@ -149,50 +148,40 @@ function signedIn(){
   .then(function(){render();toast('已连接后端 · '+esc(state.auth.user||'')+' · '+(state.auth.allowWrite?'EXECUTE':'DRY-RUN'),'ok');});
 }
 
-/* ---------- boot: decide demo / live / cross-server link ---------- */
+/* ---------- boot: same-origin or cross-server backend ---------- */
 function liveBoot(){
  if(window.__CC_LIVE_BOOTED__)return;window.__CC_LIVE_BOOTED__=true;
  var b=window.__CEPH_BOOT__||null,q=new URLSearchParams(location.search),saved='';
  try{saved=localStorage.getItem('cc_api_base')||'';}catch(e){}
- var apiParam=q.get('api'),wantDemo=q.get('demo')==='1';
+ var apiParam=q.get('api');
  state.apiBase=apiParam?apiParam.replace(/\/+$/,''):(b?'':saved);
  state.link.apiBase=state.apiBase;
  state.auth.required=!!(b&&b.authRequired)||!!state.apiBase;
  var sid='';try{sid=sessionStorage.getItem('cc_session')||'';}catch(e){}
- var choseDemo=false;try{choseDemo=sessionStorage.getItem('cc_demo')==='1';}catch(e){}
- var httpPage=/^https?:$/.test(location.protocol||'');
- /* A saved session means the user really signed in: it outranks any remembered
-    DEMO choice, so a logged-in admin can never land on the demo shell again.
-    DEMO only wins via an explicit ?demo=1 URL or when no session exists. */
- state.mode=wantDemo?'demo':(sid?'live':(choseDemo?'demo':((b||state.apiBase||httpPage)?'live':'demo')));
+ /* 只有一种运行模式：连接真实后端。没有后端就没有数据，不存在演示页。 */
+ state.mode='live';
  render();renderAuth();
- if(state.mode==='live'){
-  if(sid)state.auth.session=sid;
-  apiFetch('GET','/api/session').then(function(r){
-   if(r.authenticated){applySession(r);signedIn();}
-   else if(state.token){
-    return apiFetch('POST','/api/login',{token:state.token}).then(function(l){applySession(l);signedIn();});
-   }
-   else renderAuth();
-  }).catch(function(){renderAuth();})
-  .then(function(){try{history.replaceState({},'',location.pathname);}catch(e){}});
- }
+ if(sid)state.auth.session=sid;
+ apiFetch('GET','/api/session').then(function(r){
+  if(r.authenticated){applySession(r);signedIn();}
+  else if(state.token){
+   return apiFetch('POST','/api/login',{token:state.token}).then(function(l){applySession(l);signedIn();});
+  }
+  else renderAuth();
+ }).catch(function(){renderAuth();})
+ .then(function(){try{history.replaceState({},'',location.pathname);}catch(e){}});
  startRefresh();
 }
 function startRefresh(){
  setInterval(function(){
   if(!state.autoRefresh)return;
-  if(state.mode!=='live'){state.lastRefresh=Date.now();
-   state.metrics.cap=state.metrics.cap.slice(1).concat([state.metrics.cap[23]+0.06]);
-   state.cluster.iops=Math.round(17000+Math.random()*3500);
-   if(!state.wizard&&!state.quick&&!formBusy())render();return;}
   if(!state.auth.authenticated)return;
   syncState();
   apiFetch('GET','/api/isolation').then(function(r){state.isolation=r.data||null;}).catch(function(){});
  },15000);
 }
 
-/* ---------- wrap shell render: never show demo data before login ---------- */
+/* ---------- wrap shell render: no cluster data before login ---------- */
 var __baseRender=render;
 render=function(){
  var __content=document.getElementById('content'),__formSnap=snapshotForm(__content);
@@ -206,7 +195,7 @@ render=function(){
   restoreForm(c,__formSnap);return;}
  __baseRender();
  /* A signed-in LIVE console that has no valid /api/state must not fall back
-    to the built-in demo fixtures on any cluster view. */
+    to stale or zeroed numbers on any cluster view. */
  if(state.auth.authenticated&&liveNoData()&&CLUSTER_VIEWS.indexOf(state.view)>=0){
   var box=document.getElementById('content');if(box)box.innerHTML=noDataPage();
  }
@@ -229,8 +218,7 @@ renderTop=function(){
  var n=liveNoData()?0:activeAlerts().filter(function(a){return a.sev==='critical'&&a.status==='active';}).length;
  var h='<button class="ib" data-act="nav" data-view="alerts" title="查看告警页面" style="position:relative">'+ic('bell')+
    (n?'<span class="nav-badge" style="position:absolute;top:-6px;right:-6px">'+n+'</span>':'')+'</button>';
- if(state.mode==='demo')h='<button class="btn sm" data-act="show-login">'+ic('link',13)+' 连接后端</button>'+h;
- else if(state.auth.authenticated)h='<span class="pill '+(state.auth.allowWrite?'ok':'warn')+'">'+ic('shield',13)+' '+
+ if(state.auth.authenticated)h='<span class="pill '+(state.auth.allowWrite?'ok':'warn')+'">'+ic('shield',13)+' '+
    esc(state.auth.user)+' · '+(state.auth.role==='admin'?'管理员':'只读')+(state.auth.allowWrite?'':' · DRY-RUN')+'</span>'+
    '<button class="ib" data-act="nav" data-view="settings" title="系统设置 · 修改密码">'+ic('settings',15)+'</button>'+
    '<button class="ib" data-act="logout" title="退出登录">'+ic('lock')+'</button>'+h;
@@ -376,7 +364,7 @@ function quickApply(){
  state.cluster.health=healthInfo().t;state.lastRefresh=Date.now();
  addAudit(q.kind==='kick'?'OSD_KICK_1CLICK':isIn?'OSD_IN_1CLICK':'OSD_REPLACE_1CLICK','osd.'+q.osdId,
   q.steps.map(function(s){return s.c;}).join(' ; '),
-  (q.dryRun?'DRY-RUN 演示 · ':'一键执行 · ')+(state.mode==='live'?state.auth.user:'本地演示'));
+  (q.dryRun?'DRY-RUN 演练 · ':'一键执行 · ')+(state.auth.user||'console'));
 }
 function quickExec(stage){
  var q=state.quick;if(!q)return;
@@ -456,15 +444,6 @@ function authAction(act,el){
  switch(act){
   case 'auth-tab':state.auth.tab=el.getAttribute('data-value');state.auth.error='';renderAuth();return;
   case 'auth-login':doLogin();return;
-  case 'auth-demo':state.mode='demo';state.auth=authReset();state.auth.required=false;
-   /* DEMO is an explicit choice: remember it so a page refresh does not
-      silently drop the user back into the live login screen. */
-   try{sessionStorage.setItem('cc_demo','1');}catch(e){}
-   /* Keep apiBase: a cross-server frontend must be able to switch back to
-      LIVE without retyping the backend address. */
-   resetSamples();
-   state.settings.allowWrite=false;state.link.stateOk=false;render();renderAuth();
-   toast('已进入离线演示模式，数据不来自集群','w');return;
   default:return;
  }
 }
@@ -472,17 +451,10 @@ var __baseOnAct=onAct;
 onAct=function(act,el){
  if(act.indexOf('auth-')===0)return authAction(act,el);
  if(act.indexOf('q-')===0)return quickAction(act,el);
- if(act==='diag-retry'){syncState(true).then(function(){render();});return;}
+ if(act==='diag-retry'){__histAt=0;syncState(true).then(function(){return loadHistory(true);}).then(function(){render();});return;}
  if(act==='diag-run'){runDiag();return;}
- if(act==='diag-demo'){
-  try{sessionStorage.setItem('cc_demo','1');}catch(e){}
-  resetSamples();
-  state.mode='demo';state.auth=authReset();state.auth.required=false;
-  state.settings.allowWrite=false;if(state.link)state.link.stateOk=false;
-  state.view='overview';render();renderAuth();toast('已切换到离线演示','w');return;}
  if(act==='logout')return doLogout();
  if(act==='change-password')return changePassword();
- if(act==='show-login')return enterLive();
  if(act==='overlay'){
   if(state.quick&&(state.quick.phase==='running'||state.quick.phase==='paused')){
    toast('操作进行中，请先完成或中止','w');return;}

@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.6-20261110';
+var UI_BUILD='1.1.7-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -329,10 +329,14 @@ function vOverview(){if(liveNoData())return noDataPage();
   {l:'OSD 状态',i:'disk',v:c.osdsUp+'<small>/ '+c.osds+'</small>',s:'<b class="tw">'+(c.osds-c.osdsUp)+' 个 down</b> · '+(c.osds-c.osdsIn)+' 个 out',bar:pct(c.osdsUp,c.osds),color:'var(--warn)'},
   {l:'活跃告警',i:'bell',v:String(active.length),s:'<b class="td">'+crit+' 严重</b> · '+(active.length-crit)+' 其他'}];
  var kh=K.map(function(k){return '<div class="card kpi"><div class="kpi-l">'+ic(k.i,14)+k.l+'</div><div class="kpi-v">'+k.v+'</div><div class="kpi-s">'+k.s+'</div>'+(k.bar!=null?'<div class="bar"><i style="width:'+k.bar+'%;background:'+k.color+'"></i></div>':'')+'</div>';}).join('');
- /* 副本数来自真实池配置，不再固定写 3；拿不到就不估算逻辑可用容量。 */
- var poolRep=(function(){var xs=state.pools.map(function(p){return p.size;}).filter(function(v){return typeof v==='number';});
+ /* 副本数来自真实池配置，不再固定写 3；拿不到就不估算逻辑可用容量。
+    EC 池的 size 是 k+m（冗余比），不能和副本数混着取最大值。 */
+ var poolRep=(function(){
+  var rep=state.pools.filter(function(p){return p.type==='replicated';});
+  var src=rep.length?rep:state.pools;
+  var xs=src.map(function(p){return p.size;}).filter(function(v){return typeof v==='number';});
   return xs.length?Math.max.apply(null,xs):null;})();
- var repNote=poolRep?('原始容量 '+bytes(c.total)+' · 副本数 '+poolRep+'<br>逻辑可用约 '+bytes(Math.max(0,(c.total-c.used)/poolRep)))
+ var repNote=poolRep?('原始容量 '+bytes(c.total)+' · 最大副本数 '+poolRep+'<br>逻辑可用约 '+bytes(Math.max(0,(c.total-c.used)/poolRep)))
   :('原始容量 '+bytes(c.total)+' · 副本数未采集，不做逻辑容量估算');
  var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div><div style="margin-top:8px;color:var(--faint)">'+repNote+'</div></div></div>');
  var live=true;

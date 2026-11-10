@@ -77,7 +77,8 @@
 | 概览：健康、容量、OSD up/in、告警数 | `ceph status`（`health` / `osdmap` / `pgmap`）+ 告警规则 | 整页显示「集群数据未就绪」诊断页 |
 | 概览：PG 总数、active+clean、degraded、MON 法定人数、池数量 | `pgmap.num_pgs`、`pgmap.pgs_by_state`、`monmap.quorum`（缺失时回落顶层 `quorum` / `quorum_names`，再回落 `ceph quorum_status`）、`ceph osd pool ls detail` | `—` |
 | 概览：容量趋势 / IOPS 趋势 | `/api/history`（后端每 60 秒真实采样，落盘 24h） | 「暂无真实历史数据」 |
-| 存储池：size / min_size / 类型 / 水位 / PG | `ceph df detail` + `ceph osd pool ls detail` | `—` |
+| 存储池：池清单 / 类型 / size / min_size / PG / 应用 | `ceph osd pool ls detail`（`pg_num`、`pgp_num`、`type`、`application_metadata` 都在这里；`ceph df detail` 的池条目**没有** PG 和 application 字段，只能补用量） | `—` / 「未采集」 |
+| 存储池：用量 / 水位 | `ceph df detail` 的 `stats.bytes_used` / `stats.max_avail`（物理口径，含副本冗余；逻辑写入见 `stats.stored`，表格悬停可见） | 「未采集」 |
 | 存储池：回填 PG、恢复速率、增长速率 | `pgmap` 实时 + 24h 采样 | `—` / 「累积中」 |
 | 主机：主机名、地址、MON/MGR 角色、leader | `ceph osd tree` + `ceph orch host ls` + `status.monmap` / `mgrmap` | `—` |
 | OSD 列表的成员（哪些 OSD 会出现） | `ceph osd dump` 的 `osds[]` ∪ `ceph osd df` ∪ `ceph osd tree`，三源并集——新加的 OSD 往往先出现在 dump / tree，最后才进 df | 至少 `ceph osd tree` 能列出即显示 |

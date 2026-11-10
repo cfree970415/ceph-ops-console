@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -951,45 +951,95 @@ def read_alerts(cfg, settings):
     return out
 
 
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pool_type_name(d):
+    ptype = _int_or_none(d.get("type"))
+    if ptype == 3:
+        return "erasure"
+    if ptype == 1:
+        return "replicated"
+    return "erasure" if d.get("erasure_code_profile") else "replicated"
+
+
+def _pool_app(d, fallback=""):
+    """application 只体现在 osd pool ls detail 的 application_metadata 里
+    （{app: {}} 的字典，可能有多个），df detail 不带这个字段。"""
+    apps = d.get("application_metadata")
+    if isinstance(apps, dict) and apps:
+        return "/".join(sorted(str(k) for k in apps.keys()))
+    if isinstance(apps, list) and apps:
+        return "/".join(str(x) for x in apps)
+    return str(d.get("application") or fallback or "")
+
+
 def read_pools(cfg):
+    """池清单以 `osd pool ls detail` 为准，`df detail` 只补用量。
+
+    之前只用 df detail 当主列表，而它**没有 pg_num 字段**，导致 PG 一列恒为 0；
+    application 也不在 df 里。同理，池只要没出现在 df 里就会被整条漏掉。
+    """
     if cfg.backend == "rest":
         return []
-    doc, _ = ceph_json(cfg, ["df", "detail"])
-    pools = []
-    if isinstance(doc, dict):
-        pools = doc.get("pools", []) or []
-    # size / min_size / 类型必须来自真实池配置，不能一律填 3 / 2。
-    detail, _ = ceph_json(cfg, ["osd", "pool", "ls", "detail"])
-    meta = {}
+    df, _ = ceph_json(cfg, ["df", "detail"], 25)
+    detail, _ = ceph_json(cfg, ["osd", "pool", "ls", "detail"], 25)
+    usage = {}
+    if isinstance(df, dict):
+        for p in (df.get("pools") or []):
+            if isinstance(p, dict) and p.get("name"):
+                usage[p["name"]] = p
+    defs = []
     if isinstance(detail, list):
-        for d in detail:
-            if isinstance(d, dict):
-                key = d.get("poolname") or d.get("pool_name") or ""
-                meta[key] = d
+        defs = [d for d in detail if isinstance(d, dict)]
+    defs.sort(key=lambda d: _int_or_none(d.get("pool")) or 0)
     out = []
-    for p in pools:
-        if not isinstance(p, dict):
+    for d in defs:
+        name = d.get("poolname") or d.get("pool_name") or ""
+        if not name:
             continue
-        stats = p.get("stats", {}) or {}
-        used = stats.get("bytes_used", 0) or 0
-        avail = stats.get("max_avail", 0) or 0
-        total = used + avail
-        name = p.get("name", "")
-        d = meta.get(name, {}) or {}
-        ptype = d.get("type")
-        if ptype == 3:
-            type_name = "erasure"
-        elif ptype == 1:
-            type_name = "replicated"
-        elif d:
-            type_name = "erasure" if d.get("erasure_code_profile") else "replicated"
-        else:
-            type_name = ""
-        out.append({"name": name, "type": type_name,
-                    "size": d.get("size"), "minSize": d.get("min_size"),
-                    "pgs": p.get("pg_num", 0) or 0,
-                    "used": used, "pct": int(used * 100 / total) if total else 0,
-                    "app": p.get("application", "") or ""})
+        u = usage.get(name) or {}
+        stats = u.get("stats") or {}
+        used = _int_or_none(stats.get("bytes_used")) if stats.get("bytes_used") is not None else None
+        stored = _int_or_none(stats.get("stored")) if stats.get("stored") is not None else None
+        avail = _int_or_none(stats.get("max_avail")) if stats.get("max_avail") is not None else None
+        pct = None
+        if used is not None and avail is not None and (used + avail) > 0:
+            pct = round(used * 100.0 / (used + avail), 4)
+        pg = _int_or_none(d.get("pg_num"))
+        if pg is None:
+            pg = _int_or_none(d.get("pg_placement_num"))
+        if pg is None:
+            pg = _int_or_none(u.get("pg_num"))
+        pgp = _int_or_none(d.get("pgp_num"))
+        if pgp is None:
+            pgp = _int_or_none(d.get("pg_placement_num"))
+        out.append({"name": name, "type": _pool_type_name(d),
+                    "size": _int_or_none(d.get("size")),
+                    "minSize": _int_or_none(d.get("min_size")),
+                    "pgs": pg, "pgp": pgp,
+                    "autoscale": str(d.get("pg_autoscale_mode") or d.get("autoscale_mode") or ""),
+                    "used": used, "stored": stored, "pct": pct,
+                    "app": _pool_app(d)})
+    if out:
+        return out
+    # 读不到 pool 定义时退回 df：池名和用量还能看，PG / 类型只能留空（不填 0 冒充）。
+    for name, u in usage.items():
+        stats = u.get("stats") or {}
+        used = _int_or_none(stats.get("bytes_used"))
+        stored = _int_or_none(stats.get("stored"))
+        avail = _int_or_none(stats.get("max_avail"))
+        pct = None
+        if used is not None and avail is not None and (used + avail) > 0:
+            pct = round(used * 100.0 / (used + avail), 4)
+        out.append({"name": name, "type": "", "size": None, "minSize": None,
+                    "pgs": _int_or_none(u.get("pg_num")), "pgp": None, "autoscale": "",
+                    "used": used, "stored": stored, "pct": pct,
+                    "app": str(u.get("application") or "")})
     return out
 
 

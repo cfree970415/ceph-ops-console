@@ -92,8 +92,14 @@ function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !
    '<div class="hr"></div><div class="note">后端启动时执行 <span class="code-inline">ceph --version</span> 与命令能力探测，不依赖硬编码版本号；低版本自动回退到等价命令序列。详见「部署与对接」页的兼容矩阵。</div>')+'</div>';}
 
 /* ---- pools / hosts / audit ---- */
-function sizeRange(key){
- var xs=state.pools.map(function(p){return p[key];}).filter(function(v){return typeof v==='number';});
+function sizeRange(key,onlyType){
+ /* EC 池的 size 是 k+m，和副本数不是一个量纲，不混在一起统计 */
+ var src=state.pools;
+ if(onlyType){
+  var f=src.filter(function(p){return p.type===onlyType;});
+  if(f.length)src=f;
+ }
+ var xs=src.map(function(p){return p[key];}).filter(function(v){return typeof v==='number';});
  if(!xs.length)return '—';
  var mn=Math.min.apply(null,xs),mx=Math.max.apply(null,xs);
  return mn===mx?String(mn):mn+' ~ '+mx;
@@ -107,25 +113,41 @@ function capTrend(){
  var g=(b.pct-a.pct)/hrs,nf=(typeof state.settings.nearfull==='number')?state.settings.nearfull:85;
  return {g:g,eta:(g>0.001?((nf-b.pct)/g):null),span:hrs,cur:b.pct};
 }
-function vPools(){var rows=state.pools.map(function(p){var pc=p.pct>=80?'var(--danger)':p.pct>=65?'var(--warn)':'var(--ok)';
+function vPools(){var rows=state.pools.map(function(p){
+ var pctN=(typeof p.pct==='number')?p.pct:null;
+ var pc=pctN==null?'var(--muted)':pctN>=80?'var(--danger)':pctN>=65?'var(--warn)':'var(--ok)';
+ var w=pctN==null?0:Math.min(100,Math.max(pctN>0?1:0,pctN));
+ var pctTxt=pctN==null?'—':((pctN>0&&pctN<1?'<1':String(Math.round(pctN)))+'%');
  var cfg=(p.size==null?'—':p.size)+' / '+(p.minSize==null?'—':p.minSize);
  var tp=p.type?(p.type==='erasure'?'erasure':'replicated'):'';
- return '<tr><td class="mono"><b>'+esc(p.name)+'</b></td><td>'+(tp?'<span class="tag '+(tp==='erasure'?'pur':'info')+'">'+tp+'</span>':'<span class="tag mute">—</span>')+'</td><td class="mono">'+cfg+'</td><td class="mono">'+p.pgs+'</td><td class="mono">'+bytes(p.used)+'</td>'+
-  '<td style="min-width:140px"><div class="flex" style="gap:7px"><div class="bar" style="flex:1;margin:0"><i style="width:'+p.pct+'%;background:'+pc+'"></i></div><span class="mono mini" style="width:32px;text-align:right;color:'+pc+'">'+p.pct+'%</span></div></td><td><span class="tag mute">'+esc(p.app||'—')+'</span></td></tr>';}).join('');
+ var pgTip=[(p.pgp!=null&&p.pgp!==p.pgs?'pgp_num='+p.pgp:''),(p.autoscale?'autoscale='+p.autoscale:'')].filter(Boolean).join(' · ');
+ var usedTxt=(p.used==null)?'<span class="tag mute" title="ceph df detail 中没有该池的用量">未采集</span>':bytes(p.used);
+ var usedTip=((p.stored!=null&&p.stored!==p.used)?' title="物理占用（含副本 / EC 冗余）；逻辑写入 '+bytes(p.stored)+'"':'');
+ return '<tr><td class="mono"><b>'+esc(p.name)+'</b></td><td>'+(tp?'<span class="tag '+(tp==='erasure'?'pur':'info')+'">'+tp+'</span>':'<span class="tag mute">—</span>')+'</td><td class="mono">'+cfg+'</td>'+
+  '<td class="mono"'+(pgTip?' title="'+esc(pgTip)+'"':'')+'>'+((p.pgs==null)?'<span class="tag mute" title="ceph osd pool ls detail 未返回 pg_num">未采集</span>':p.pgs)+'</td>'+
+  '<td class="mono"'+usedTip+'>'+usedTxt+'</td>'+
+  '<td style="min-width:140px"><div class="flex" style="gap:7px"><div class="bar" style="flex:1;margin:0"><i style="width:'+w+'%;background:'+pc+'"></i></div><span class="mono mini" style="width:32px;text-align:right;color:'+pc+'">'+pctTxt+'</span></div></td><td><span class="tag mute">'+esc(p.app||'—')+'</span></td></tr>';}).join('');
  if(!rows)rows='<tr><td colspan="7"><div class="empty" style="padding:22px 0">'+ic('db',30)+
    '<div>尚未读取到存储池</div><div class="tiny" style="margin-top:8px">新建一个池，或检查后端 ceph osd pool ls 是否可执行</div>'+
    '<div style="margin-top:12px"><button class="btn pri sm" data-act="pool-open">'+ic('plus',13)+' 创建存储池</button></div></div></td></tr>';
  var ec=state.pools.filter(function(p){return p.type==='erasure';}).length,ct=capTrend();
+ var typed=state.pools.filter(function(p){return p.type==='replicated'||p.type==='erasure';}).length;
+ var repTxt=typed?((typed-ec)+' / '+ec):'—';
  var gTxt=ct.g==null?'累积中（需 ≥3 个采样点）':((ct.g>=0?'+':'')+ct.g.toFixed(3)+' pt/小时');
  var etaTxt=ct.eta==null?'—':(ct.eta>48?Math.round(ct.eta/24)+' 天':Math.round(ct.eta)+' 小时');
  var bf=(typeof state.cluster.pgBackfill==='number')?state.cluster.pgBackfill:'—';
  var rec=(typeof state.cluster.recoveringBytes==='number')?bytes(state.cluster.recoveringBytes)+'/s':'—';
  var deg=(typeof state.cluster.pgDegraded==='number')?state.cluster.pgDegraded:'—';
- return pageH('存储池','副本 / EC 配置、容量水位与 PG 分布',
+ return pageH('存储池','副本 / EC 配置、容量水位与恢复状态',
    '<button class="btn pri" data-act="pool-open">'+ic('plus',14)+' 创建存储池</button>')+
-  card('存储池列表','<div class="tbl-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>size / min_size</th><th>PG</th><th>已用</th><th>水位</th><th>应用</th></tr></thead><tbody>'+rows+'</tbody></table></div>','',false)+
-  '<div class="grid g3" style="margin-top:14px">'+card('副本与冗余','<div class="stat-line"><span>池数量</span><b class="mono">'+state.pools.length+'</b></div><div class="stat-line"><span>副本 / EC 池</span><b class="mono">'+(state.pools.length-ec)+' / '+ec+'</b></div><div class="stat-line"><span>size 范围</span><b class="mono">'+sizeRange('size')+'</b></div><div class="stat-line"><span>min_size 范围</span><b class="mono">'+sizeRange('minSize')+'</b></div>')+
-  card('回填 / 恢复','<div class="stat-line"><span>回填 / 恢复中 PG</span><b class="mono '+(typeof bf==='number'&&bf>0?'tw':'t')+'">'+bf+'</b></div><div class="stat-line"><span>degraded / undersized</span><b class="mono '+(typeof deg==='number'&&deg>0?'tw':'t')+'">'+deg+'</b></div><div class="stat-line"><span>恢复速率</span><b class="mono">'+rec+'</b></div><div class="stat-line"><span>数据来源</span><b class="mono">pgmap 实时</b></div>')+
+  card('存储池列表','<div class="tbl-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>size / min_size</th><th>PG 数</th><th>已用</th><th>水位</th><th>应用</th></tr></thead><tbody>'+rows+'</tbody></table></div>','',false)+
+  '<div class="grid g3" style="margin-top:14px">'+card('副本与冗余','<div class="stat-line"><span>池数量</span><b class="mono">'+state.pools.length+'</b></div><div class="stat-line"><span>副本 / EC 池</span><b class="mono"'+(typed<state.pools.length?' title="'+(state.pools.length-typed)+' 个池的类型未采集"':'')+'>'+repTxt+'</b></div><div class="stat-line"><span>size 范围（副本）</span><b class="mono">'+sizeRange('size','replicated')+'</b></div><div class="stat-line"><span>min_size 范围</span><b class="mono">'+sizeRange('minSize','replicated')+'</b></div>')+
+  card('回填 / 恢复','<div class="stat-line"><span>PG 总数 / active+clean</span><b class="mono">'+((typeof state.cluster.pgs==='number')?state.cluster.pgs:'—')+' / '+((typeof state.cluster.pgActiveClean==='number')?state.cluster.pgActiveClean:'—')+'</b></div>'+
+   '<div class="stat-line"><span>回填 / 恢复中 PG</span><b class="mono '+(typeof bf==='number'&&bf>0?'tw':'t')+'">'+bf+'</b></div>'+
+   '<div class="stat-line"><span>degraded / undersized</span><b class="mono '+((typeof deg==='number'&&deg>0)?'tw':'t')+'"'+
+   ((typeof deg==='number'&&deg>0&&typeof bf==='number'&&bf===0)?' title="这些 PG 异常但不在回填：通常是 OSD 仍 in 只是 down，PG 在等它回来；标 out 后才会真正触发回填"':'')+'>'+deg+'</b></div>'+
+   '<div class="stat-line"><span>恢复速率</span><b class="mono">'+rec+'</b></div>'+
+   '<div class="stat-line"><span>数据来源</span><b class="mono">pgmap 实时</b></div>')+
   card('容量增长（真实采样）','<div class="stat-line"><span>采样跨度</span><b class="mono">'+(ct.span>0?spanText(ct.span*3600):'累积中')+'</b></div><div class="stat-line"><span>增长速率</span><b class="mono">'+gTxt+'</b></div><div class="stat-line"><span>预计达到 nearfull</span><b class="mono tw">'+etaTxt+'</b></div><div class="stat-line"><span>nearfull / full</span><b class="mono">'+state.settings.nearfull+'% / '+state.settings.full+'%</b></div>')+'</div>';}
 function vHosts(){var c=state.cluster;
  var rows=state.hosts.map(function(h){var cpu=(typeof h.cpu==='number')?h.cpu:null,mem=(typeof h.mem==='number')?h.mem:null;

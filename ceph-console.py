@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.9"
+VERSION = "1.1.0"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -492,6 +492,142 @@ def read_cluster(cfg, probe):
             "deploy": probe.orchestrator}
 
 
+def _dev_path(d):
+    """Normalise a device name to /dev/xxx (multi-device strings keep the first)."""
+    d = str(d or "").strip()
+    if not d:
+        return ""
+    d = d.split(",")[0].strip()
+    if not d:
+        return ""
+    return d if d.startswith("/") else "/dev/" + d
+
+
+def osd_device_map(cfg, want=None):
+    """OSD id -> 真实设备 / 主机 / 序列号。
+
+    来源按可靠性排序，前面的补上了就不再被后面的覆盖：
+      1. ceph-volume lvm list   —— 唯一按 osd id 精确对应 LVM 设备的来源
+      2. ceph device ls         —— 13.x+ 的 devicehealth，能顺带给 SN
+      3. ceph osd metadata <id> —— 前两者都缺失时逐个补（限制数量，避免拖慢）
+
+    任何一个来源拿不到就留空，前端显示“未采集”，绝不把同一块盘复制给多个 OSD。
+    """
+    dev_by_id, host_by_id, serial_by_id = {}, {}, {}
+    if cfg.backend == "rest":
+        return dev_by_id, host_by_id, serial_by_id
+    ids = []
+    for i in (want or []):
+        try:
+            ids.append(int(str(i).replace("osd.", "")))
+        except (TypeError, ValueError):
+            continue
+
+    # 1) ceph-volume lvm list：{"0": [{devices:["/dev/nvme0n1"], ...}], ...}
+    argv = ["ceph-volume", "lvm", "list", "--format=json"]
+    if cfg.ceph_conf:
+        argv += ["--conf", cfg.ceph_conf]
+    rc, out, _ = run(argv, timeout=30)
+    if rc == 0 and out.strip():
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+        entries = []
+        if isinstance(data, dict):
+            for k, v in data.items():
+                for e in (v if isinstance(v, list) else [v]):
+                    if isinstance(e, dict):
+                        entries.append((k, e))
+        elif isinstance(data, list):
+            for e in data:
+                if isinstance(e, dict):
+                    entries.append((e.get("osd_id") or e.get("id") or "", e))
+        for key, e in entries:
+            try:
+                oid = int(str(e.get("osd_id") or key).replace("osd.", ""))
+            except (TypeError, ValueError):
+                continue
+            devs = e.get("devices") or []
+            if isinstance(devs, str):
+                devs = [devs]
+            dev = _dev_path(devs[0]) if devs else ""
+            if dev:
+                dev_by_id.setdefault(oid, dev)
+
+    # 2) ceph device ls：location 在版本间可能是 dict 或 list，daemons/osd_ids 都要认。
+    doc, _ = ceph_json(cfg, ["device", "ls"])
+    items = doc if isinstance(doc, list) else (
+        (doc.get("devices") or []) if isinstance(doc, dict) else [])
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            loc = item.get("location")
+            if isinstance(loc, list):
+                loc = loc[0] if loc and isinstance(loc[0], dict) else {}
+            elif not isinstance(loc, dict):
+                loc = {}
+            dev = _dev_path(loc.get("dev") or loc.get("path") or item.get("dev") or "")
+            host = loc.get("host") or item.get("host") or ""
+            sn = item.get("device_id") or item.get("serial") or ""
+            oids = []
+            for daemon in (item.get("daemons") or []):
+                m = re.match(r"osd\.(\d+)", str(daemon))
+                if m:
+                    oids.append(int(m.group(1)))
+            for x in (item.get("osd_ids") or []):
+                try:
+                    oids.append(int(x))
+                except (TypeError, ValueError):
+                    pass
+            for oid in oids:
+                if dev:
+                    dev_by_id.setdefault(oid, dev)
+                if host:
+                    host_by_id.setdefault(oid, host)
+                if sn:
+                    serial_by_id.setdefault(oid, sn)
+
+    # 3) metadata 兜底：只补仍缺设备的 OSD，且总数受控（大量 OSD 时不逐个调用）。
+    todo = [i for i in ids if i not in dev_by_id]
+    if todo and len(ids) <= 64:
+        for oid in todo:
+            meta, _ = ceph_json(cfg, ["osd", "metadata", str(oid)], timeout=8)
+            if not isinstance(meta, dict):
+                continue
+            dev = _dev_path(meta.get("bluestore_bdev") or meta.get("devices") or "")
+            if dev:
+                dev_by_id.setdefault(oid, dev)
+            host = meta.get("hostname") or ""
+            if host:
+                host_by_id.setdefault(oid, host)
+    return dev_by_id, host_by_id, serial_by_id
+
+
+def osd_upin_map(cfg):
+    """OSD id -> (up, in) 的真实状态。
+
+    `ceph osd df` 的 node 里没有 up / in 字段，早前用 `n.get("in", 1)` 取值，
+    于是所有 OSD 恒为 in——点 OUT 后前端刚变，下一次刷新又被“纠正”回 OUT。
+    这里以 `ceph osd dump` 的 osds[].up / osds[].in 为准（一次调用拿全量）。
+    """
+    out = {}
+    if cfg.backend == "rest":
+        return out
+    doc, _ = ceph_json(cfg, ["osd", "dump"], timeout=30)
+    if isinstance(doc, dict):
+        for o in (doc.get("osds") or []):
+            if not isinstance(o, dict):
+                continue
+            try:
+                oid = int(o.get("osd"))
+            except (TypeError, ValueError):
+                continue
+            out[oid] = (bool(o.get("up")), bool(o.get("in")))
+    return out
+
+
 def read_osds(cfg):
     if cfg.backend == "rest":
         return []
@@ -502,7 +638,7 @@ def read_osds(cfg):
     if not isinstance(nodes, list):
         nodes = []
     host_by_id = {}
-    dev_by_id = {}  # oid -> (dev, host)
+    tree_state = {}
 
     # CRUSH tree: map each OSD id to its host (works on every Ceph release).
     tree, _ = ceph_json(cfg, ["osd", "tree"])
@@ -518,28 +654,28 @@ def read_osds(cfg):
             h = node.get("name", "") if node.get("type") == "host" else host
             if node.get("type") == "osd":
                 host_by_id[node["id"]] = h
+                # 兜底状态：status=down 表示进程停了；reweight=0 通常对应 out。
+                rw = node.get("reweight")
+                tree_state[node["id"]] = (
+                    node.get("status") != "down",
+                    (float(rw) if isinstance(rw, (int, float)) else 1.0) > 0)
             for child in node.get("children", []) or []:
                 rec(child, h)
         for node in by_id.values():
             if node.get("type") == "root":
                 rec(node["id"], "")
+    upin = osd_upin_map(cfg)
 
-    # ceph device ls (13.x+): map OSD daemon -> device / serial.
-    devices, _ = ceph_json(cfg, ["device", "ls"])
-    if isinstance(devices, list):
-        for item in devices:
-            if not isinstance(item, dict):
-                continue
-            loc = item.get("location") or []
-            loc = loc[0] if isinstance(loc, list) and loc and isinstance(loc[0], dict) else {}
-            dev = loc.get("dev") or loc.get("path") or ""
-            if dev and not str(dev).startswith("/"):
-                dev = "/dev/" + str(dev)
-            host = loc.get("host", "") or ""
-            for daemon in item.get("daemons", []) or []:
-                m = re.match(r"osd\.(\d+)", str(daemon))
-                if m:
-                    dev_by_id[int(m.group(1))] = (dev, host)
+    # 真实设备 / SN：按 osd id 精确映射，不能拿“第一个设备”套给所有 OSD。
+    ids = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        try:
+            ids.append(int(str(n.get("id", n.get("osd", n.get("name")))).replace("osd.", "")))
+        except (TypeError, ValueError):
+            continue
+    dev_by_id, dev_host_by_id, serial_by_id = osd_device_map(cfg, ids)
 
     out = []
     for n in nodes:
@@ -553,16 +689,20 @@ def read_osds(cfg):
         kb = n.get("kb", 0) or 0
         used = n.get("kb_used", 0) or 0
         util = n.get("utilization", 0) or 0
-        dm = dev_by_id.get(oid, ("", ""))
+        dev = dev_by_id.get(oid) or _dev_path(n.get("device") or "")
+        host = host_by_id.get(oid) or dev_host_by_id.get(oid) or ""
+        up, inn = upin.get(oid) or tree_state.get(oid) or (
+            bool(n.get("up", 1)), bool(n.get("in", 1)))
         cls = str(n.get("device_class") or n.get("type") or "SSD").upper()
         # SMART 需要 cephadm / node_exporter 侧的真实指标，这里不伪造 "OK"。
-        out.append({"id": oid, "host": host_by_id.get(oid, "") or dm[1],
-                    "dev": dm[0] or (n.get("device", "") or ""),
+        out.append({"id": oid, "host": host,
+                    "dev": dev,
                     "type": cls[:8],
                     "size": int(kb * 1024), "used": int(used * 1024),
-                    "up": bool(n.get("up", 1)), "inn": bool(n.get("in", 1)),
+                    "up": up, "inn": inn,
                     "pgs": n.get("pgs", 0) or 0, "weight": n.get("crush_weight", 1) or 1,
-                    "smart": "", "serial": "", "utilization": util})
+                    "smart": "", "serial": serial_by_id.get(oid, ""),
+                    "utilization": util})
     return out
 
 
@@ -1482,6 +1622,11 @@ class Handler(BaseHTTPRequestHandler):
             plan, pending, pause = full, [], False
         allow = bool(body.get("allow_write")) and self.cfg.allow_write and self._can_write()
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
+        if not dry:
+            # 真正下发过命令：丢掉状态缓存，下一次 /api/state 必须重新读取，
+            # 否则前端会拿 20 秒内的旧快照把刚改的 up/in 覆盖回去。
+            _STATE_CACHE["data"] = None
+            _STATE_CACHE["ts"] = 0
         audit("OSD_%s" % intent.upper(), "osd.%d" % oid, " ; ".join(commands),
               "DRY-RUN" if dry else "EXECUTED",
               "remote=%s ceph=%s stage=%s" % (self._client(), self.probe.version, stage),
@@ -1533,6 +1678,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.cfg.allow_write and body.get("confirm_phrase") == "osd.%d" % oid:
                 rc, out, err = ceph_run(self.cfg, argv[1:], 30)
                 res = "OK" if rc == 0 else "FAIL"
+                if rc == 0:
+                    # osd out / in 立即改变 up·in，必须让 /api/state 丢掉旧缓存，
+                    # 否则前端点完按钮几秒后又被旧快照翻回原状态。
+                    _STATE_CACHE["data"] = None
+                    _STATE_CACHE["ts"] = 0
                 audit("OSD_%s" % action.upper(), "osd.%d" % oid, cmd_str(argv), res, err[:200],
                       self._client(), self._user())
                 return self._json({"ok": rc == 0, "result": res, "detail": (out or err)[:300]})

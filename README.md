@@ -42,7 +42,7 @@
 | --- | --- |
 | 集群概览 | HEALTH 状态、OSD 上下线、容量与 PG 状态、活跃告警、待处置故障盘、SVG 趋势图 |
 | 告警中心 | 四级告警分级统计、筛选/确认/静默、告警直达故障 OSD 的一键处置入口 |
-| OSD / 磁盘 | OSD 列表、主机与设备映射、元数据查询、标记 out、一键 IN 盘 |
+| OSD / 磁盘 | OSD 列表（服务器名 + IP + 真实设备映射）、元数据查询、行内 OUT / IN 切换、一键踢盘换盘 |
 | 存储池 / 主机 | 存储池用量、主机与 MON 视图 |
 | 一键踢盘 | 标记 DOWN → 标记 OUT → 等待回填 → 移除 OSD 与认证 → 清理设备 → 健康验证 |
 | 一键换盘 | 标记 DOWN/OUT → 移除 OSD → 清理元数据 → **暂停等待人工换盘** → 原 OSD ID 重建 → 回填观察 |
@@ -78,7 +78,9 @@
 | 存储池：size / min_size / 类型 / 水位 / PG | `ceph df detail` + `ceph osd pool ls detail` | `—` |
 | 存储池：回填 PG、恢复速率、增长速率 | `pgmap` 实时 + 24h 采样 | `—` / 「累积中」 |
 | 主机：主机名、地址、MON/MGR 角色、leader | `ceph osd tree` + `ceph orch host ls` + `status.monmap` / `mgrmap` | `—` |
-| OSD：容量、使用率、up/in、PG 数 | `ceph osd df` + `ceph osd tree` + `ceph device ls` | `—` |
+| OSD：容量、使用率、PG 数 | `ceph osd df` | `—` |
+| OSD：up / in 状态 | `ceph osd dump` 的 `osds[].up` / `osds[].in`（失败时回落 `ceph osd tree` 的 `status` / `reweight`） | `—` |
+| OSD：设备名与序列号 | `ceph-volume lvm list` → `ceph device ls` → `ceph osd metadata`，按 osd id 精确映射（不会把一个设备套给多个 OSD） | `未采集` |
 | OSD：SMART | 需要 cephadm / Prometheus 侧盘健康指标，控制台**不伪造 OK** | `未采集` |
 | 主机：CPU / 内存 | 需要 node_exporter，控制台不采集 | `未采集` |
 | 变更审计 | `/var/log/ceph-console/audit.jsonl` | 空列表 |
@@ -287,7 +289,7 @@ unset PW
 
 适用于磁盘维护、临时下线后恢复，或误执行 OUT 的回滚。已被 `purge` / `osd rm` 的 OSD 无法 IN，只能重新部署。IN 只会清掉「被标记 OUT」类告警，硬件类告警（SMART、心跳丢失）仍保留，不会假装磁盘已经修好。
 
-入口位置：概览页「快捷运维」、OSD 列表每行的操作列、OSD 详情弹窗；只有处于 OUT 状态的 OSD 才会显示「一键 IN 盘」。
+入口位置：概览页「快捷运维」、OSD 列表每行的操作列、OSD 详情弹窗。OSD 列表里按钮是二态的：`in` 时显示 **OUT**，`out` 后同一位置显示同款 **IN** 按钮，点击直接执行 `ceph osd in <id>`，不再经过向导。状态以 `ceph osd dump` 为准，执行成功会立即丢弃后端状态缓存并强制刷新，不会出现点完 OUT 几秒后又跳回 OUT 的情况（DRY-RUN 未真实下发时不会改按钮，只提示命令未执行）。
 
 后端按探测到的 Ceph 版本与编排器自动选择命令模板；人工换盘由 `stage=pre` / `stage=post` 两段执行，**不会假装自动完成物理换盘**。
 
@@ -508,10 +510,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 
 ```bash
 grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.6+ = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.0.9-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.0-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.0.9-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.0-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
@@ -560,7 +562,7 @@ journalctl -u ceph-console -n 50 --no-pager
 ## 常见问题
 
 **Q：登录 admin 后看到的还是旧数据 / 空页面？**
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.0.9-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.0-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但页面空白**：属于[登录后没有真实数据](#登录后没有真实数据)，点「运行后端自检」看 `ceph status` 的真实报错，不是模式问题。
 3. 分离部署时确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
 
@@ -574,7 +576,7 @@ journalctl -u ceph-console -n 50 --no-pager
 先确认服务是否处于 DRY-RUN：按快速开始安装时带了 `--allow-write`，应已开启真实执行；检查 `/api/session` 是否返回 `allow_write: true`、登录角色是否为 admin。若当初去掉了 `--allow-write`，改 `/etc/ceph-console/env` 中的 `CEPH_CONSOLE_ALLOW_WRITE=1` 后 `systemctl restart ceph-console` 即可，无需重装。
 
 **Q：踢完盘后 OSD 一直显示 out，怎么恢复？**
-维护结束后在 OSD 列表或概览页点「一键 IN 盘」，等价于 `ceph osd in <id>`，会恢复 CRUSH 权重并开始回填。注意 IN 只能让 OSD 重新参与数据分布；如果进程本身起不来（`down`），需要先修硬件 / 重启 OSD 服务。
+维护结束后在 OSD 列表点该行的 **IN** 按钮（或概览页的「一键 IN 盘」），等价于 `ceph osd in <id>`，会恢复 CRUSH 权重并开始回填。注意 IN 只能让 OSD 重新参与数据分布；如果进程本身起不来（`down`），需要先修硬件 / 重启 OSD 服务。
 
 **Q：`rest` 后端为什么不能换盘？**
 REST 通道是 mgr dashboard 的只读代理；OSD 写操作需要 `cli` 后端与 ceph CLI。

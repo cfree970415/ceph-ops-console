@@ -39,19 +39,31 @@ function vAlerts(){var f=state.filters;
 
 /* ---- OSD ---- */
 function osdStatus(o){if(!o.up&&!o.inn)return {t:'down / out',c:'err'};if(!o.up)return {t:'down / in',c:'err'};if(!o.inn)return {t:'up / out',c:'warn'};return {t:'up / in',c:'ok'};}
+function hostIp(h){if(!h)return '';var r=(state.hosts||[]).filter(function(x){return x.name===h;})[0];return (r&&r.ip)||'';}
+/* 服务器列：主机名 + IP，保证能定位到具体机器；后端没给就说明未采集。 */
+function hostCell(h){
+ if(!h)return '<span class="tag mute" title="后端未采集主机名">未采集</span>';
+ var ip=hostIp(h);
+ return '<span class="mono">'+esc(h)+'</span>'+(ip?'<div class="tiny mono" style="color:var(--faint)">'+esc(ip)+'</div>':'');
+}
+/* 设备列：只显示后端按 osd id 精确映射到的真实设备，拿不到就显示未采集。 */
+function devCell(d){
+ if(!d)return '<span class="tag mute" title="后端未采集设备名">未采集</span>';
+ return '<span class="mono">'+esc(d)+'</span>';
+}
 function osdRow(o){var s=osdStatus(o),p=pct(o.used,o.size),pc=p>=85?'var(--danger)':p>=75?'var(--warn)':'var(--ok)';
- return '<tr><td class="mono"><b>osd.'+o.id+'</b></td><td>'+esc(o.host)+'</td><td class="mono">'+esc(o.dev)+'</td><td><span class="tag mute">'+o.type+'</span></td><td class="mono">'+bytes(o.size)+'</td>'+
+ return '<tr><td class="mono"><b>osd.'+o.id+'</b></td><td>'+hostCell(o.host)+'</td><td>'+devCell(o.dev)+'</td><td><span class="tag mute">'+o.type+'</span></td><td class="mono">'+bytes(o.size)+'</td>'+
   '<td style="min-width:130px"><div class="flex" style="gap:7px"><div class="bar" style="flex:1;margin:0"><i style="width:'+p+'%;background:'+pc+'"></i></div><span class="mono mini" style="width:32px;text-align:right;color:'+pc+'">'+p+'%</span></div></td>'+
   '<td><span class="tag '+s.c+'"><span class="dot '+(s.c==='err'?'err':s.c==='warn'?'warn':'ok')+'"></span>'+s.t+'</span></td><td class="mono mini">'+o.pgs+'</td>'+
   '<td>'+(o.smart==='OK'?'<span class="tag ok">OK</span>':o.smart==='WARN'?'<span class="tag warn">WARN</span>':o.smart==='FAIL'?'<span class="tag err">FAIL</span>':'<span class="tag mute" title="后端未采集 SMART">未采集</span>')+'</td>'+
  '<td><div class="btn-row" style="flex-wrap:nowrap;gap:5px"><button class="btn sm" data-act="osd-detail" data-id="'+o.id+'">详情</button>'+
- (o.inn?'<button class="btn sm" data-act="osd-out" data-id="'+o.id+'">OUT</button>':'<button class="qbtn" data-act="q-open" data-kind="in" data-id="'+o.id+'">'+ic('refresh',12)+'一键 IN 盘</button>')+
+ (o.inn?'<button class="btn sm" data-act="osd-out" data-id="'+o.id+'">OUT</button>':'<button class="btn sm" data-act="osd-in" data-id="'+o.id+'">IN</button>')+
  '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',12)+'一键踢盘</button>'+
  '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+o.id+'">'+ic('zap',12)+'一键换盘</button></div></td></tr>';}
 function osdTable(){var f=state.filters,list=state.osds.filter(function(o){
   if(f.osdStatus==='down'&&o.up)return false;if(f.osdStatus==='out'&&o.inn)return false;if(f.osdStatus==='nearfull'&&pct(o.used,o.size)<85)return false;
-  if(f.osdStatus==='smart'&&o.smart!=='FAIL'&&o.smart!=='WARN')return false;if(f.osdQ&&(('osd.'+o.id)+o.host+o.dev+o.type+o.serial).toLowerCase().indexOf(f.osdQ.toLowerCase())<0)return false;return true;});
- return '<div class="tbl-wrap"><table><thead><tr><th>OSD</th><th>主机</th><th>设备</th><th>介质</th><th>容量</th><th>使用率</th><th>状态</th><th>PG</th><th>SMART</th><th>操作</th></tr></thead><tbody>'+
+  if(f.osdStatus==='smart'&&o.smart!=='FAIL'&&o.smart!=='WARN')return false;if(f.osdQ&&(('osd.'+o.id)+o.host+o.dev+o.type+o.serial+hostIp(o.host)).toLowerCase().indexOf(f.osdQ.toLowerCase())<0)return false;return true;});
+ return '<div class="tbl-wrap"><table><thead><tr><th>OSD</th><th>服务器</th><th>设备</th><th>介质</th><th>容量</th><th>使用率</th><th>状态</th><th>PG</th><th>SMART</th><th>操作</th></tr></thead><tbody>'+
   (list.length?list.map(osdRow).join(''):'<tr><td colspan="10"><div class="empty">没有匹配的 OSD</div></td></tr>')+'</tbody></table></div>';}
 function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !o.up;}).length,out=state.osds.filter(function(o){return !o.inn;}).length,
  nf=state.osds.filter(function(o){return pct(o.used,o.size)>=85;}).length,sm=state.osds.filter(function(o){return o.smart==='FAIL'||o.smart==='WARN';}).length,p=liveProfile();
@@ -59,7 +71,7 @@ function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !
   '<input class="inp" style="width:250px" placeholder="搜索 OSD / 主机 / 设备 / SN…" value="'+esc(f.osdQ)+'" data-bind="filters.osdQ"><div class="sp"></div><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 踢盘换盘向导</button></div>';
  var fO=faultOsd();
  var quickBar=fO?'<div class="card" style="margin-bottom:14px"><div class="card-b" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'+
-  '<div><div class="tiny">检测到待处置磁盘</div><div style="font-size:14px;font-weight:650" class="mono">osd.'+fO.id+' · '+esc(fO.host)+' · '+esc(fO.dev)+'</div>'+
+  '<div><div class="tiny">检测到待处置磁盘</div><div style="font-size:14px;font-weight:650" class="mono">osd.'+fO.id+' · '+esc(fO.host||'—')+' · '+esc(fO.dev||'—')+'</div>'+
   '<div class="tiny">'+(fO.smart==='FAIL'?'SMART FAIL':fO.smart==='WARN'?'SMART WARN':'磁盘状态异常（'+(fO.up?'up':'down')+' / '+(fO.inn?'in':'out')+'）')+' · SN '+esc(fO.serial||'未采集')+'</div></div><div class="sp"></div>'+
   '<button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fO.id+'">'+ic('trash',14)+'一键踢盘</button>'+
   '<button class="qbtn lg" data-act="q-open" data-kind="replace" data-id="'+fO.id+'">'+ic('zap',14)+'一键换盘</button>'+

@@ -8,8 +8,8 @@ function modalHead(t,sub){return '<div class="modal-h">'+ic('terminal',18)+'<h3>
 /* ---------- detail modals ---------- */
 function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(id);})[0];if(!o)return;
  var p=pct(o.used,o.size),s=osdStatus(o);
- var body='<div class="grid g2"><div><div class="stat-line"><span>OSD ID</span><b class="mono">osd.'+o.id+'</b></div><div class="stat-line"><span>主机</span><b class="mono">'+esc(o.host)+'</b></div>'+
-  '<div class="stat-line"><span>设备</span><b class="mono">'+esc(o.dev)+'</b></div><div class="stat-line"><span>序列号</span><b class="mono">'+esc(o.serial)+'</b></div>'+
+ var body='<div class="grid g2"><div><div class="stat-line"><span>OSD ID</span><b class="mono">osd.'+o.id+'</b></div><div class="stat-line"><span>服务器</span><b class="mono">'+esc(o.host||'未采集')+(hostIp(o.host)?' · '+esc(hostIp(o.host)):'')+'</b></div>'+
+  '<div class="stat-line"><span>设备</span><b class="mono">'+esc(o.dev||'未采集')+'</b></div><div class="stat-line"><span>序列号</span><b class="mono">'+esc(o.serial||'未采集')+'</b></div>'+
   '<div class="stat-line"><span>介质</span><b>'+o.type+'</b></div><div class="stat-line"><span>状态</span><span class="tag '+s.c+'">'+s.t+'</span></div></div>'+
   '<div><div class="stat-line"><span>容量</span><b class="mono">'+bytes(o.size)+'</b></div><div class="stat-line"><span>已用</span><b class="mono">'+bytes(o.used)+' ('+p+'%)</b></div>'+
   '<div class="stat-line"><span>使用率</span><div class="bar" style="width:120px;margin:0"><i style="width:'+p+'%;background:'+(p>85?'var(--danger)':'var(--ok)')+'"></i></div></div>'+
@@ -18,8 +18,8 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
   (o.smart==='FAIL'?'<div class="dangerbox" style="margin-top:14px">'+ic('alert')+'<div>该盘 SMART 报告介质失效且 OSD 已下线，建议立即走「踢盘换盘」流程。换盘前请核对 SN <span class="mono">'+esc(o.serial)+'</span> 与物理盘位。</div></div>':'')+
   '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">相关告警</div>'+
   (state.alerts.filter(function(a){return a.osd===o.id;}).map(function(a){return '<div class="ck"><div class="ck-i '+(a.sev==='critical'?'f':'w')+'">!</div><div><div class="ck-n">'+esc(a.title)+'</div><div class="ck-d mono">'+a.id+' · '+ago(a.since)+'</div></div></div>';}).join('')||'<div class="note">暂无关联告警</div>');
- openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host)+' · '+esc(o.dev))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
-  '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="qbtn" data-act="q-open" data-kind="in" data-id="'+o.id+'">'+ic('refresh',13)+'一键 IN 盘</button>')+
+ openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host||'—')+' · '+esc(o.dev||'—'))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
+  '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
   '<button class="qbtn" data-act="q-open" data-kind="replace" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
 function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)return;
@@ -253,7 +253,9 @@ function osdMark(id,inn){
   addAudit(inn?'OSD_IN':'OSD_OUT','osd.'+o.id,cmd,(dry?'DRY-RUN 演示':'真实执行')+(detail?' · '+detail:''));
   toast('osd.'+o.id+(inn?' IN':' OUT')+(dry?' 已生成命令（DRY-RUN，未下发集群）':' 已下发并执行'),'ok');
   closeModal();render();
-  if(!dry&&state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState();},800);
+  /* 强制刷新（?refresh=1）：后端刚执行完 out/in，20 秒缓存里还是旧状态，
+     不带 refresh 会把刚切换的按钮又翻回去。 */
+  if(!dry&&state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState(true);},800);
  }
  if(state.mode==='live'&&state.auth.authenticated){
   apiFetch('POST','/api/osd/'+o.id+'/'+act,{confirm_phrase:'osd.'+o.id,allow_write:!!state.settings.allowWrite})

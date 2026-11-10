@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.0.9-20261110';
+var UI_BUILD='1.1.0-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -389,7 +389,7 @@ function vOverview(){if(liveNoData())return noDataPage();
   '<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+'查看告警页面</button></div><div class="hr"></div>':'';
  /* An OSD left in OUT state (maintenance / drained) can be put back with one click. */
  var iq=liveNoData()?null:inOsd();
- if(iq)quickOps+='<div class="btn-row" style="margin-bottom:12px;align-items:center"><button class="qbtn lg" data-act="q-open" data-kind="in" data-id="'+iq.id+'">'+ic('refresh',14)+'一键 IN 盘</button>'+
+ if(iq)quickOps+='<div class="btn-row" style="margin-bottom:12px;align-items:center"><button class="qbtn lg" data-act="osd-in" data-id="'+iq.id+'">'+ic('refresh',14)+'IN</button>'+
   '<span class="tiny mono">osd.'+iq.id+' 当前为 OUT · 重新 IN 后恢复 CRUSH 权重并开始回填</span></div><div class="hr"></div>';
  /* Unreachable while liveNoData() is true (vOverview returns noDataPage()
     above); kept empty so no stale "placeholder numbers" banner survives. */

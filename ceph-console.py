@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.15"
+VERSION = "1.1.16"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -58,6 +58,9 @@ HISTORY_MAX_POINTS = 24 * 60 + 60
 ALERT_STATE_PATH = "/var/lib/ceph-console/alerts.json"
 ALERT_RESOLVE_TTL = 2 * 3600      # keep resolved rows this long for review
 ALERT_SILENCE_DEFAULT = 60        # minutes
+# 一个 check 连续多少次采集都看不到，才判定「已恢复」。单次采集抖动
+# （MON 忙、命令超时，尤其是刚做完 OUT/IN 之后）不该把还在的告警标成恢复。
+ALERT_MISS_LIMIT = 2
 SESSION_TTL = 8 * 3600
 LOGIN_WINDOW = 300
 LOGIN_MAX_FAIL = 5
@@ -1228,6 +1231,10 @@ def read_osds(cfg):
 _ALERT_LOCK = threading.Lock()
 _ALERT_STATE = {}
 _ALERT_LOADED = {"done": False, "path": ""}
+# 上一次成功解析出的告警行。「取不到」不等于「没有告警」：health detail 超时 /
+# MON 忙时若直接返回空列表，前端会把整屏告警清掉、健康还会显示 OK。
+# 失败时沿用这份快照，并通过 alertsOk=false 让前端知道数据是陈旧的。
+_ALERT_LAST = {"rows": [], "ok": False, "err": "", "ts": 0}
 
 
 def alert_state_path(cfg):
@@ -1439,14 +1446,72 @@ def alert_assets(texts, osds=None):
     return osd_ids[:12], hosts[:8], devs[:8]
 
 
+def _alert_rows(now_s):
+    """把 _ALERT_STATE 渲染成前端行（排序：未处置优先、严重优先）。
+
+    调用方需持有 _ALERT_LOCK。既用于正常采集，也用于「采集失败时用磁盘
+    状态兜底」—— 否则服务重启后第一次采集失败会返回空列表，把告警清空。
+    """
+    now_ms = now_s * 1000
+    rows = []
+    for key, item in _ALERT_STATE.items():
+        oids = [x for x in (item.get("osdIds") or []) if isinstance(x, int)]
+        rows.append({"id": "H-" + key,
+                     "sev": item.get("sev") or "warning",
+                     "code": item.get("code") or key,
+                     "title": item.get("title") or key,
+                     "msg": item.get("msg") or "",
+                     "src": "ceph health detail",
+                     "osd": oids[0] if oids else None,
+                     "osdIds": oids,
+                     "hosts": list(item.get("hosts") or []),
+                     "devs": list(item.get("devs") or []),
+                     "since": int(item.get("first") or now_ms),
+                     "status": _alert_live_status(item, now_s),
+                     "count": int(item.get("count") or 1),
+                     "by": item.get("by") or "",
+                     "until": int(item.get("until") or 0)})
+    stat_rank = {"active": 0, "acked": 1, "silenced": 2, "resolved": 3}
+    sev_rank = {"critical": 0, "warning": 1, "info": 2}
+    rows.sort(key=lambda r: (stat_rank.get(r["status"], 4), sev_rank.get(r["sev"], 3), -r["since"]))
+    return rows
+
+
+def _alert_stale(cfg, err):
+    """采集失败时返回上一次成功的结果（逐行标 stale），绝不当成「没有告警」。
+
+    否则 `ceph health detail` 偶尔超时（刚做完 OUT/IN、MON 忙时最常发生）
+    就会把整屏告警清空，健康也跟着显示 OK —— 看起来像「操作把告警治好了」。
+    内存快照为空（服务刚重启）时改用磁盘里的 alerts.json 兜底。
+    """
+    with _ALERT_LOCK:
+        _ALERT_LAST["ok"] = False
+        _ALERT_LAST["err"] = str(err or "")
+        if not _ALERT_LAST["rows"]:
+            alert_state_load(cfg)
+            if _ALERT_STATE:
+                _ALERT_LAST["rows"] = [dict(r) for r in _alert_rows(int(time.time()))]
+        rows = [dict(r) for r in _ALERT_LAST["rows"]]
+    for r in rows:
+        r["stale"] = True
+    return rows
+
+
 def read_alerts(cfg, settings, osds=None):
-    """当前 health check → 告警列表；同一 code 一条，状态跨刷新保持。"""
+    """当前 health check → 告警列表；同一 code 一条，状态跨刷新保持。
+
+    两种「读不到」的情况都沿用上次快照（并置 alertsOk=false），而不是返回 []：
+      * `ceph health detail` 失败 / 超时 / 非 JSON；
+      * 文档里没有 `checks` 字段（HEALTH_OK 时 Ceph 给的是 `{"checks": {}}`）。
+    """
     if cfg.backend == "rest":
         return []
     doc, err = ceph_json(cfg, ["health", "detail"])
-    if doc is None:
-        return []
-    checks = doc.get("checks", {}) or {}
+    if doc is None or not isinstance(doc, dict):
+        return _alert_stale(cfg, err or "ceph health detail 没有返回 JSON 对象")
+    checks = doc.get("checks")
+    if not isinstance(checks, dict):
+        return _alert_stale(cfg, "health detail 缺少 checks 字段")
     now_s = int(time.time())
     now_ms = now_s * 1000
     changed = False
@@ -1493,6 +1558,10 @@ def read_alerts(cfg, settings, osds=None):
                     item["status"] = ("silenced" if int(item.get("until") or 0) > now_s
                                       else "active")
                     changed = True
+                if int(item.get("miss") or 0):
+                    # 又看到了：把「连续缺席」计数清零，避免下次抖动直接判恢复。
+                    item["miss"] = 0
+                    changed = True
                 item["last"] = now_ms
                 item["sev"] = sev
                 item["title"] = msg
@@ -1503,12 +1572,19 @@ def read_alerts(cfg, settings, osds=None):
                     item["osdIds"] = osd_ids or item.get("osdIds") or []
                     item["hosts"] = hosts or item.get("hosts") or []
                     item["devs"] = devs or item.get("devs") or []
-        # 已经不在 health detail 里的：标恢复，过了保留期再删掉。
+        # 已经不在 health detail 里的：连续确认若干次才标恢复，过了保留期再删掉。
         for key in list(_ALERT_STATE.keys()):
             if key in seen:
                 continue
             item = _ALERT_STATE[key]
             if (item.get("status") or "") != "resolved":
+                miss = int(item.get("miss") or 0) + 1
+                if miss < ALERT_MISS_LIMIT:
+                    # 只缺席一次（命令抖动、MON 忙）不下结论，保持原状态。
+                    item["miss"] = miss
+                    changed = True
+                    continue
+                item["miss"] = 0
                 item["status"] = "resolved"
                 item["resolvedAt"] = now_ms
                 item["last"] = now_ms
@@ -1518,27 +1594,13 @@ def read_alerts(cfg, settings, osds=None):
                 changed = True
         if changed:
             alert_state_save(cfg)
-        rows = []
-        for key, item in _ALERT_STATE.items():
-            oids = [x for x in (item.get("osdIds") or []) if isinstance(x, int)]
-            rows.append({"id": "H-" + key,
-                         "sev": item.get("sev") or "warning",
-                         "code": item.get("code") or key,
-                         "title": item.get("title") or key,
-                         "msg": item.get("msg") or "",
-                         "src": "ceph health detail",
-                         "osd": oids[0] if oids else None,
-                         "osdIds": oids,
-                         "hosts": list(item.get("hosts") or []),
-                         "devs": list(item.get("devs") or []),
-                         "since": int(item.get("first") or now_ms),
-                         "status": _alert_live_status(item, now_s),
-                         "count": int(item.get("count") or 1),
-                         "by": item.get("by") or "",
-                         "until": int(item.get("until") or 0)})
-    stat_rank = {"active": 0, "acked": 1, "silenced": 2, "resolved": 3}
-    sev_rank = {"critical": 0, "warning": 1, "info": 2}
-    rows.sort(key=lambda r: (stat_rank.get(r["status"], 4), sev_rank.get(r["sev"], 3), -r["since"]))
+        rows = _alert_rows(now_s)
+    # 只有「真的读到了完整的 health detail」才更新快照；下一次失败时用它兜底。
+    with _ALERT_LOCK:
+        _ALERT_LAST["rows"] = [dict(r) for r in rows]
+        _ALERT_LAST["ok"] = True
+        _ALERT_LAST["err"] = ""
+        _ALERT_LAST["ts"] = now_s
     return rows
 
 
@@ -1571,6 +1633,9 @@ def alert_ack(cfg, aid, action, by="", minutes=0):
         else:
             return {"ok": False, "error": "未知操作 %s" % action}
         alert_state_save(cfg)
+        # 处置结果立刻反映到快照里：否则下一轮采集失败时会用旧快照把它显示回
+        # 未处置，看起来像「确认了又弹回来」。
+        _ALERT_LAST["rows"] = [dict(r) for r in _alert_rows(now_s)]
         return {"ok": True, "id": "H-" + key, "status": item["status"],
                 "until": int(item.get("until") or 0), "by": item.get("by") or "",
                 "count": int(item.get("count") or 1)}
@@ -1980,8 +2045,19 @@ def read_state(cfg, probe, settings):
         cluster["pools"] = len(pools)
     # OSD 只取一次：告警要按 osd 编号反查主机与设备盘符，不能再跑一遍命令。
     osds = read_osds(cfg)
+    alerts = read_alerts(cfg, settings, osds)
+    # rest 后端本就不提供 health detail（返回空是真实答案）；cli 后端要区分
+    # 「读到的是空」与「这次没读到」，前者才允许前端清空列表。
+    if cfg.backend == "rest":
+        alerts_ok, alerts_err, alerts_at = True, "", 0
+    else:
+        alerts_ok = bool(_ALERT_LAST["ok"])
+        alerts_err = _ALERT_LAST["err"]
+        alerts_at = int(_ALERT_LAST["ts"] or 0)
     return {"cluster": cluster, "osds": osds,
-            "alerts": read_alerts(cfg, settings, osds), "pools": pools,
+            "alerts": alerts,
+            "alertsOk": alerts_ok, "alertsErr": alerts_err, "alertsAt": alerts_at,
+            "pools": pools,
             "hosts": read_hosts(cfg, cluster), "profile": probe.as_dict(),
             # 阈值来自后端配置文件，前端不再用自己的演示默认值 85/95。
             # 安全策略随状态下发：页面开关只显示真实值，默认 DRY-RUN + 二次确认开。

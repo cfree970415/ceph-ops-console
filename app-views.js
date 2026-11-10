@@ -20,6 +20,19 @@ function alertRow(a,compact){var cls=a.sev==='critical'?'c':a.sev==='warning'?'w
    (a.status==='active'||a.status==='acked'?'<button class="btn sm" data-act="alert-silence" data-id="'+a.id+'">静音</button>':'')+
    (a.status==='acked'||a.status==='silenced'?'<button class="btn sm" data-act="alert-reopen" data-id="'+a.id+'">重新激活</button>':'')+
    '<button class="btn sm" data-act="alert-detail" data-id="'+a.id+'">详情</button>'+'</div>')+'</div>';}
+/* 告警明细这一轮没读到（health detail 超时 / MON 忙）：说明列表是快照，
+   而不是「已经没问题了」。没有这个提示，一次采集失败看起来就像告警被治好了。 */
+function alertsStaleBox(){
+ if(state.alertsOk!==false)return '';
+ var when=state.alertsAt?dt(state.alertsAt*1000):'—';
+ return '<div class="warnbox" style="margin-bottom:14px;align-items:flex-start">'+ic('alert')+
+  '<div style="flex:1;min-width:0">'+
+   '<div><b>这一轮没取到告警明细</b>　<span style="opacity:.72">读不到不等于没有问题，列表先保持原样</span></div>'+
+   '<div class="mono" style="font-size:10.5px;opacity:.82;word-break:break-all;margin-top:3px">'+esc(state.alertsErr||'ceph health detail 失败')+'</div>'+
+   '<div style="font-size:10.5px;opacity:.72;margin-top:2px">下面是 '+esc(when)+' 的最后一次快照，可能已过期；恢复采集后自动更新。</div>'+
+  '</div>'+
+  '<button class="btn sm" data-act="refresh" style="flex:0 0 auto">重新同步</button></div>';
+}
 function vAlerts(){var f=state.filters;
  var list=state.alerts.filter(function(a){if(f.alertSev!=='all'&&a.sev!==f.alertSev)return false;if(f.alertStatus!=='all'&&a.status!==f.alertStatus)return false;
   if(f.alertQ&&(a.title+a.msg+a.code+a.src+a.id).toLowerCase().indexOf(f.alertQ.toLowerCase())<0)return false;return true;});
@@ -38,7 +51,7 @@ function vAlerts(){var f=state.filters;
    return '<div class="qstat">'+ic(x[3],20)+'<div><div class="v '+x[2]+'">'+x[1]+'</div><div class="l">'+x[0]+'</div></div></div>';}).join('')+'</div>';
  var nh=notify.map(function(n){return '<div class="setrow"><div><div class="l">'+n[1]+'</div><div class="d">'+n[2]+'</div></div><button class="switch '+(state.settings[n[0]]?'on':'')+'" data-act="toggle" data-key="settings.'+n[0]+'"></button></div>';}).join('');
  return pageH('告警中心 · 查看与处置','实时监控告警 · 分级查看 / 确认 / 静音','<button class="btn" data-act="refresh">'+ic('refresh',14)+' 刷新告警</button><button class="btn pri" data-act="nav" data-view="settings">'+ic('settings',14)+' 阈值设置</button>')+
-   statsHtml+filter+card('告警列表',list.length?list.map(function(a){return alertRow(a);}).join(''):'<div class="empty">当前筛选条件下没有告警</div>','',false)+
+   statsHtml+alertsStaleBox()+filter+card('告警列表',list.length?list.map(function(a){return alertRow(a);}).join(''):'<div class="empty">当前筛选条件下没有告警</div>','',false)+
   '<div class="grid g2" style="margin-top:14px">'+card('告警规则',ruleTbl,'',false)+card('通知渠道',nh+'<div class="fgrp" style="margin-top:14px"><label class="fld">Webhook 地址</label><input class="inp" data-bind="settings.webhook" value="'+esc(state.settings.webhook)+'" placeholder="https://alert.example.com/hook"></div>')+'</div>';}
 
 /* ---- OSD ---- */

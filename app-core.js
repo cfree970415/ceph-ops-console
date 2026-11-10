@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.15-20261110';
+var UI_BUILD='1.1.16-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -71,6 +71,9 @@ var state={
   monList:[],monLeader:'',mgrActive:'',mgrStandbys:[],mgrAvailable:false,
   pgActiveClean:null,pgDegraded:null,pgBackfill:null,recoveringBytes:0,objects:0},
  osds:[],alerts:[],pools:[],hosts:[],audit:[],
+ /* 告警明细是否真的读到了：alertsOk=false 时列表是上一次的快照（stale），
+    不能据此断言「没有告警」，健康状态也不能因此显示成 OK。 */
+ alertsOk:true,alertsErr:'',alertsAt:0,
  ioReal:{iops:false,thr:false},samples:{iops:[],cap:[]},lastStateTs:0,
  /* 真实 24h 历史：来自后端 /api/history（后端每分钟采样并落盘）。 */
  history:{points:[],at:0,span:0,interval:60,loaded:false,err:'',unsupported:false},
@@ -207,6 +210,9 @@ function healthInfo(){
   var h=state.cluster.health;
   if(h==='HEALTH_ERR')return {t:'HEALTH_ERR',cl:'err',dot:'err',txt:'集群错误'};
   if(h==='HEALTH_WARN')return {t:'HEALTH_WARN',cl:'warn',dot:'warn',txt:'存在警告'};
+  /* ceph status 说 OK，但这一轮 health detail 没取到：告警明细未核实，
+     不能凭一次成功/失败就把结论改成「一切正常」。 */
+  if(state.alertsOk===false)return {t:'HEALTH_OK?',cl:'warn',dot:'warn',txt:'健康明细未核实'};
   return {t:'HEALTH_OK',cl:'ok',dot:'ok',txt:'集群健康'};
  }
  var a=activeAlerts(),c=a.filter(function(x){return x.sev==='critical'&&x.status==='active';}).length;
@@ -399,4 +405,4 @@ function vOverview(){if(liveNoData())return noDataPage();
    '<button class="btn sm" data-act="nav" data-view="alerts">查看全部 '+ic('arrow',12)+'</button>',false);
  var quick=card('快捷运维',quickOps+'<div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
  return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="init">'+ic('zap',14)+' 一键换盘</button>')+
-  noData+'<div class="grid g4" style="margin-bottom:14px">'+kh+'</div><div class="grid g21" style="margin-bottom:14px">'+trend+donutCard+'</div><div class="grid g2" style="margin-bottom:14px">'+io+pg+'</div><div class="grid g2">'+recent+quick+'</div>';}
+  noData+alertsStaleBox()+'<div class="grid g4" style="margin-bottom:14px">'+kh+'</div><div class="grid g21" style="margin-bottom:14px">'+trend+donutCard+'</div><div class="grid g2" style="margin-bottom:14px">'+io+pg+'</div><div class="grid g2">'+recent+quick+'</div>';}

@@ -169,7 +169,13 @@ function syncState(force){
   if(!err&&Array.isArray(d.osds))state.osds=d.osds.map(function(o){
    return {id:o.id,host:o.host||'',dev:o.dev||'',type:o.type||'SSD',size:o.size||0,used:o.used||0,
     up:o.up!==false,inn:o.inn!==false,pgs:o.pgs||0,weight:o.weight||1,smart:o.smart||'',serial:o.serial||''};});
-  if(!err&&Array.isArray(d.alerts)){
+  /* 后端用 alertsOk 区分「确认没有告警」与「这一轮没读到」。没读到时给的是
+     上一次快照；连快照都没有（服务刚重启）就保留本地记录，绝不拿空数组清屏。 */
+  if(!err&&typeof d.alertsOk==='boolean'){
+   state.alertsOk=d.alertsOk;state.alertsErr=d.alertsErr||'';state.alertsAt=d.alertsAt||0;}
+  var keepAlerts=!err&&d.alertsOk===false&&state.alerts.length>0
+   &&(!Array.isArray(d.alerts)||d.alerts.length===0);
+  if(!err&&Array.isArray(d.alerts)&&!keepAlerts){
    /* 后端已按 health check 归并成一条，这里再兜一层：同 id 沿用本地记录的
       since / status，避免某次响应字段缺失把「已确认」冲回 active。 */
    var prevA={};state.alerts.forEach(function(a){prevA[a.id]=a;});

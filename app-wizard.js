@@ -45,13 +45,18 @@ function alertAction(a,action,okMsg){
  }).catch(function(err){toast('操作失败：'+((err&&err.message)||'后端未响应'),'e');});
 }
 function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)return;
+ /* 旧后端落盘的告警资产三列可能为空：用 health detail 原文兜底，别让用户
+    对着「osd.0 ... is down」却看到全是 —。值只取自原文，识别不出仍是 —。 */
+ var r=alertRefs(a),rTip=r.guessed?' title="由告警正文解析，后端未给出资产字段"':'',
+  rOsd=r.osdIds.length?r.osdIds.map(function(x){return 'osd.'+x;}).join(', '):'—',
+  rHost=r.hosts.length?esc(r.hosts.join(', ')):'—',rDev=r.devs.length?esc(r.devs.join(', ')):'—';
  var body='<div class="flex" style="gap:10px;margin-bottom:14px">'+sevTag(a.sev)+stTag(a.status)+'<span class="tag mute mono">'+a.id+'</span></div>'+
   '<div style="font-size:15px;font-weight:650;margin-bottom:10px">'+esc(a.title)+'</div><div class="note" style="font-size:12.5px;color:var(--muted);margin-bottom:16px">'+esc(a.msg)+'</div>'+
   '<div class="grid g2"><div><div class="stat-line"><span>告警代码</span><b class="mono">'+a.code+'</b></div><div class="stat-line"><span>来源</span><b class="mono">'+esc(a.src)+'</b></div><div class="stat-line"><span>首次出现</span><b class="mono">'+dt(a.since)+'</b></div><div class="stat-line"><span>处置人</span><b class="mono">'+(a.by?esc(a.by):'—')+'</b></div></div>'+
   '<div><div class="stat-line"><span>持续</span><b>'+ago(a.since).replace('前','')+'</b></div><div class="stat-line"><span>触发次数</span><b class="mono">'+a.count+'</b></div>'+
-  '<div class="stat-line"><span>涉及 OSD</span><b class="mono">'+((a.osdIds&&a.osdIds.length)?a.osdIds.map(function(x){return 'osd.'+x;}).join(', '):'—')+'</b></div>'+
-  '<div class="stat-line"><span>涉及主机</span><b class="mono">'+((a.hosts&&a.hosts.length)?esc(a.hosts.join(', ')):'—')+'</b></div>'+
-  '<div class="stat-line"><span>涉及设备</span><b class="mono">'+((a.devs&&a.devs.length)?esc(a.devs.join(', ')):'—')+'</b></div></div></div>'+
+  '<div class="stat-line"><span>涉及 OSD</span><b class="mono"'+rTip+'>'+rOsd+'</b></div>'+
+  '<div class="stat-line"><span>涉及主机</span><b class="mono"'+rTip+'>'+rHost+'</b></div>'+
+  '<div class="stat-line"><span>涉及设备</span><b class="mono"'+rTip+'>'+rDev+'</b></div></div></div>'+
   '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+esc(alertAdvice(a))+'</div>';
  openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   (a.status==='active'?'<button class="btn" data-act="alert-ack" data-id="'+a.id+'">确认告警</button><button class="btn" data-act="alert-silence" data-id="'+a.id+'">静音 60 分钟</button>':'')+

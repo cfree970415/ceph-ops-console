@@ -323,10 +323,12 @@ EC 池把第二行换成 `... erasure <ec_profile>` 并跳过 `set size`。
 | `DEVICE_HEALTH` / SMART | `ceph device ls`、`smartctl -a <dev>`；确认后再走换盘流程 |
 | `MON_*` / `MGR_*` / `CLOCK_SKEW` | `ceph mon stat`、`quorum_status`、时间同步检查 |
 | `SLOW_OPS` / 延迟 | `ceph osd perf`、`ceph osd df` |
-| `OSD_DOWN` / 主机 down | `ceph osd tree`、`osd metadata <id>`、查守护进程，先尝试拉起服务 |
-| 其它 | 兜底的只读排查命令 |
+| `OSD_DOWN` / 主机 down | **第一条就是 `ceph osd tree`**（确认 up/in、CRUSH 权重、所在主机），再 `ceph osd find <id>`、`ceph osd metadata <id>`、`ceph health detail`、`ceph -s`、查守护进程状态；只是进程掉了先拉服务，不要直接 out |
+| 其它 | `ceph osd tree`、`ceph health detail`、`ceph pg stat`、`ceph -s` |
 
-真实写操作统一到「OSD / 磁盘」页或「快捷运维」：那里有二次确认、DRY-RUN 与执行后复核。早前这里只要认出 OSD 编号就一律给出 `down + out` 踢盘步骤，`PG_DEGRADED`（副本不足）也会中招，1.1.18 已改为按类型给只读建议。
+真实写操作统一到「OSD / 磁盘」页或「快捷运维」：那里有二次确认、DRY-RUN 与执行后复核。早前这里只要认出 OSD 编号就一律给出 `down + out` 踢盘步骤，`PG_DEGRADED`（副本不足）也会中招，1.1.18 起改为按类型给只读建议。
+
+`code` 缺失、或资产三列是旧版本落盘的空值时，会退而用告警标题/正文（`osd.0 (root=default,host=ceph-single) is down`）判断类型并解出 `osd.0` / 主机名，命令里填真实编号而不是 `<id>`。识别不出的仍留 `—`，不猜值。
 
 ---
 
@@ -513,10 +515,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.18-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.19-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.18-20261110`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.19-20261110`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 

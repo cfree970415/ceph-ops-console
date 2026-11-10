@@ -2,13 +2,27 @@
 'use strict';
 function sevTag(s){return s==='critical'?'<span class="tag err">严重</span>':s==='warning'?'<span class="tag warn">警告</span>':'<span class="tag info">提示</span>';}
 function stTag(s){return {active:'<span class="tag err">活跃</span>',acked:'<span class="tag warn">已确认</span>',silenced:'<span class="tag mute">已静音</span>',resolved:'<span class="tag ok">已恢复</span>'}[s]||'';}
-/* 告警涉及的资源：OSD / 主机 / 设备盘符。后端从 health detail 文本里解析，
-   再用 osd 表补全主机与盘符，识别不出的留空，不猜。 */
+/* 告警涉及的资源：优先用后端解析好的 osdIds / hosts / devs。
+   旧版本落盘的告警（或后端还没升级）这三列可能是空的，此时从 health detail
+   原文兜底解析：osd.0 (root=default,host=ceph-single) is down / /dev/nvme0n2。
+   只取文本里明写的值，识别不出的留空，不猜。 */
+function alertRefs(a){
+ var r={osdIds:(a.osdIds||[]).slice(),hosts:(a.hosts||[]).slice(),devs:(a.devs||[]).slice(),
+        guessed:!((a.osdIds||[]).length||(a.hosts||[]).length||(a.devs||[]).length)};
+ var t=String(a.title||'')+'\n'+String(a.msg||''),m;
+ var reOsd=/\bosd[. ](\d+)\b/g;
+ while((m=reOsd.exec(t))!==null){var id=parseInt(m[1],10);if(r.osdIds.indexOf(id)<0)r.osdIds.push(id);}
+ var reHost=/\bhost\s*[=:]\s*['"]?([A-Za-z0-9._-]{1,64})|\bhost\s+'([^']{1,64})'/g;
+ while((m=reHost.exec(t))!==null){var h=m[1]||m[2];if(h&&r.hosts.indexOf(h)<0)r.hosts.push(h);}
+ var reDev=/\/dev\/[A-Za-z0-9._-]+/g;
+ while((m=reDev.exec(t))!==null){if(r.devs.indexOf(m[0])<0)r.devs.push(m[0]);}
+ return r;
+}
 function alertAssets(a){
- var p=[];
- if(a.osdIds&&a.osdIds.length)p.push(a.osdIds.map(function(x){return 'osd.'+x;}).join(', '));
- if(a.hosts&&a.hosts.length)p.push(a.hosts.join(', '));
- if(a.devs&&a.devs.length)p.push(a.devs.join(', '));
+ var r=alertRefs(a),p=[];
+ if(r.osdIds.length)p.push(r.osdIds.map(function(x){return 'osd.'+x;}).join(', '));
+ if(r.hosts.length)p.push(r.hosts.join(', '));
+ if(r.devs.length)p.push(r.devs.join(', '));
  return p.join(' · ');
 }
 /* 建议处置按告警类型给「只读排查」命令。
@@ -16,18 +30,36 @@ function alertAssets(a){
    这时给 down + out 踢盘命令是错的：数据迁移只会让冗余更差。所有真实写操作
    统一引导到 OSD / 磁盘页（那里有二次确认、DRY-RUN 与执行后复核）。 */
 function alertAdvice(a){
- var c=String(a.code||'').toUpperCase(),osd=(a.osdIds&&a.osdIds.length)?a.osdIds[0]:null;
+ var c=String(a.code||'').toUpperCase(),r=alertRefs(a);
+ var osd=r.osdIds.length?r.osdIds[0]:null,id=(osd!=null?String(osd):'<id>');
+ var dev=r.devs.length?r.devs[0]:'/dev/<盘符>';
+ /* code 由后端给出，但历史记录可能缺 code 或用了新版本没见过的名字：
+    再用告警标题/正文兜底判断类型，别让 OSD_DOWN 掉进通用的 health+pg 模板。 */
+ var t=String(a.title||'')+' '+String(a.msg||'');
+ var downLike=/\b\d+\s+osds?\s+(is\s+|are\s+)?down\b|\bosd[. ]\d+\b[^\n]*\bis down\b|\bhost\b[^\n]*\bis down\b/i.test(t);
+ var pgLike=/\bpgs?\b|undersized|degraded data redundancy|peering|incomplete/i.test(t);
+ var fullLike=/nearfull|backfillfull|full osd|\bfull\b/i.test(t);
  var head,cmds,note;
  if(/(DEVICE_HEALTH|SMART|DISK_FAIL|BLUESTORE)/.test(c)){
   head='# 设备预失效 / 介质告警：先确认是哪块盘、还剩多少寿命';
-  cmds=['ceph device ls','ceph health detail','ceph osd tree',
-   'smartctl -a '+((a.devs&&a.devs[0])?a.devs[0]:'/dev/<盘符>')];
+  cmds=['ceph device ls','ceph health detail','ceph osd tree','smartctl -a '+dev];
   note='确认盘确实要换之后，到「OSD / 磁盘」页走换盘流程（保留原 OSD 编号，会先复核再执行）。';
- }else if(/(NEARFULL|_FULL|CAPACITY|BACKFILLFULL)/.test(c)){
+ }else if(/(NEARFULL|_FULL|CAPACITY|BACKFILLFULL)/.test(c)||(!c&&fullLike)){
   head='# 容量告警：先看空间分布，别急着动 OSD';
   cmds=['ceph df','ceph osd df','ceph osd tree','ceph health detail'];
   note='清理无用数据或扩容；此时 out / 踢盘会触发数据迁移，反而让占用更高。';
- }else if(/(^PG_|PG_DEGRADED|PG_AVAILABILITY|OBJECT_UNFOUND|PG_DAMAGED|TOO_FEW_PGS|TOO_MANY_PGS|OSD_SCRUB_ERRORS)/.test(c)){
+ }else if(/(OSD_DOWN|HOST_DOWN|OSD_HOST_DOWN|OSD_OUT|DAEMON)/.test(c)||(downLike&&!pgLike)){
+  /* OSD down 的第一步永远是 osd tree：确认它是否真的 down、还在不在 in、落在哪台主机。
+     只是守护进程掉了就拉服务，别一上来 out 摘盘（那会触发无谓的数据迁移）。 */
+  head='# OSD / 主机不可用：先用 ceph osd tree 确认 up/in 状态与所在主机';
+  cmds=['ceph osd tree',
+   'ceph osd find '+id,
+   'ceph osd metadata '+id+'   # 查对应的物理盘符 / 设备',
+   'ceph health detail',
+   'ceph -s',
+   'ceph orch ps --daemon-type osd   # cephadm；传统部署用 systemctl status ceph-osd@'+id];
+  note='osd tree 里 up=0 才是真 down；只是进程掉了就先拉起服务。\n# 判定硬件故障、评估过数据迁移后，才到「OSD / 磁盘」页走换盘流程。';
+ }else if(/(^PG_|PG_DEGRADED|PG_AVAILABILITY|OBJECT_UNFOUND|PG_DAMAGED|TOO_FEW_PGS|TOO_MANY_PGS|OSD_SCRUB_ERRORS)/.test(c)||pgLike){
   head='# 副本不足 / PG 未 active+clean：先定位原因';
   cmds=['ceph health detail','ceph pg stat','ceph osd tree','ceph -s'];
   note='常见于 OSD 刚被 out、正在回填或权重被改，等回到 active+clean 即可恢复；这类告警不需要踢盘或换盘。';
@@ -39,16 +71,10 @@ function alertAdvice(a){
   head='# 慢请求 / 延迟：先看是不是个别 OSD 拖慢';
   cmds=['ceph osd perf','ceph health detail','ceph osd df','ceph -s'];
   note='先定位慢盘或网络；不要在负载高的时候做 out，迁移会进一步加压。';
- }else if(/(OSD_DOWN|HOST_DOWN|OSD_HOST_DOWN|OSD_OUT|DAEMON)/.test(c)){
-  head='# OSD / 主机不可用：先尝试拉起服务';
-  cmds=['ceph osd tree','ceph health detail',
-   osd!=null?'ceph osd metadata '+osd:'ceph osd metadata <id>',
-   'ceph orch ps --daemon-type osd   # cephadm；传统部署用 systemctl status ceph-osd@<id>'];
-  note='确认守护进程状态；只有判定为硬件故障、且评估过数据迁移，才到「OSD / 磁盘」页走换盘流程。';
  }else{
   head='# 先查完整原因，再决定动作';
-  cmds=['ceph health detail','ceph pg stat','ceph -s'];
-  note='不要仅凭这条告警直接执行 out / down。';
+  cmds=['ceph osd tree','ceph health detail','ceph pg stat','ceph -s'];
+  note='不要仅凭这条告警直接执行 out / down；osd tree 能看出 OSD 的 up/in 状态与所在主机。';
  }
  return head+'\n'+cmds.join('\n')+'\n# '+note+
   '\n# 真实写操作统一在「OSD / 磁盘」页 / 「快捷运维」：有二次确认、DRY-RUN 与执行后复核。';

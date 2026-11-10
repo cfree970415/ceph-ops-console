@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.17"
+VERSION = "1.1.18"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -1411,10 +1411,12 @@ def _alert_live_status(item, now_s):
 
 
 # health detail 里只有 detail 文本带具体对象，例如
+#   "osd.0 (root=default,host=ceph-single) is down"   ← 新版本：host=xxx
 #   "osd.1 is down" / "host 'ceph-node-2' (root=default) is down"
 #   "Device /dev/nvme0n2 is expected to fail soon" / "acting [0,1]"
 _ALERT_OSD_RE = re.compile(r"\bosd[. ](\d+)\b")
 _ALERT_HOST_RE = re.compile(r"\bhost '([^']{1,64})'")
+_ALERT_HOST_EQ_RE = re.compile(r"\bhost\s*[:=]\s*([A-Za-z0-9._-]{1,64})")
 _ALERT_DEV_RE = re.compile(r"(/dev/[A-Za-z0-9/_.\-]{1,64})")
 _ALERT_ACTING_RE = re.compile(r"acting \[([0-9,\s]{1,64})\]")
 
@@ -1425,7 +1427,11 @@ def alert_assets(texts, osds=None):
     osd_ids, hosts, devs = [], [], []
 
     def add(seq, v):
-        if v and v not in seq:
+        # 不能用 `if v`：osd.0 的编号是整数 0，会被当成假值丢掉，
+        # 于是「涉及 OSD / 主机 / 设备」全空（单 OSD 集群最常见的编号）。
+        if v is None or v == "":
+            return
+        if v not in seq:
             seq.append(v)
 
     for t in texts:
@@ -1437,6 +1443,8 @@ def alert_assets(texts, osds=None):
             except ValueError:
                 pass
         for m in _ALERT_HOST_RE.finditer(str(t)):
+            add(hosts, m.group(1))
+        for m in _ALERT_HOST_EQ_RE.finditer(str(t)):
             add(hosts, m.group(1))
         for m in _ALERT_DEV_RE.finditer(str(t)):
             add(devs, m.group(1))
@@ -1538,6 +1546,23 @@ def read_alerts(cfg, settings, osds=None):
     changed = False
     with _ALERT_LOCK:
         alert_state_load(cfg)
+        # 升级前落盘的旧记录，资产字段可能是空的（1.1.17 及更早把 osd.0 的
+        # 整数 0 当假值丢掉了）。用保存下来的标题/正文再解析一次补空字段，
+        # 不必等 health detail 下次再出现这条 check 才补得上。
+        for item in _ALERT_STATE.values():
+            if item.get("osdIds") and item.get("hosts") and item.get("devs"):
+                continue
+            oids, hnames, dnames = alert_assets(
+                [item.get("title"), item.get("msg")], osds)
+            if oids and not item.get("osdIds"):
+                item["osdIds"] = oids
+                changed = True
+            if hnames and not item.get("hosts"):
+                item["hosts"] = hnames
+                changed = True
+            if dnames and not item.get("devs"):
+                item["devs"] = dnames
+                changed = True
         # 静音到期自动恢复为活跃，不需要用户再点一次。
         for item in _ALERT_STATE.values():
             if (item.get("status") or "") == "silenced" \

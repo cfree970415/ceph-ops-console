@@ -52,7 +52,7 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
   '<div class="stat-line"><span>涉及 OSD</span><b class="mono">'+((a.osdIds&&a.osdIds.length)?a.osdIds.map(function(x){return 'osd.'+x;}).join(', '):'—')+'</b></div>'+
   '<div class="stat-line"><span>涉及主机</span><b class="mono">'+((a.hosts&&a.hosts.length)?esc(a.hosts.join(', ')):'—')+'</b></div>'+
   '<div class="stat-line"><span>涉及设备</span><b class="mono">'+((a.devs&&a.devs.length)?esc(a.devs.join(', ')):'—')+'</b></div></div></div>'+
-  '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+(a.osd!=null?'# 1. 确认故障盘与物理盘位\nceph osd metadata '+a.osd+'\n# 2. 先置 DOWN 停止服务，再 OUT 摘盘（也可在 OSD 页面执行「一键踢盘」）\nceph osd down '+a.osd+'\nceph osd out '+a.osd+'\n# 3. 观察回填至 active+clean；维护结束后再 IN 恢复':'# 查看健康明细\nceph health detail\n# 查看 PG 状态\nceph pg stat')+'</div>';
+  '<div class="hr"></div><div class="tiny" style="margin-bottom:8px">建议处置</div><div class="cmdbox">'+esc(alertAdvice(a))+'</div>';
  openModal(modalHead('告警详情',a.code)+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   (a.status==='active'?'<button class="btn" data-act="alert-ack" data-id="'+a.id+'">确认告警</button><button class="btn" data-act="alert-silence" data-id="'+a.id+'">静音 60 分钟</button>':'')+
   (a.status==='acked'||a.status==='silenced'?'<button class="btn" data-act="alert-reopen" data-id="'+a.id+'">重新激活</button>':'')+

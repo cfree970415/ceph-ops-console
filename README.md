@@ -303,11 +303,30 @@ EC 池把第二行换成 `... erasure <ec_profile>` 并跳过 `set size`。
 
 ### 定位到具体资源
 
-- 来源是 `health detail` 的 detail 文本（`osd.1 is down`、`host 'x'`、`/dev/nvme0n2`）
+- 来源是 `health detail` 的 detail 文本（`osd.0 (root=default,host=ceph-single) is down`、`host 'x'`、`host=xxx`、`/dev/nvme0n2`）
 - 认出 osd 编号后，用 `osd metadata` 采到的 osd → 主机 / 设备映射补全主机名与盘符
 - PG 类告警没有 `osd.N` 字样，退化取 `acting [0,1]` 的 OSD 列表
 - 只认出盘符时反查 osd 表拿主机名（`DEVICE_HEALTH` 这类）
 - 认不出来的留 `—`，不用推测值填充
+- 升级前落盘的旧记录若资产字段为空，下一轮用保存的标题 / 正文重新解析补齐
+
+> 1.1.18 修掉一个只影响 `osd.0` 的解析缺陷：编号 `0` 曾被 Python 的 `if v` 判成假值丢弃，于是单 OSD 集群的告警「涉及 OSD / 主机 / 设备」全显示 `—`。同时补上了 `host=xxx` 这种新版本 Ceph 的文本格式。
+
+### 建议处置（只读）
+
+告警详情里的「建议处置」**只给排查命令**，按 health check code 分流，不直接给 `ceph osd down / out`、zap 或换盘命令：
+
+| 告警类型 | 建议内容 |
+| --- | --- |
+| `PG_*` / `OBJECT_UNFOUND`（含 `pgs undersized`） | `ceph health detail`、`ceph pg stat`、`ceph osd tree`、`ceph -s`；等回填到 active+clean，明确写明不需要踢盘 |
+| `*_FULL` / `NEARFULL` | `ceph df`、`ceph osd df`；清理或扩容，此时 out 会加剧占用 |
+| `DEVICE_HEALTH` / SMART | `ceph device ls`、`smartctl -a <dev>`；确认后再走换盘流程 |
+| `MON_*` / `MGR_*` / `CLOCK_SKEW` | `ceph mon stat`、`quorum_status`、时间同步检查 |
+| `SLOW_OPS` / 延迟 | `ceph osd perf`、`ceph osd df` |
+| `OSD_DOWN` / 主机 down | `ceph osd tree`、`osd metadata <id>`、查守护进程，先尝试拉起服务 |
+| 其它 | 兜底的只读排查命令 |
+
+真实写操作统一到「OSD / 磁盘」页或「快捷运维」：那里有二次确认、DRY-RUN 与执行后复核。早前这里只要认出 OSD 编号就一律给出 `down + out` 踢盘步骤，`PG_DEGRADED`（副本不足）也会中招，1.1.18 已改为按类型给只读建议。
 
 ---
 
@@ -494,10 +513,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.17-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.18-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.17-20261110`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.18-20261110`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 

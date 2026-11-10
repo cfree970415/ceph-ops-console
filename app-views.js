@@ -11,6 +11,48 @@ function alertAssets(a){
  if(a.devs&&a.devs.length)p.push(a.devs.join(', '));
  return p.join(' · ');
 }
+/* 建议处置按告警类型给「只读排查」命令。
+   PG_DEGRADED（pgs undersized）只是副本不足，常见于 OSD 刚被 out、正在回填，
+   这时给 down + out 踢盘命令是错的：数据迁移只会让冗余更差。所有真实写操作
+   统一引导到 OSD / 磁盘页（那里有二次确认、DRY-RUN 与执行后复核）。 */
+function alertAdvice(a){
+ var c=String(a.code||'').toUpperCase(),osd=(a.osdIds&&a.osdIds.length)?a.osdIds[0]:null;
+ var head,cmds,note;
+ if(/(DEVICE_HEALTH|SMART|DISK_FAIL|BLUESTORE)/.test(c)){
+  head='# 设备预失效 / 介质告警：先确认是哪块盘、还剩多少寿命';
+  cmds=['ceph device ls','ceph health detail','ceph osd tree',
+   'smartctl -a '+((a.devs&&a.devs[0])?a.devs[0]:'/dev/<盘符>')];
+  note='确认盘确实要换之后，到「OSD / 磁盘」页走换盘流程（保留原 OSD 编号，会先复核再执行）。';
+ }else if(/(NEARFULL|_FULL|CAPACITY|BACKFILLFULL)/.test(c)){
+  head='# 容量告警：先看空间分布，别急着动 OSD';
+  cmds=['ceph df','ceph osd df','ceph osd tree','ceph health detail'];
+  note='清理无用数据或扩容；此时 out / 踢盘会触发数据迁移，反而让占用更高。';
+ }else if(/(^PG_|PG_DEGRADED|PG_AVAILABILITY|OBJECT_UNFOUND|PG_DAMAGED|TOO_FEW_PGS|TOO_MANY_PGS|OSD_SCRUB_ERRORS)/.test(c)){
+  head='# 副本不足 / PG 未 active+clean：先定位原因';
+  cmds=['ceph health detail','ceph pg stat','ceph osd tree','ceph -s'];
+  note='常见于 OSD 刚被 out、正在回填或权重被改，等回到 active+clean 即可恢复；这类告警不需要踢盘或换盘。';
+ }else if(/(^MON_|CLOCK_SKEW|^MGR_|AUTH_)/.test(c)){
+  head='# MON / MGR / 时钟类告警：查服务与时间同步，与磁盘无关';
+  cmds=['ceph mon stat','ceph quorum_status','ceph mgr dump','chronyc sources -v   # 或 ntpq -p'];
+  note='修复服务或时间同步后再看告警是否自动消失。';
+ }else if(/(SLOW_OPS|REQUEST_SLOW|SLOW_PING|LATENCY|BLOCKED)/.test(c)){
+  head='# 慢请求 / 延迟：先看是不是个别 OSD 拖慢';
+  cmds=['ceph osd perf','ceph health detail','ceph osd df','ceph -s'];
+  note='先定位慢盘或网络；不要在负载高的时候做 out，迁移会进一步加压。';
+ }else if(/(OSD_DOWN|HOST_DOWN|OSD_HOST_DOWN|OSD_OUT|DAEMON)/.test(c)){
+  head='# OSD / 主机不可用：先尝试拉起服务';
+  cmds=['ceph osd tree','ceph health detail',
+   osd!=null?'ceph osd metadata '+osd:'ceph osd metadata <id>',
+   'ceph orch ps --daemon-type osd   # cephadm；传统部署用 systemctl status ceph-osd@<id>'];
+  note='确认守护进程状态；只有判定为硬件故障、且评估过数据迁移，才到「OSD / 磁盘」页走换盘流程。';
+ }else{
+  head='# 先查完整原因，再决定动作';
+  cmds=['ceph health detail','ceph pg stat','ceph -s'];
+  note='不要仅凭这条告警直接执行 out / down。';
+ }
+ return head+'\n'+cmds.join('\n')+'\n# '+note+
+  '\n# 真实写操作统一在「OSD / 磁盘」页 / 「快捷运维」：有二次确认、DRY-RUN 与执行后复核。';
+}
 function alertRow(a,compact){var cls=a.sev==='critical'?'c':a.sev==='warning'?'w':'i';
  /* 「核实中」：这一轮 health detail 里已经没有这条检查了，但还不能下结论 ——
     刚做过 OUT/IN 的观察期内，或距最后一次出现不足 60 秒。状态保持原样，

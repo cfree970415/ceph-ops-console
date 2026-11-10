@@ -74,6 +74,12 @@ function syncState(){
  if(state.mode!=='live')return Promise.resolve();
  return API.call('GET','/api/state').then(function(r){
   var d=r.data||{},c=d.cluster||{},err=c.error||d.error||'';
+  /* HTTP 200 is not enough: the REST proxy only returns a summary, so a
+     payload without capacity / OSD counters must not be treated as usable
+     state, or the demo fixtures (711 TiB / 96 OSD) would stay on screen. */
+  if(!err&&typeof c.total!=='number'&&typeof c.osds!=='number'){
+   err='后端返回的数据不含集群容量 / OSD 计数'+(c.note?'（'+c.note+'）':'')+'；REST 只读通道仅代理 summary，请改用 CLI 后端';
+  }
   /* Record WHY there is no real data, so the UI can show the exact error
      instead of a vague "waiting for backend" label. */
   if(state.link){state.link.stateOk=!err;state.link.stateError=err?String(err):'';
@@ -101,7 +107,8 @@ function syncState(){
    state.link.stateHttp=(e&&e.status)||0;state.link.stateAt=Date.now();}
   if(state.auth.authenticated&&!state.wizard&&!formBusy())render();
   toast('同步集群状态失败：'+((e&&e.message)||'未知错误'),'e');});}
-function startWizard(id,intent){var n=id==null?7:Number(id),o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[7];
+function startWizard(id,intent){var n=id==null?7:Number(id),o=state.osds.filter(function(x){return x.id===n;})[0]||state.osds[0];
+ if(!o){toast('当前没有可用的 OSD，无法发起踢盘换盘','w');return;}
  state.wizard={step:1,osdId:o.id,host:o.host,dev:o.dev,intent:intent||'replace',phrase:'',confirmed:false,checks:null,plan:null,
   logs:[],progress:0,running:false,done:false,aborted:false,newOsdId:null,remote:null};
  renderWizard();
@@ -279,8 +286,8 @@ function boot(){
   var act=el.getAttribute('data-act');
   if(act==='overlay'){if(!e.target.closest('.modal'))onAct('overlay',el);return;}
   if(el.disabled)return;onAct(act,el);});
- document.addEventListener('input',function(e){var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
- document.addEventListener('change',function(e){var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
+ document.addEventListener('input',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
+ document.addEventListener('change',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
  if(typeof liveBoot==='function'){liveBoot();return;}
  render();
  if(state.mode==='live')syncState();

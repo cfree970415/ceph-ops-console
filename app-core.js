@@ -158,7 +158,10 @@ function formKey(el){return el.id||el.getAttribute('data-bind')||el.getAttribute
 function formBusy(){
  var a=document.activeElement;
  if(!a||!/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))return false;
- return !!a.value;
+ if(!a.value)return false;
+ /* Hold the re-render only while the user is actively typing. Merely being
+    focused on a pre-filled field used to block auto-refresh indefinitely. */
+ return (Date.now()-(state.lastInputAt||0))<4000;
 }
 function snapshotForm(root){
  var out=[],els=root?root.querySelectorAll('input,textarea,select'):[],i,e,r;
@@ -203,7 +206,7 @@ function noDataPage(){
  var authGone=http===401||/not authenticated|sign in|请登录/i.test(err);
  var reason=pending?'正在向后端请求集群状态（首次同步尚未完成）':
   (authGone?'登录会话已失效，请重新登录':
-   (http?('请求返回 HTTP '+http+(err?'：'+esc(err):'')):
+   (http&&http!==200?('请求返回 HTTP '+http+(err?'：'+esc(err):'')):
     (err?('后端返回：'+esc(err)):'请求未完成（网络不可达 / CORS 被拦截 / 后端无响应）')));
  var rows='<div class="stat-line"><span>失败原因</span><b>'+reason+'</b></div>'+
   '<div class="stat-line"><span>后端地址</span><b class="mono">'+esc(backendBase()||'同源 · 由后端托管')+'</b></div>'+

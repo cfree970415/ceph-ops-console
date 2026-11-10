@@ -42,8 +42,13 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.20"
+VERSION = "1.1.21"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
+# 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
+# destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
+# post 阶段（zap）之前必须重新确认，否则宁可拒绝执行，也绝不多出一块盘。
+REPLACE_DESTROY_TRIES = 5
+REPLACE_DESTROY_INTERVAL = 2
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
 # Real capacity / IO history. Sampled once a minute by the backend itself, so
@@ -870,6 +875,52 @@ def check_downout(cfg, oid):
             "message": "osd.%d %s" % (oid, "；".join(reasons))}
 
 
+def osd_map_flags(cfg):
+    """从 ceph osd dump 读出每个编号的真实标记（exists / up / destroyed / new）。
+
+    cephadm `orch osd rm --replace` 走完的硬证据，是 osd.<id> 在 osdmap 里带
+    destroyed 标记：只有这时 OSDSpec 才会在下一次部署时认领这个编号。没有
+    destroyed 就 zap 新盘，编排器会把它当成一块全新的盘、分配一个新编号 ——
+    这正是「一键换盘变成新增磁盘」的根因。
+    """
+    doc, err = ceph_json(cfg, ["osd", "dump"], 30)
+    if not isinstance(doc, dict):
+        return None, err or "ceph osd dump 无返回"
+    flags = {}
+    for o in (doc.get("osds") or []):
+        if not isinstance(o, dict):
+            continue
+        try:
+            oid = int(o.get("osd"))
+        except (TypeError, ValueError):
+            continue
+        flags[oid] = [str(x).lower() for x in (o.get("state") or [])
+                      if isinstance(x, (str, bytes))]
+    return flags, ""
+
+
+def osd_destroyed(cfg, oid):
+    """原编号是否已释放为 destroyed，可以被 OSDSpec 复用。"""
+    flags, _ = osd_map_flags(cfg)
+    return bool(flags and "destroyed" in (flags.get(int(oid)) or []))
+
+
+def osdspec_managed(cfg):
+    """是否存在能自动按编号重建 OSD 的 managed OSDSpec。"""
+    doc, err = ceph_json(cfg, ["orch", "ls", "--service-type", "osd"], 30)
+    if doc is None:
+        return False, err or "ceph orch ls --service-type osd 无返回"
+    items = doc if isinstance(doc, list) else (doc.get("services") or [])
+    managed = [x for x in items if isinstance(x, dict)
+               and not bool(x.get("unmanaged"))]
+    if not managed:
+        return False, ("没有可用的 OSDSpec：ceph orch ls --service-type osd 里的服务"
+                       "全部是 unmanaged=true（或根本没有 osd 服务）。这种状态下 zap "
+                       "之后不会有任何 daemon 被重建，必须先配置匹配该主机的 managed "
+                       "spec（ceph orch apply osd --all-available-devices 或 apply -i）")
+    return True, ""
+
+
 def _dev_key(path):
     """把分区路径归一到整盘：/dev/nvme0n2p1、/dev/sda1 -> /dev/nvme0n2、/dev/sda。"""
     p = str(path or "").strip()
@@ -879,10 +930,30 @@ def _dev_key(path):
 
 
 def device_owner(cfg, dev):
-    """这块盘现在被哪个 OSD 占用（按 osd metadata 的真实设备路径反查）。"""
+    """这块盘现在被哪个 OSD 占用。
+
+    优先看 `ceph orch device ls` 里 LVM 标签上的 osd_id（cephadm 现场扫描到的
+    真实归属），再用 osd metadata 兜底。旧 OSD 的 metadata 可能还留着旧设备路径，
+    只看 metadata 会把「新盘其实已经被新编号占了」误判成「还挂在原编号」。
+    """
     if not dev:
         return None
     key = _dev_key(dev)
+    doc, _ = ceph_json(cfg, ["orch", "device", "ls"], 30)
+    if isinstance(doc, list):
+        for h in doc:
+            if not isinstance(h, dict):
+                continue
+            for d in (h.get("devices") or []):
+                if not isinstance(d, dict) or _dev_key(d.get("path") or "") != key:
+                    continue
+                for lv in (d.get("lvs") or []):
+                    if not isinstance(lv, dict) or lv.get("osd_id") is None:
+                        continue
+                    try:
+                        return int(lv["osd_id"])
+                    except (TypeError, ValueError):
+                        continue
     dev_by_id, _ = osd_used_devices(cfg)
     for i, d in (dev_by_id or {}).items():
         if d and _dev_key(d) == key:
@@ -891,6 +962,50 @@ def device_owner(cfg, dev):
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def replace_prereq(cfg, oid, dev=None):
+    """换盘 zap 之前的硬门禁。三项前提缺一不可，否则编号一定会被改成新的。
+
+    1. 原编号已是 destroyed：--replace 的移除队列真正走完，OSDSpec 才会认领它；
+    2. 存在 managed 的 OSDSpec：否则 zap 之后根本没有人来重建；
+    3. 目标盘不属于别的编号，osdmap 里也没有新冒出来、从未上线的编号。
+
+    这里的每一项都能从只读命令回读，不依赖「等一会儿应该就好了」的猜测。
+    """
+    oid = int(oid)
+    blockers = []
+    info = {"ok": False, "destroyed": False, "specManaged": False,
+            "owner": None, "newOsds": [], "blockers": blockers}
+    flags, err = osd_map_flags(cfg)
+    if flags is None:
+        blockers.append("读不到 ceph osd dump，无法确认原编号状态：" + err)
+        return info
+    states = flags.get(oid) or []
+    info["destroyed"] = "destroyed" in states
+    if not info["destroyed"]:
+        blockers.append(
+            "osd.%d 还不是 destroyed（当前 state=%s）。ceph orch osd rm %d --replace "
+            "是异步的，必须等移除队列真正把编号释放掉，OSDSpec 才会复用它；现在 zap "
+            "新盘只会被当成一块全新的盘、分配一个新编号。"
+            % (oid, "/".join(states) if states else "编号不在 osdmap", oid))
+    spec_ok, spec_msg = osdspec_managed(cfg)
+    info["specManaged"] = spec_ok
+    if not spec_ok:
+        blockers.append(spec_msg)
+    owner = device_owner(cfg, dev)
+    info["owner"] = owner
+    if owner is not None and owner != oid:
+        blockers.append("%s 当前属于 osd.%d（不是 osd.%d），zap 会抹掉别的 OSD 的盘"
+                        % (dev or "<新盘>", owner, oid))
+    new_ids = sorted(i for i, st in flags.items() if i != oid and "new" in st)
+    info["newOsds"] = new_ids
+    if new_ids:
+        blockers.append("osdmap 里已经有从未上线的新编号 %s：说明之前的操作已经把"
+                        "换盘变成了「新增磁盘」，请先清理这些多余记录再继续"
+                        % "、".join("osd.%d" % i for i in new_ids))
+    info["ok"] = not blockers
+    return info
 
 
 def check_replace(cfg, oid, dev=None):
@@ -918,6 +1033,23 @@ def check_replace(cfg, oid, dev=None):
             % (dev, owner, oid,
                ("down/out" if st and not st["up"] and not st["in"] else "仍在 osdmap"),
                oid, oid))
+        return base
+    # 旧 OSD 的 metadata 可能还在把新盘报给原编号，于是 owner 看起来「没变」，
+    # 但 osdmap 里其实已经多了一个从未上线的新 OSD（state 含 new）。这种现场
+    # 不能当成「启动慢」——等再久原编号也不会自己回来，必须明确报编号没复用。
+    flags, _ = osd_map_flags(cfg)
+    orphans = sorted(i for i, st in (flags or {}).items()
+                     if i != int(oid) and "new" in st)
+    reused = bool(st and st["up"] and st["in"])
+    if orphans and not reused:
+        base.update({"newOsd": orphans[0], "newOsds": orphans,
+                     "action": "cleanup"})
+        base["message"] = (
+            "集群里出现了从未上线的新编号 %s，而 osd.%d 并没有用原编号回来："
+            "这次换盘实际变成了「新增磁盘」。这不是 OSD 启动慢，等再久 osd.%d "
+            "也不会自己 up。请用 ceph osd tree / ceph orch ps 核对，清理多出的 OSD "
+            "记录、确认 --replace 的移除队列已把原编号标记为 destroyed 后再重试。"
+            % ("、".join("osd.%d" % i for i in orphans), oid, oid))
         return base
     if st is None:
         base.update({"pending": True, "action": "recheck"})
@@ -2376,10 +2508,12 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         cur = osd_upin_state(cfg, oid)
         dead = bool(cur) and not cur.get("up")
         weight = (cur or {}).get("weight") or 0.0
-        add("停止故障 OSD 守护进程", osd_daemon_cmd(probe, "stop", oid),
-            "盘已坏时这条可能直接失败，不影响后续；还在跑时必须先停，否则 out 会被心跳改回 up")
+        # cephadm 分支不要手工 `orch daemon stop`：官方 --replace 流程由编排器自己
+        # 停 daemon 并 purge，手工停会让移除队列卡在 "done, waiting for purge"，
+        # 原编号始终没被打成 destroyed，后面 zap 就变成分配新编号。
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
-            "先把 PG 从这块盘迁走；盘已彻底损坏时其他副本通常早已接管，该步幂等")
+            "先把 PG 从这块盘迁走；盘已彻底损坏时其他副本通常早已接管，该步幂等。"
+            "cephadm 的移除与停 daemon 由 ceph orch osd rm --replace 统一处理")
         if orch:
             if dead:
                 add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace", "--force"],
@@ -2393,19 +2527,28 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
                 "spec 不存在或 unmanaged=true 时 zap 之后不会重建，需先配置 spec")
             add("轮询移除进度", ["ceph", "orch", "osd", "rm", "status", "--format=json"],
                 "确认该 OSD 已离开移除队列（destroyed，且编号留作替换）")
+            add("确认原编号已释放为 destroyed（编号复用前提）",
+                ["ceph", "osd", "dump", "--format=json"],
+                "osds[] 里 osd.%d 的 state 必须含 destroyed；没有就说明 --replace 的"
+                "移除队列还没走完。点「继续执行」时平台会再次核验，未释放直接拒绝 zap" % oid)
             add("物理更换故障盘", None,
                 "现场操作：按盘位 / SN 换上同规格新盘；不要换盘位、不要改主机，否则编号无法沿用")
             add("确认新盘已被编排器识别", ["ceph", "orch", "device", "ls", str(host), "--format=json"],
                 "新盘应出现在 %s 的设备列表里（available 可能为 false，因为还带着旧签名）" % host)
             add("清理新盘残留签名（触发按原编号自动重建）",
                 ["ceph", "orch", "device", "zap", str(host), str(dev), "--force"],
-                "只作用于 %s；zap 后由 OSDSpec 自动部署，新盘复用 destroyed 的编号 osd.%d。"
-                "不要改用 ceph orch daemon add osd：那是命令式添加，会分配新编号，"
-                "把 1:1 换盘变成「新增一块盘」" % (dev, oid))
+                "只作用于 %s；执行前平台会确认 osd.%d 已是 destroyed、存在 managed "
+                "OSDSpec、且这块盘不属于别的编号，任一不满足就拒绝 zap。zap 后由 "
+                "OSDSpec 自动用 destroyed 的原编号 osd.%d 重建；绝不能改用 "
+                "ceph orch daemon add osd：那是命令式添加，会分配新编号" % (dev, oid, oid))
             add("等待编排器用原编号重建 OSD",
                 ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
                 "只读查看；cephadm 拉起容器常需几十秒，daemon 必须是 osd.%d 而不是新编号" % oid)
         else:
+            # 非 cephadm 部署没有编排器：按官方手工替换流程先停进程再摘盘，
+            # 编号由后面的 ceph-volume lvm create --osd-id 显式复用。
+            add("停止故障 OSD 守护进程", osd_daemon_cmd(probe, "stop", oid),
+                "包安装部署：先停进程，否则心跳会把 down 立刻改回 up")
             if purge:
                 add("移除 OSD 但留作替换（purge）", ["ceph", "osd", "purge", str(oid), "--yes-i-really-mean-it"],
                     "清掉 CRUSH 条目 / 认证 / osdmap 记录；编号 osd.%d 由下一步 --osd-id 强制复用" % oid)
@@ -2507,7 +2650,9 @@ def plan_strings(plan):
 TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止故障 OSD 守护进程",
                   "预检设备是否可加入集群", "预检设备是否未被占用",
                   "轮询移除进度", "确认新盘已被编排器识别",
-                  "确认 OSD 服务规约（编号复用的前提）", "等待编排器用原编号重建 OSD",
+                  "确认 OSD 服务规约（编号复用的前提）",
+                  "确认原编号已释放为 destroyed（编号复用前提）",
+                  "等待编排器用原编号重建 OSD",
                   # 建池：预检 / autoscale / 复核失败都不应中断（池可能已经建好）
                   "检查池名是否已被占用", "启用 PG 自动扩缩", "复核池配置")
 
@@ -3104,6 +3249,11 @@ class Handler(BaseHTTPRequestHandler):
                 others = "、".join("osd.%d" % i for i in owners)
                 return self._json({"error": "%s 当前被 %s 使用，不能当作新盘重建；"
                                             "请核对设备路径" % (dev, others)}, 400)
+        if intent == "replace" and allow and stage == "auto" and manual is not None:
+            return self._json({"error":
+                "一键换盘必须按 pre / post 两阶段执行：先提交 --replace 并等原编号"
+                "释放为 destroyed，现场换好盘后再继续 zap。一次请求跳过人工步骤"
+                "必然把新盘变成新增 OSD，已拒绝"}, 409)
         if intent == "replace" and allow and stage == "post":
             # cephadm 的 --replace 会在新盘出现后由 OSDSpec 自动重建：这时再 zap
             # 会把刚建好的 OSD 抹掉。但「原编号 up/in」不足以证明重建完成——
@@ -3134,7 +3284,37 @@ class Handler(BaseHTTPRequestHandler):
                     "为避免误 zap 正在使用的盘，post 阶段已暂停。"
                     "请执行 ceph orch osd rm status 与 ceph osd metadata %d 确认后重试"
                     % (oid, dev or "<新盘>", oid)}, 409)
+            # 编号复用的硬门禁：--replace 只是「预约」，真正能被 OSDSpec 认领的
+            # 前提是 osd.<id> 已被打成 destroyed。现场实测：移除队列卡在
+            # "done, waiting for purge" 时原编号仍是 exists，此时 zap 新盘，
+            # cephadm 就会分配一个新编号 —— 这正是用户看到的「新增 OSD」。
+            # 只对 cephadm 生效：包安装部署靠 ceph-volume --osd-id 显式复用编号，
+            # 不需要 destroyed 标记，也没有 OSDSpec 这个概念。
+            if self.probe.caps.get("orch"):
+                pre_ok = replace_prereq(self.cfg, oid, dev)
+                if not pre_ok["ok"]:
+                    audit("OSD_REPLACE", "osd.%d" % oid, "-", "BLOCKED",
+                          "编号复用前提不满足，拒绝 zap：" + "；".join(pre_ok["blockers"]),
+                          self._client(), self._user())
+                    return self._json({"error":
+                        "已阻止 zap：编号复用前提不满足，继续操作会把新盘变成一块新增 OSD。\n"
+                        + "\n".join("· " + b for b in pre_ok["blockers"])
+                        + "\n排查：ceph orch osd rm status / ceph osd dump 确认 osd.%d 的 "
+                          "state 已含 destroyed 后再点「继续执行」。若队列里有别的 OSD "
+                          "卡在 draining，先 ceph orch osd rm stop <id> 清掉，再重新执行 "
+                          "ceph orch osd rm %d --replace --force。" % (oid, oid),
+                        "prereq": pre_ok}, 409)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
+        prereq = None
+        if intent == "replace" and not dry and self.probe.caps.get("orch"):
+            if stage == "pre":
+                # --replace 是异步的：给编排器一点时间把原编号打成 destroyed。
+                # 这里不判死（可能只是慢），post 阶段 zap 之前会重新核验。
+                for _ in range(REPLACE_DESTROY_TRIES):
+                    if osd_destroyed(self.cfg, oid):
+                        break
+                    time.sleep(REPLACE_DESTROY_INTERVAL)
+            prereq = replace_prereq(self.cfg, oid, dev)
         verify = None
         if intent == "downout" and not dry:
             # 命令返回码为 0 不等于 down 真的生效（心跳会把标记改回 up），
@@ -3161,12 +3341,16 @@ class Handler(BaseHTTPRequestHandler):
               "DRY-RUN" if dry else "EXECUTED",
               "remote=%s ceph=%s stage=%s" % (self._client(), self.probe.version, stage),
               self._client(), self._user())
+        manual_note = (manual[2] or "") if manual else ""
+        if manual and prereq and not prereq["ok"]:
+            manual_note += ("｜编号复用前提未满足，现场换盘后点「继续执行」会被拒绝："
+                            + "；".join(prereq["blockers"]))
         return self._json({"ok": True, "commands": commands, "results": results,
-                           "target": target, "verify": verify,
+                           "target": target, "verify": verify, "prereq": prereq,
                            "dry_run": dry, "version": self.probe.version,
                            "orchestrator": self.probe.orchestrator,
                            "stage": stage, "pause": pause, "pending_commands": pending,
-                           "manual_step": ({"name": manual[0], "note": manual[2] or ""}
+                           "manual_step": ({"name": manual[0], "note": manual_note}
                                            if manual else None)})
 
     def _pool_create(self, body):

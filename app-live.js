@@ -459,6 +459,13 @@ function quickPaintModal(){
   if(q.phase==='paused'){
    b+='<div class="warnbox" style="margin-top:12px">'+ic('wrench')+'<div><b>请现场更换磁盘</b>：按 SN <span class="mono">'+esc(q.serial||'-')+'</span> 与盘位把 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 换成新盘（新盘装回<b>原盘位</b>，编号才能沿用）。'+
     '平台已暂停，后续 '+q.pending.length+' 条命令（清理新盘签名 / 用原编号重建 / 复核 up·in）将在确认后继续下发。</div></div>';
+   if(q.prereq&&q.prereq.ok===false){
+    b+='<div class="dangerbox" style="margin-top:10px">'+ic('alert')+'<div><b>编号复用前提尚未满足，先别急着继续</b><br>'+
+     (q.prereq.blockers||[]).map(function(x){return '· '+esc(x);}).join('<br>')+
+     '<br>点「继续执行」时平台会重新只读核验：原编号仍不是 <span class="mono">destroyed</span> 就拒绝 zap，'+
+     '否则新盘会被分配成新的 OSD 编号。先用 <span class="mono">ceph orch osd rm status</span> / '+
+     '<span class="mono">ceph osd dump</span> 确认移除队列走完再继续。</div></div>';
+   }
    foot='<div class="sp"></div><button class="btn" data-act="q-abort">中止流程</button>'+
     '<button class="btn pri" data-act="q-resume">'+ic('check',14)+' 磁盘已换好，继续执行</button>';
   }else foot='<div class="sp"></div><button class="btn dan" data-act="q-abort">中止</button>';
@@ -601,6 +608,7 @@ function quickExec(stage){
  }
  req.then(function(r){
   if(!state.quick||state.quick!==q)return;
+  q.prereq=r.prereq||null;
   var cmds=r.commands||[],res=r.results||[],i=0;
   qLog('c','✓ 后端返回 '+cmds.length+' 条命令（dry_run='+!!r.dry_run+'）');
   function step(){

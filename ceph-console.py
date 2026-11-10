@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -506,12 +506,15 @@ def _dev_path(d):
 def osd_device_map(cfg, want=None):
     """OSD id -> 真实设备 / 主机 / 序列号。
 
-    来源按可靠性排序，前面的补上了就不再被后面的覆盖：
-      1. ceph-volume lvm list   —— 唯一按 osd id 精确对应 LVM 设备的来源
-      2. ceph device ls         —— 13.x+ 的 devicehealth，能顺带给 SN
-      3. ceph osd metadata <id> —— 前两者都缺失时逐个补（限制数量，避免拖慢）
+    设备名以 `ceph osd metadata <id>` 的 bluestore_bdev 为准——它是唯一
+    “按 osd 查自己那块盘”的来源。ceph-volume lvm list 仅在覆盖全部 OSD 且
+    无重复时作为快路径直接采信；否则逐个用 metadata 核对覆盖。
+    `ceph device ls` 只用来补仍然缺失的设备与序列号，且只采信“一个设备只挂
+    一个 OSD”的记录：NVMe 的 nvme0n2 / nvme0n3 共用一个 nvme0n1 控制器，
+    device ls 会把多个 daemon 挂在 nvme0n1 名下，直接采信就会出现“所有 OSD
+    都叫 /dev/nvme0n1”。
 
-    任何一个来源拿不到就留空，前端显示“未采集”，绝不把同一块盘复制给多个 OSD。
+    任何一个来源都拿不到就留空，前端显示“未采集”，绝不把同一块盘复制给多个 OSD。
     """
     dev_by_id, host_by_id, serial_by_id = {}, {}, {}
     if cfg.backend == "rest":
@@ -555,7 +558,51 @@ def osd_device_map(cfg, want=None):
             if dev:
                 dev_by_id.setdefault(oid, dev)
 
-    # 2) ceph device ls：location 在版本间可能是 dict 或 list，daemons/osd_ids 都要认。
+    # 同一设备被分给多个 OSD，说明这个来源给的是“控制器 / 整盘”级别的聚合。
+    # NVMe 的 nvme0n2、nvme0n3 是 nvme0n1 控制器的 namespace，ceph device ls
+    # 常把它们报成同一个 /dev/nvme0n1 —— 这种值必须丢弃，不能套给多个 OSD。
+    def _dup_ids(mapping):
+        seen, bad = {}, set()
+        for oid in sorted(mapping):
+            dev = mapping[oid]
+            if dev in seen:
+                bad.add(oid)
+                bad.add(seen[dev])
+            else:
+                seen[dev] = oid
+        return bad
+
+    def _purge_dupes(mapping):
+        for oid in _dup_ids(mapping):
+            mapping.pop(oid, None)
+
+    # lvm list 只有“覆盖全部 OSD 且没有重复”时才算可信快路径；否则交给
+    # metadata 逐个核对（raw 部署下 lvm list 是空的，这里一定为 False）。
+    lvm_ok = bool(ids) and all(i in dev_by_id for i in ids) and not _dup_ids(dev_by_id)
+
+    # 2) ceph osd metadata <id>：唯一“按 osd 查自身设备”的来源，结果覆盖前一步。
+    #    cephadm 默认 raw 部署下 lvm list 为空、device ls 只看到控制器，
+    #    只有 metadata 的 bluestore_bdev 能给出 nvme0n2 / nvme0n3。
+    if not lvm_ok and ids and len(ids) <= 64:
+        for oid in ids:
+            meta, _ = ceph_json(cfg, ["osd", "metadata", str(oid)], timeout=5)
+            if not isinstance(meta, dict):
+                continue
+            raw = meta.get("bluestore_bdev") or meta.get("devices") or ""
+            if isinstance(raw, list):
+                raw = raw[0] if raw else ""
+            dev = _dev_path(raw)
+            if dev:
+                dev_by_id[oid] = dev
+            host = meta.get("hostname") or ""
+            if host:
+                host_by_id.setdefault(oid, host)
+
+    # metadata 也拿不到时，清掉前面来源里的重复项（宁可未采集，不给错设备）。
+    _purge_dupes(dev_by_id)
+
+    # 3) ceph device ls：只补仍然缺设备的 OSD，并且只信任“一个设备只挂一个 OSD”
+    #    的记录；多 daemon 的记录是控制器级聚合，用它会重现“所有盘都叫 nvme0n1”。
     doc, _ = ceph_json(cfg, ["device", "ls"])
     items = doc if isinstance(doc, list) else (
         (doc.get("devices") or []) if isinstance(doc, dict) else [])
@@ -582,26 +629,17 @@ def osd_device_map(cfg, want=None):
                 except (TypeError, ValueError):
                     pass
             for oid in oids:
-                if dev:
-                    dev_by_id.setdefault(oid, dev)
+                if dev and oid not in dev_by_id and len(oids) == 1:
+                    dev_by_id[oid] = dev
                 if host:
                     host_by_id.setdefault(oid, host)
-                if sn:
+                # SN 只在该设备确实属于这个 OSD 时才采纳，避免把控制器的
+                # 序列号复制给挂在它上面的多个 namespace。
+                if sn and (dev_by_id.get(oid) == dev or len(oids) == 1):
                     serial_by_id.setdefault(oid, sn)
 
-    # 3) metadata 兜底：只补仍缺设备的 OSD，且总数受控（大量 OSD 时不逐个调用）。
-    todo = [i for i in ids if i not in dev_by_id]
-    if todo and len(ids) <= 64:
-        for oid in todo:
-            meta, _ = ceph_json(cfg, ["osd", "metadata", str(oid)], timeout=8)
-            if not isinstance(meta, dict):
-                continue
-            dev = _dev_path(meta.get("bluestore_bdev") or meta.get("devices") or "")
-            if dev:
-                dev_by_id.setdefault(oid, dev)
-            host = meta.get("hostname") or ""
-            if host:
-                host_by_id.setdefault(oid, host)
+    # 最后再过一遍：任何重复都清空，宁可显示“未采集”也不给错设备名。
+    _purge_dupes(dev_by_id)
     return dev_by_id, host_by_id, serial_by_id
 
 

@@ -81,7 +81,8 @@
 | OSD 列表的成员（哪些 OSD 会出现） | `ceph osd dump` 的 `osds[]` ∪ `ceph osd df` ∪ `ceph osd tree`，三源并集——新加的 OSD 往往先出现在 dump / tree，最后才进 df | 至少 `ceph osd tree` 能列出即显示 |
 | OSD：容量、使用率、PG 数 | `ceph osd df`（按 osd id 匹配） | `—` |
 | OSD：up / in 状态 | `ceph osd dump` 的 `osds[].up` / `osds[].in`（失败时回落 `ceph osd tree` 的 `status` / `reweight`） | `—` |
-| OSD：设备名与序列号 | `ceph-volume lvm list` → `ceph device ls` → `ceph osd metadata`，按 osd id 精确映射（不会把一个设备套给多个 OSD） | `未采集` |
+| OSD：设备名 | `ceph osd metadata <id>` 的 `bluestore_bdev`（**唯一按 osd 查自身设备**的来源，cephadm raw 部署下只有它能看到 nvme namespace）→ `ceph-volume lvm list`（LVM 部署）→ `ceph device ls`（仅采信一对一记录）。同一设备被多个 OSD 引用时整组作废、改用 metadata 核对 | `未采集` |
+| OSD：序列号 | `ceph device ls` 的 `device_id`，仅当设备名与该 OSD 匹配时采纳（不会把控制器的 SN 复制给多个 namespace） | `未采集` |
 | OSD：SMART | 需要 cephadm / Prometheus 侧盘健康指标，控制台**不伪造 OK** | `未采集` |
 | 主机：CPU / 内存 | 需要 node_exporter，控制台不采集 | `未采集` |
 | 变更审计 | `/var/log/ceph-console/audit.jsonl` | 空列表 |
@@ -513,10 +514,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 
 ```bash
 grep -c 'function noDataPage' /opt/ceph-console/app-core.js   # 1.0.6+ = 1，旧版 = 0
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.2-20261110'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.3-20261110'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.2-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，当前最新为 `1.1.3-20261110`；登录页底部也显示同一个号。若仍是旧号或不显示，说明浏览器 / nginx 缓存了旧文件，Ctrl+F5 强制刷新后再看。
 
 同步只覆盖运行文件，不动 `/etc/ceph-console/` 下的 `users.json`、`config.json`、`env`，因此**登录密码、API token、审计日志都保留**；服务重启后会话失效，需重新登录一次。
 
@@ -565,7 +566,7 @@ journalctl -u ceph-console -n 50 --no-pager
 ## 常见问题
 
 **Q：登录 admin 后看到的还是旧数据 / 空页面？**
-1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.2-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
+1. **看构建号**：设置页「关于 → 前端构建」或登录页底部，最新应为 `1.1.3-20261110`。不是这个号（或没有这一行）说明**运行目录还是旧文件**——`git pull` 不会自动更新 `/opt/ceph-console`，按 [升级已部署实例](#升级已部署实例) 同步、重启服务，再 Ctrl+F5 强制刷新。
 2. **构建号正确但页面空白**：属于[登录后没有真实数据](#登录后没有真实数据)，点「运行后端自检」看 `ceph status` 的真实报错，不是模式问题。
 3. 分离部署时确认 URL 的 `?api=` 参数或登录页填写的后端地址正确，且 `--cors-origin` 放行前端来源。
 
@@ -588,6 +589,14 @@ ceph orch ps --daemon-type osd                   # cephadm：daemon 是否还在
 ```
 
 三种情况：① `osd dump` 里没有 → 还没创建成功，看 `ceph-volume` / `ceph orch` 的报错；② 只在 `osd tree` 里、`dump` 没有 → MON 尚未接受，通常是 OSD 启动失败；③ 三个都有但页面还是旧的 → 后端 `/api/state` 有 20 秒缓存，等一个刷新周期或重新登录即可。
+
+**Q：OSD 列表里所有盘都显示同一个设备名（比如都是 `/dev/nvme0n1`）？**
+说明设备映射退化成了「控制器级」记录。`ceph device ls` 会把同一 NVMe 控制器（`nvme0n1`）下的多个 namespace（`nvme0n2`、`nvme0n3`）报成同一个 device，并把多个 daemon 挂在它名下。控制台现在以 `ceph osd metadata <id>` 的 `bluestore_bdev` 为准，并且当 `ceph device ls` 的记录被多个 OSD 引用时整组丢弃、改用 metadata 核对。如果升级后仍然重复，检查两点：后端进程的 keyring 是否有 `osd 'allow r'`（读不到 metadata 就会退回旧来源）；OSD 数是否超过 64（超过时会跳过逐个核对以避免拖慢）。核对命令：
+
+```bash
+ceph osd metadata 0 --format=json | grep -E 'bluestore_bdev|devices'
+ceph-volume lvm list --format=json | head -20    # LVM 部署才有内容
+```
 
 **Q：踢完盘后 OSD 一直显示 out，怎么恢复？**
 维护结束后在 OSD 列表点该行的 **IN** 按钮（或概览页的「一键 IN 盘」），等价于 `ceph osd in <id>`，会恢复 CRUSH 权重并开始回填。注意 IN 只能让 OSD 重新参与数据分布；如果进程本身起不来（`down`），需要先修硬件 / 重启 OSD 服务。

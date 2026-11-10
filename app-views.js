@@ -15,7 +15,7 @@ function alertRow(a,compact){var cls=a.sev==='critical'?'c':a.sev==='warning'?'w
  /* 「核实中」：这一轮 health detail 里已经没有这条检查了，但还不能下结论 ——
     刚做过 OUT/IN 的观察期内，或距最后一次出现不足 60 秒。状态保持原样，
     确认后才变「已恢复」，避免一次操作把无关告警整屏刷绿。 */
- var pend=(a.status==='active'&&a.pending)?'<span class="tag warn" title="Ceph 这一轮已不再报这条健康检查，但仍在观察期（写操作后 3 分钟，或距最后一次出现不足 60 秒）。确认后面会自动变成「已恢复」。">核实中'+(a.hold?' '+a.hold+'s':'')+'</span>':'';
+ var pend=(a.status==='active'&&a.pending)?'<span class="tag warn" title="Ceph 这一轮已不再报这条健康检查，但仍在观察期（写操作后 3 分钟，或距最后一次出现不足 60 秒）。确认后会自动变成「已恢复」。">核实中'+(a.hold?' '+a.hold+'s':'')+'</span>':'';
  var who=(a.by&&(a.status==='acked'||a.status==='silenced'))?'<span title="处置状态保存在后端，刷新和换浏览器都不会丢">'+esc(a.by)+' '+(a.status==='acked'?'已确认':'已静音')+'</span>':'';
  var where=alertAssets(a);
  return '<div class="alert-i"><div class="alert-ic '+cls+'">'+ic(a.sev==='info'?'info':'alert')+'</div><div style="flex:1;min-width:0"><div class="alert-tt">'+sevTag(a.sev)+esc(a.title)+stTag(a.status)+pend+'</div>'+

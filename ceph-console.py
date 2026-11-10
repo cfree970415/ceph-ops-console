@@ -1211,6 +1211,8 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             raise ValueError("device path is required for a new disk")
         if host and not HOST_RE.match(str(host)):
             raise ValueError("invalid host")
+        if probe.caps.get("orch") and not host:
+            raise ValueError("host is required for cephadm: ceph orch daemon add osd <host>:<dev>")
         if ".." in dev or not DEV_RE.match(str(dev)):
             raise ValueError("invalid device path")
     else:

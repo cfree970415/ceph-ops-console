@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -437,15 +437,35 @@ def read_cluster(cfg, probe):
             if any(k in name for k in ("backfill", "recover", "remapped")):
                 pg_backfill += count
     # MON / MGR detail: real names, ranks and quorum — never "mon.a / b / c".
-    quorum = _g(monmap, "quorum") or []
+    # quorum 的位置随版本/部署形态不同：常见于 monmap.quorum，也有版本只放在
+    # 顶层 quorum / quorum_names（单 MON 集群尤其容易只给名字列表）。全部取不到
+    # 时再用 ceph quorum_status 兜底，避免把「一个在线的 MON」显示成 0/1。
+    quorum = _g(monmap, "quorum")
+    if quorum is None:
+        quorum = _g(doc, "quorum")
+    if quorum is None:
+        quorum = _g(doc, "quorum_names") or _g(monmap, "quorum_names")
+    if not isinstance(quorum, list):
+        quorum = []
+    if not quorum:
+        qdoc, _ = ceph_json(cfg, ["quorum_status"])
+        if isinstance(qdoc, dict):
+            q = qdoc.get("quorum")
+            if not isinstance(q, list):
+                q = qdoc.get("quorum_names")
+            if isinstance(q, list):
+                quorum = q
+    # quorum 里可能是 rank 列表 [0] 或名字列表 ["mon01"]，两种都要认。
+    quorum_by_name = bool(quorum) and isinstance(quorum[0], str)
     mon_list = []
     for m in (monmap.get("mons") or []):
         if not isinstance(m, dict):
             continue
         rank = m.get("rank", 0)
-        mon_list.append({"name": m.get("name", ""), "rank": rank,
+        name = m.get("name", "")
+        mon_list.append({"name": name, "rank": rank,
                          "addr": m.get("public_addr") or m.get("addr") or "",
-                         "inQuorum": rank in quorum})
+                         "inQuorum": (name in quorum) if quorum_by_name else (rank in quorum)})
     mon_leader = ""
     for m in sorted(mon_list, key=lambda x: x["rank"]):
         if m["inQuorum"]:

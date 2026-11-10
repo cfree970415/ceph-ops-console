@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.0.8-20261110';
+var UI_BUILD='1.0.9-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -65,7 +65,7 @@ var T=Date.now();
 var state={
  view:'overview',theme:'dark',mode:'live',apiBase:'',token:'',autoRefresh:true,lastRefresh:T,
  /* 没有任何内置集群数据：所有数值都来自后端 /api/state，未同步前显示诊断页。 */
- cluster:{name:'',fsid:'',version:'',codename:'',total:0,used:0,health:'UNKNOWN',mons:0,monInQuorum:0,
+ cluster:{name:'',fsid:'',version:'',codename:'',total:0,used:0,health:'UNKNOWN',mons:null,monInQuorum:null,
   osds:0,osdsUp:0,osdsIn:0,pools:0,pgs:0,iops:0,throughput:0,deploy:'',
   monList:[],monLeader:'',mgrActive:'',mgrStandbys:[],mgrAvailable:false,
   pgActiveClean:null,pgDegraded:null,pgBackfill:null,recoveringBytes:0,objects:0},

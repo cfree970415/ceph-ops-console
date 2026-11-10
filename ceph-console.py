@@ -20,6 +20,7 @@ import platform
 import re
 import shlex
 import shutil
+import socket
 import socketserver
 import ssl
 import subprocess
@@ -41,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.8"
+VERSION = "1.1.9"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -409,6 +410,181 @@ def _g(d, *keys):
     return d
 
 
+def _addr_str(d):
+    """public_addr 在不同版本里是字符串，也可能是 addrvec 结构。"""
+    if isinstance(d, str):
+        return d
+    if isinstance(d, dict):
+        vec = d.get("addrvec")
+        if isinstance(vec, list) and vec and isinstance(vec[0], dict):
+            return vec[0].get("addr") or ""
+    return ""
+
+
+def _quorum_names(raw_quorum, raw_names, mons):
+    """把 quorum（可能是 rank 列表，也可能是名字列表）归一成名字列表。
+
+    返回 None 表示这个来源没有仲裁信息；返回 [] 表示明确「没有仲裁」
+    （MON 没形成 quorum）。两者在页面上必须区分，不能都当成 0。
+    """
+    if isinstance(raw_names, list) and raw_names:
+        return [str(x) for x in raw_names]
+    if isinstance(raw_quorum, list):
+        if not raw_quorum:
+            return []
+        out = []
+        for x in raw_quorum:
+            if isinstance(x, str):
+                out.append(x)
+                continue
+            name = ""
+            for m in mons:
+                if m.get("rank") == x and m.get("name"):
+                    name = m["name"]
+                    break
+            out.append(name or str(x))
+        return out
+    return None
+
+
+def read_mons(cfg, doc=None):
+    """MON 成员 / 位次 / 是否在 quorum / leader，返回 (mon_list, quorum, leader)。
+
+    `ceph status` 的 monmap 从 Octopus 起只保留 num_mons，不再带 mons 数组，
+    照它取成员名永远是空（页面就显示「—」，主机角色也认不出 MON）。
+    真正带成员表的是 quorum_status 和 mon dump，status 只作最后兜底。
+    """
+    doc = doc if isinstance(doc, dict) else {}
+    monmap = doc.get("monmap") if isinstance(doc.get("monmap"), dict) else {}
+    mons = []
+    quorum = None
+    leader = ""
+    qdoc = None
+    qs, _ = ceph_json(cfg, ["quorum_status"])
+    if isinstance(qs, dict):
+        qdoc = qs
+        mp = qs.get("monmap") if isinstance(qs.get("monmap"), dict) else {}
+        mons = [m for m in (mp.get("mons") or []) if isinstance(m, dict)]
+        quorum = _quorum_names(qs.get("quorum"), qs.get("quorum_names"), mons)
+    if not mons:
+        md, _ = ceph_json(cfg, ["mon", "dump"])
+        if isinstance(md, dict):
+            mons = [m for m in (md.get("mons") or []) if isinstance(m, dict)]
+            if quorum is None:
+                quorum = _quorum_names(md.get("quorum"), md.get("quorum_names"), mons)
+    if not mons:
+        mons = [m for m in (monmap.get("mons") or []) if isinstance(m, dict)]
+    if quorum is None:
+        quorum = _quorum_names(monmap.get("quorum"),
+                               monmap.get("quorum_names") or doc.get("quorum_names"), mons)
+    if quorum is None:
+        quorum = _quorum_names(doc.get("quorum"), None, mons)
+    out = []
+    for m in mons:
+        name = m.get("name") or ""
+        if not name:
+            continue
+        out.append({"name": name, "rank": m.get("rank", 0),
+                    "addr": (_addr_str(m.get("public_addr")) or _addr_str(m.get("public_addrs"))
+                             or _addr_str(m.get("addr"))),
+                    # 仲裁信息完全拿不到时（老版本），只能按「在册即在线」显示，
+                    # 这种情况通常伴随 ceph 命令整体失败，不会走到这里。
+                    "inQuorum": (name in quorum) if quorum is not None else True})
+    out.sort(key=lambda x: (x["rank"], x["name"]))
+    if qdoc and qdoc.get("quorum_leader_name"):
+        leader = qdoc["quorum_leader_name"]
+    for m in out:
+        if leader:
+            break
+        if m["inQuorum"]:
+            leader = m["name"]
+    return out, quorum, leader
+
+
+def read_mgr(cfg, doc=None):
+    """MGR active / standby / 是否可用；status 里没给就用 mgr dump。"""
+    doc = doc if isinstance(doc, dict) else {}
+    mp = doc.get("mgrmap") if isinstance(doc.get("mgrmap"), dict) else {}
+    active = mp.get("active_name") or ""
+    standbys = [s.get("name") or "" for s in (mp.get("standbys") or []) if isinstance(s, dict)]
+    available = bool(mp.get("available", False))
+    if not active:
+        md, _ = ceph_json(cfg, ["mgr", "dump"])
+        if isinstance(md, dict):
+            active = md.get("active_name") or ""
+            if not standbys:
+                standbys = [s.get("name") or "" for s in (md.get("standbys") or [])
+                            if isinstance(s, dict)]
+            if md.get("available") is not None:
+                available = bool(md.get("available"))
+    return {"active": active, "standbys": [s for s in standbys if s], "available": available}
+
+
+_LOCAL_USAGE = {"ts": 0.0, "host": "", "ips": [], "cpu": None, "mem": None}
+
+
+def _cpu_times():
+    """(总时间, 空闲时间)，单位 jiffies，取自 /proc/stat 第一行。"""
+    with open("/proc/stat", "r") as f:
+        parts = f.readline().split()
+    vals = [int(x) for x in parts[1:] if x.isdigit()]
+    if len(vals) < 4:
+        raise ValueError("bad /proc/stat")
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return sum(vals), idle
+
+
+def local_usage(ttl=15):
+    """运行控制台这台机器的真实 CPU / 内存水位（/proc 采样，结果缓存 ttl 秒）。
+
+    没装 node_exporter 时这是唯一真实可得的来源；采样只覆盖控制台所在的
+    节点，其它节点保持空（页面显「未采集」），绝不拿 0 或演示值充数。
+    """
+    now = time.time()
+    if _LOCAL_USAGE["ts"] and now - _LOCAL_USAGE["ts"] < ttl:
+        return _LOCAL_USAGE
+    host = ""
+    ips = []
+    try:
+        host = socket.gethostname() or ""
+    except Exception:
+        host = ""
+    if host:
+        try:
+            ips = socket.gethostbyname_ex(host)[2]
+        except Exception:
+            ips = []
+    cpu = None
+    try:
+        t1, i1 = _cpu_times()
+        time.sleep(0.15)
+        t2, i2 = _cpu_times()
+        span = t2 - t1
+        if span > 0:
+            cpu = int(round(max(0.0, min(100.0, (1.0 - float(i2 - i1) / span) * 100.0))))
+    except Exception:
+        cpu = None
+    mem = None
+    try:
+        info = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                key, _, val = line.partition(":")
+                num = val.strip().split(" ")[0] if val.strip() else ""
+                if num.isdigit():
+                    info[key] = int(num)
+        total = info.get("MemTotal") or 0
+        avail = info.get("MemAvailable")
+        if avail is None:
+            avail = (info.get("MemFree") or 0) + (info.get("Buffers") or 0) + (info.get("Cached") or 0)
+        if total > 0:
+            mem = int(round(max(0.0, min(100.0, (1.0 - float(avail) / total) * 100.0))))
+    except Exception:
+        mem = None
+    _LOCAL_USAGE.update({"ts": now, "host": host, "ips": ips, "cpu": cpu, "mem": mem})
+    return _LOCAL_USAGE
+
+
 def read_cluster(cfg, probe):
     if cfg.backend == "rest":
         return rest_state(cfg)
@@ -439,52 +615,25 @@ def read_cluster(cfg, probe):
                 pg_bad += count
             if any(k in name for k in ("backfill", "recover", "remapped")):
                 pg_backfill += count
-    # MON / MGR detail: real names, ranks and quorum — never "mon.a / b / c".
-    # quorum 的位置随版本/部署形态不同：常见于 monmap.quorum，也有版本只放在
-    # 顶层 quorum / quorum_names（单 MON 集群尤其容易只给名字列表）。全部取不到
-    # 时再用 ceph quorum_status 兜底，避免把「一个在线的 MON」显示成 0/1。
-    quorum = _g(monmap, "quorum")
-    if quorum is None:
-        quorum = _g(doc, "quorum")
-    if quorum is None:
-        quorum = _g(doc, "quorum_names") or _g(monmap, "quorum_names")
-    if not isinstance(quorum, list):
-        quorum = []
-    if not quorum:
-        qdoc, _ = ceph_json(cfg, ["quorum_status"])
-        if isinstance(qdoc, dict):
-            q = qdoc.get("quorum")
-            if not isinstance(q, list):
-                q = qdoc.get("quorum_names")
-            if isinstance(q, list):
-                quorum = q
-    # quorum 里可能是 rank 列表 [0] 或名字列表 ["mon01"]，两种都要认。
-    quorum_by_name = bool(quorum) and isinstance(quorum[0], str)
-    mon_list = []
-    for m in (monmap.get("mons") or []):
-        if not isinstance(m, dict):
-            continue
-        rank = m.get("rank", 0)
-        name = m.get("name", "")
-        mon_list.append({"name": name, "rank": rank,
-                         "addr": m.get("public_addr") or m.get("addr") or "",
-                         "inQuorum": (name in quorum) if quorum_by_name else (rank in quorum)})
-    mon_leader = ""
-    for m in sorted(mon_list, key=lambda x: x["rank"]):
-        if m["inQuorum"]:
-            mon_leader = m["name"]
-            break
-    mgrmap = doc.get("mgrmap") or {}
-    mgr_active = mgrmap.get("active_name") or ""
-    mgr_standbys = [s.get("name", "") for s in (mgrmap.get("standbys") or [])
-                    if isinstance(s, dict)]
+    # MON / MGR：`ceph status` 的 monmap 在新版本只有 num_mons（没有 mons 数组），
+    # 个别版本 mgrmap 也不带 active_name —— 直接读 status 会把成员名、leader、
+    # MGR active 全显示成「—」。改由 quorum_status / mon dump / mgr dump 提供，
+    # status 仅兜底。
+    mon_list, quorum, mon_leader = read_mons(cfg, doc)
+    mon_in = len([m for m in mon_list if m["inQuorum"]])
+    if not mon_list:
+        mon_in = len(quorum or [])
+    mon_total = _g(monmap, "num_mons") or len(mon_list)
+    if mon_total < len(mon_list):
+        mon_total = len(mon_list)
+    mgr = read_mgr(cfg, doc)
     return {"health": health, "fsid": doc.get("fsid", ""),
             "version": probe.version, "codename": probe.codename,
             "osds": osds, "osdsUp": up, "osdsIn": inn,
-            "mons": _g(monmap, "num_mons") or len(monmap.get("mons", []) or []),
-            "monInQuorum": len(quorum), "monList": mon_list, "monLeader": mon_leader,
-            "mgrActive": mgr_active, "mgrStandbys": mgr_standbys,
-            "mgrAvailable": bool(mgrmap.get("available", False)),
+            "mons": mon_total, "monInQuorum": mon_in, "monList": mon_list,
+            "monLeader": mon_leader,
+            "mgrActive": mgr["active"], "mgrStandbys": mgr["standbys"],
+            "mgrAvailable": mgr["available"],
             "pgs": pgs, "pgActiveClean": pg_active_clean, "pgDegraded": pg_bad,
             "pgBackfill": pg_backfill,
             "recoveringBytes": _g(pgmap, "recovering_bytes_per_sec") or 0,
@@ -1253,21 +1402,66 @@ def read_hosts(cfg, cluster=None):
             if isinstance(h, dict):
                 addr_by_host[h.get("hostname") or h.get("name") or ""] = h.get("addr") or ""
     cl = cluster or {}
-    mon_names = set(m.get("name") for m in (cl.get("monList") or []) if m.get("inQuorum"))
-    mgr_name = cl.get("mgrActive") or ""
+    # 主机角色按「这台机器上有没有该守护进程」判断，不看是否在仲裁里：
+    # MON 掉出 quorum 仍然是 MON 主机。
+    mon_names = set(m.get("name") for m in (cl.get("monList") or []) if m.get("name"))
+    mgr_names = set(cl.get("mgrStandbys") or [])
+    if cl.get("mgrActive"):
+        mgr_names.add(cl["mgrActive"])
+    local = local_usage() if cfg.backend == "cli" else {"host": "", "ips": [], "cpu": None, "mem": None}
     out = []
+    # `ceph osd tree` 是扁平列表，children 里放的是 id 而不是对象 —— 不建索引
+    # 就数不到每个 host 下的 OSD，up 只能靠 children 个数冒充。
+    nodes_all = doc.get("nodes", []) if isinstance(doc, dict) else doc
+    by_id = {}
+    for n in (nodes_all or []):
+        if isinstance(n, dict) and n.get("id") is not None:
+            by_id[n["id"]] = n
+
+    def kids_of(n):
+        kids = []
+        for c in (n.get("children") or []):
+            if isinstance(c, dict):
+                kids.append(c)
+            elif c in by_id:
+                kids.append(by_id[c])
+        return kids
+
+    seen = set()
+
+    def is_local(name, ip):
+        """只有控制台所在节点能用 /proc 采到 CPU / 内存，别的节点留空。"""
+        lh = (local.get("host") or "").split(".")[0].lower()
+        if name and lh and name.split(".")[0].lower() == lh:
+            return True
+        return bool(ip) and ip in (local.get("ips") or [])
+
     def walk(nodes):
         for n in nodes or []:
             if not isinstance(n, dict):
                 continue
+            if id(n) in seen:
+                continue
+            seen.add(id(n))
             if n.get("type") == "host":
                 name = n.get("name", "")
-                kids = n.get("children", []) or []
-                out.append({"name": name, "ip": addr_by_host.get(name, ""),
-                            "mons": name in mon_names, "mgr": name == mgr_name,
-                            "osds": len(kids), "up": len(kids),
-                            "mem": None, "cpu": None, "ver": ""})
-            walk(n.get("children", []))
+                kids = [k for k in kids_of(n)
+                        if k.get("type") == "osd" or str(k.get("name", "")).startswith("osd.")]
+                total = len(kids) if kids else len(n.get("children") or [])
+                # osd tree 给的是每个 OSD 的 up/down；没有状态字段才退回「按在册计」。
+                if kids and all("status" in k for k in kids):
+                    up = len([k for k in kids if str(k.get("status", "")).lower() == "up"])
+                else:
+                    up = total
+                ip = addr_by_host.get(name, "")
+                mine = is_local(name, ip)
+                out.append({"name": name, "ip": ip,
+                            "mons": name in mon_names, "mgr": name in mgr_names,
+                            "osds": total, "up": up,
+                            "mem": local.get("mem") if mine else None,
+                            "cpu": local.get("cpu") if mine else None,
+                            "ver": ""})
+            walk(kids_of(n))
     walk(doc.get("nodes", []) if isinstance(doc, dict) else doc)
     return out
 

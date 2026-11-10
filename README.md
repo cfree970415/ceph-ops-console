@@ -61,19 +61,19 @@
 | 界面 / 字段 | 数据来源 | 取不到时 |
 | --- | --- | --- |
 | 概览：健康、容量、OSD up/in、告警数 | `ceph status`（`health` / `osdmap` / `pgmap`）+ 告警规则 | 整页显示「集群数据未就绪」诊断页 |
-| 概览：PG 总数、active+clean、degraded、MON 法定人数、池数量 | `pgmap.num_pgs`、`pgmap.pgs_by_state`、`monmap.quorum`（缺失时回落顶层 `quorum` / `quorum_names`，再回落 `ceph quorum_status`）、`ceph osd pool ls detail` | `—` |
+| 概览：PG 总数、active+clean、degraded、MON 法定人数、池数量 | `pgmap.num_pgs`、`pgmap.pgs_by_state`、`ceph quorum_status`（缺失时回落 `ceph mon dump`，最后才用 `status.monmap`）、`ceph osd pool ls detail` | `—` |
 | 概览：容量趋势 / IOPS 趋势 | `/api/history`（后端每 60 秒真实采样，落盘 24h） | 「暂无真实历史数据」 |
 | 存储池：池清单 / 类型 / size / min_size / PG / 应用 | `ceph osd pool ls detail`（`pg_num`、`pgp_num`、`type`、`application_metadata` 都在这里；`ceph df detail` 的池条目**没有** PG 和 application 字段，只能补用量） | `—` / 「未采集」 |
 | 存储池：用量 / 水位 | `ceph df detail` 的 `stats.bytes_used` / `stats.max_avail`（物理口径，含副本冗余；逻辑写入见 `stats.stored`，表格悬停可见） | 「未采集」 |
 | 存储池：回填 PG、恢复速率、增长速率 | `pgmap` 实时 + 24h 采样 | `—` / 「累积中」 |
-| 主机：主机名、地址、MON/MGR 角色、leader | `ceph osd tree` + `ceph orch host ls` + `status.monmap` / `mgrmap` | `—` |
+| 主机：主机名、地址、MON/MGR 角色、leader、MGR active | `ceph osd tree`（按 `status` 统计 up）+ `ceph orch host ls` + `ceph quorum_status`（成员名 / 地址 / leader）+ `ceph mgr dump`（active / standby）。`ceph status` 的 `monmap` 从 Octopus 起只有 `num_mons`、没有 `mons` 数组，**不能**用来取成员名 | `—` |
 | OSD 列表的成员（哪些 OSD 会出现） | `ceph osd dump` 的 `osds[]` ∪ `ceph osd df` ∪ `ceph osd tree`，三源并集——新加的 OSD 往往先出现在 dump / tree，最后才进 df | 至少 `ceph osd tree` 能列出即显示 |
 | OSD：容量、使用率、PG 数 | `ceph osd df`（按 osd id 匹配） | `—` |
 | OSD：up / in 状态 | `ceph osd dump` 的 `osds[].up` / `osds[].in`（失败时回落 `ceph osd tree` 的 `status` / `reweight`） | `—` |
 | OSD：设备名 | `ceph osd metadata <id>` 的 `bluestore_bdev`（**唯一按 osd 查自身设备**的来源，cephadm raw 部署下只有它能看到 nvme namespace）→ `ceph-volume lvm list`（LVM 部署）→ `ceph device ls`（仅采信一对一记录）。同一设备被多个 OSD 引用时整组作废、改用 metadata 核对 | `未采集` |
 | OSD：序列号 | `ceph device ls` 的 `device_id`，仅当设备名与该 OSD 匹配时采纳（不会把控制器的 SN 复制给多个 namespace） | `未采集` |
 | OSD：SMART | 需要 cephadm / Prometheus 侧盘健康指标，控制台**不伪造 OK** | `未采集` |
-| 主机：CPU / 内存 | 需要 node_exporter，控制台不采集 | `未采集` |
+| 主机：CPU / 内存 | 控制台所在节点读 `/proc/stat`、`/proc/meminfo`（15 秒采样，缓存后复用）；其它节点需要 node_exporter，控制台不伪造 | 非控制台节点 `未采集` |
 | 变更审计 | `/var/log/ceph-console/audit.jsonl` | 空列表 |
 | 告警阈值 nearfull / full | `/etc/ceph-console/config.json`（随 `/api/state` 下发） | 默认 85 / 95 |
 

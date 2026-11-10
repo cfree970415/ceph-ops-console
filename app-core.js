@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.7-20261110';
+var UI_BUILD='1.1.8-20261110';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -268,7 +268,9 @@ function render(){document.documentElement.setAttribute('data-theme',state.theme
  renderNav();renderTop();
  content.innerHTML=f();
  restoreForm(content,snap);}
-function pageH(t,s,right){return '<div class="page-h"><div><h2>'+t+'</h2><p>'+s+'</p></div><div class="btn-row">'+(right||'')+'</div></div>';}
+/* 页面头部只留标题与操作按钮：副标题属于装饰性文案，统一不再渲染。
+   第二参数保留在签名里只是为了不改动调用方。 */
+function pageH(t,s,right){return '<div class="page-h"><div><h2>'+t+'</h2></div><div class="btn-row">'+(right||'')+'</div></div>';}
 function card(title,body,right,noPad){return '<div class="card"><div class="card-h"><h3>'+title+'</h3><div class="sp"></div>'+(right||'')+'</div><div class="'+(noPad===false?'':'card-b')+'">'+body+'</div></div>';}
 
 /* ---- view: LIVE but no real backend data ---- */
@@ -329,16 +331,7 @@ function vOverview(){if(liveNoData())return noDataPage();
   {l:'OSD 状态',i:'disk',v:c.osdsUp+'<small>/ '+c.osds+'</small>',s:'<b class="tw">'+(c.osds-c.osdsUp)+' 个 down</b> · '+(c.osds-c.osdsIn)+' 个 out',bar:pct(c.osdsUp,c.osds),color:'var(--warn)'},
   {l:'活跃告警',i:'bell',v:String(active.length),s:'<b class="td">'+crit+' 严重</b> · '+(active.length-crit)+' 其他'}];
  var kh=K.map(function(k){return '<div class="card kpi"><div class="kpi-l">'+ic(k.i,14)+k.l+'</div><div class="kpi-v">'+k.v+'</div><div class="kpi-s">'+k.s+'</div>'+(k.bar!=null?'<div class="bar"><i style="width:'+k.bar+'%;background:'+k.color+'"></i></div>':'')+'</div>';}).join('');
- /* 副本数来自真实池配置，不再固定写 3；拿不到就不估算逻辑可用容量。
-    EC 池的 size 是 k+m（冗余比），不能和副本数混着取最大值。 */
- var poolRep=(function(){
-  var rep=state.pools.filter(function(p){return p.type==='replicated';});
-  var src=rep.length?rep:state.pools;
-  var xs=src.map(function(p){return p.size;}).filter(function(v){return typeof v==='number';});
-  return xs.length?Math.max.apply(null,xs):null;})();
- var repNote=poolRep?('原始容量 '+bytes(c.total)+' · 最大副本数 '+poolRep+'<br>逻辑可用约 '+bytes(Math.max(0,(c.total-c.used)/poolRep)))
-  :('原始容量 '+bytes(c.total)+' · 副本数未采集，不做逻辑容量估算');
- var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div><div style="margin-top:8px;color:var(--faint)">'+repNote+'</div></div></div>');
+ var donutCard=card('容量分布','<div class="donut-wrap">'+donut(up,'var(--accent)','已用')+'<div class="legend"><div><i style="background:var(--accent)"></i>已用 <b class="mono" style="float:right">'+bytes(c.used)+'</b></div><div><i style="background:var(--panel3)"></i>可用 <b class="mono" style="float:right">'+bytes(c.total-c.used)+'</b></div><div><i style="background:var(--warn)"></i>nearfull 阈值 <b class="mono" style="float:right">'+state.settings.nearfull+'%</b></div></div></div>');
  var live=true;
  /* 趋势只有一种数据来源：真实采样。优先后端 /api/history（每分钟落盘，
     能给出真实时间轴），其次本次会话的本地采样；不足 2 点就显示空态。 */
@@ -354,25 +347,23 @@ function vOverview(){if(liveNoData())return noDataPage();
  var capDelta=capV.length>=2?(capV[capV.length-1]-capV[0]):null;
  var histErr=(state.history&&state.history.unsupported)?'后端未提供 /api/history，请升级后端到 1.0.7+ 后重启服务':'';
  var waitTxt=histErr||'暂无真实历史数据（后端每 60 秒采样一次，至少 2 个点后绘制）';
- var srcTag=useHist?'<span class="tag info">后端真实采样 · 60s/点</span>':'<span class="tag info">本地真实采样 · 15s/点</span>';
  var trendTitle=useHist?'容量使用率（近 '+spanText(capSec)+' 真实历史）':'容量使用率（本地真实采样）';
  var trendSub=useHist
-  ?'当前 <b class="mono" style="color:var(--accent2)">'+capCur.toFixed(1)+'%</b> · 近 '+spanText(capSec)+' '+(capDelta>=0?'+':'')+capDelta.toFixed(2)+' pt · '+capV.length+' 个后端采样点'
-  :(histErr?esc(histErr):(capV.length?'已采集 <b class="mono">'+capV.length+'</b> 个本地样本 · 最近 '+spanText(capSec)+'，后端历史积累中':'等待后端历史数据'));
+  ?'当前 <b class="mono" style="color:var(--accent2)">'+capCur.toFixed(1)+'%</b> · 近 '+spanText(capSec)+' '+(capDelta>=0?'+':'')+capDelta.toFixed(2)+' pt'
+  :(histErr?esc(histErr):(capV.length?'近期 '+spanText(capSec):''));
  var trend=card(trendTitle,
   '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">'+trendSub+'</div>'+
   (capV.length>=2?spark(capV,'var(--accent)',true):chartEmpty(waitTxt))+
-  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+axisFromSpan(capSec)+'</div>',srcTag);
+  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+axisFromSpan(capSec)+'</div>');
  var iopsTxt=state.ioReal.iops?c.iops.toLocaleString():'—';
  var thrTxt=state.ioReal.thr?bytes(c.throughput)+'<small>/s</small>':'—';
- var ioSub=useHistIo?'最近 '+spanText(ioSec)+' · '+ioV.length+' 个后端采样点（每 60 秒）'
-  :(state.ioReal.iops?'本地采样 '+(ioV.length>=2?'最近 '+spanText(ioSec):'已采集 '+ioV.length+' 个点')+' · 后端历史积累中'
-    :'后端 /api/state 未返回 IOPS / 吞吐字段，无法绘制真实曲线');
+ var ioSub=useHistIo?'最近 '+spanText(ioSec)
+  :(state.ioReal.iops?(ioV.length>=2?'最近 '+spanText(ioSec):''):'');
  var io=card('集群 IO 性能',
   '<div class="grid g2" style="gap:10px;margin-bottom:14px"><div><div class="tiny">IOPS</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+iopsTxt+'</div></div><div><div class="tiny">吞吐</div><div class="kpi-v" style="font-size:21px;margin:2px 0">'+thrTxt+'</div></div></div>'+
   (ioV.length>=2?spark(ioV,'var(--info)',true):chartEmpty(waitTxt))+
   '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--faint)">'+axisFromSpan(ioSec)+'</div>'+
-  '<div class="note" style="margin-top:8px">'+ioSub+'</div>',srcTag);
+  (ioSub?'<div class="note" style="margin-top:8px">'+ioSub+'</div>':''));
  /* PG / MON 卡片全部来自后端真实字段；后端没给的（例如 REST 只读通道）
     显示 “—”，不再用 4084 / 12 / 6 之类的演示常量冒充。 */
  var pgAC=(typeof c.pgActiveClean==='number')?c.pgActiveClean.toLocaleString():'—';
@@ -388,7 +379,7 @@ function vOverview(){if(liveNoData())return noDataPage();
   '<div class="stat-line"><span>存储池</span><b class="mono">'+poolN+'</b></div>'+
   '<div class="stat-line"><span>部署方式</span><b class="mono tp">'+esc(c.deploy)+'</b></div>');
  var fq=faultOsd();
- var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>检测到待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'，可一键 <b>DOWN + OUT</b> 摘出（不退役，随时可 IN 恢复）。</div></div>'+
+ var quickOps=fq?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div>待处置磁盘 <b class="mono">osd.'+fq.id+'</b> @ '+esc(fq.host)+' '+esc(fq.dev)+'</div></div>'+
   '<div class="btn-row" style="margin-bottom:14px"><button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fq.id+'">'+ic('trash',14)+'一键踢盘</button>'+
   '<button class="qbtn lg" data-act="q-open" data-kind="init" data-id="'+fq.id+'">'+ic('zap',14)+'一键换盘</button>'+
   '<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+'查看告警页面</button></div><div class="hr"></div>':'';
@@ -404,6 +395,6 @@ function vOverview(){if(liveNoData())return noDataPage();
    recentList.length?recentList.map(function(a){return alertRow(a,true);}).join('')
     :'<div class="empty" style="padding:16px">'+ic('check',22)+'<div>当前没有活跃告警</div></div>',
    '<button class="btn sm" data-act="nav" data-view="alerts">查看全部 '+ic('arrow',12)+'</button>',false);
- var quick=card('快捷运维',quickOps+'<div class="note" style="margin-bottom:12px">磁盘故障处理推荐走「踢盘换盘向导」：自动完成版本适配、预检、二次确认、执行与回填观察。</div><div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
+ var quick=card('快捷运维',quickOps+'<div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
  return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="init">'+ic('zap',14)+' 一键换盘</button>')+
   noData+'<div class="grid g4" style="margin-bottom:14px">'+kh+'</div><div class="grid g21" style="margin-bottom:14px">'+trend+donutCard+'</div><div class="grid g2" style="margin-bottom:14px">'+io+pg+'</div><div class="grid g2">'+recent+quick+'</div>';}

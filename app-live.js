@@ -43,22 +43,18 @@ function renderAuth(){
  var a=state.auth,pw=a.tab==='password';
  var box='<div class="auth-wrap"><div class="auth-card">'+
   '<div class="auth-brand"><div class="brand-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 2c3.5 0 6 2.6 6 6.2v1.3c0 1.6.7 3.1 1.9 4.1 1.2 1 1.9 2.5 1.9 4.1 0 2.9-2.3 5.3-5.2 5.3H7.4C4.5 23 2.2 20.6 2.2 17.7c0-1.6.7-3.1 1.9-4.1A5.4 5.4 0 0 0 6 9.5V8.2C6 4.6 8.5 2 12 2z"/><path d="M12 2v6M6 12h12"/></svg></div>'+
-  '<div><div style="font-size:16px;font-weight:700">Ceph Ops Console</div><div class="tiny">多版本集群监控与磁盘运维 · 登录</div></div></div>'+
+  '<div><div style="font-size:16px;font-weight:700">Ceph Ops Console</div><div class="tiny">登录</div></div></div>'+
   '<div class="fgrp" style="margin-top:18px"><label class="fld">后端服务地址'+
    (backendBase()?' <span class="tag info">跨机连接</span>':' <span class="tag mute">同源</span>')+'</label>'+
-   '<input class="inp" id="auth-api" value="'+esc(backendBase())+'" placeholder="留空为同源；跨机填 http://后端IP:8780" autocomplete="off">'+
-   '<div class="hint">前端可独立部署在任意 Web 服务器，只要能访问后端 API 即可；地址会保存在本机浏览器。</div></div>'+
+   '<input class="inp" id="auth-api" value="'+esc(backendBase())+'" placeholder="留空为同源；跨机填 http://后端IP:8780" autocomplete="off"></div>'+
   '<div class="seg" style="margin-bottom:14px"><button class="'+(pw?'on acc':'')+'" data-act="auth-tab" data-value="password">账号密码</button>'+
    '<button class="'+(!pw?'on acc':'')+'" data-act="auth-tab" data-value="token">访问令牌</button></div>'+
   (pw?
    '<div class="fgrp"><label class="fld">用户名</label><input class="inp" id="auth-user" value="admin" autocomplete="username" placeholder="deploy.sh 创建的用户"></div>'+
    '<div class="fgrp"><label class="fld">密码</label><input class="inp" id="auth-pass" type="password" autocomplete="current-password" placeholder="初始密码见部署脚本输出"></div>':
-   '<div class="fgrp"><label class="fld">访问令牌（Service Token）</label><input class="inp" id="auth-token" type="password" placeholder="部署脚本生成的 X-Console-Token"><div class="hint">令牌保存在 0600 的 env 文件中；用它换取会话后不会出现在地址栏。</div></div>')+
+   '<div class="fgrp"><label class="fld">访问令牌（Service Token）</label><input class="inp" id="auth-token" type="password" placeholder="部署脚本生成的 X-Console-Token"></div>')+
   (a.error?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div>'+esc(a.error)+'</div></div>':'')+
   '<button class="btn pri" style="width:100%;padding:10px" data-act="auth-login" '+(a.busy?'disabled':'')+'>'+ic('lock',15)+' '+(a.busy?'正在连接…':'登录并连接集群')+'</button>'+
-  '<div class="hr"></div><div class="grid g2" style="gap:8px;font-size:11px;color:var(--faint)">'+
-   '<div>'+ic('shield',13)+' 会话 8 小时 · HttpOnly Cookie</div><div>'+ic('network',13)+' 支持前后端分离部署</div>'+
-   '<div>'+ic('db',13)+' 不影响 Ceph 原生 Dashboard</div><div>'+ic('terminal',13)+' 默认 DRY-RUN</div></div>'+
 
   '<div style="margin-top:10px;text-align:center;font-size:11px;color:var(--faint)">UI 构建 '+esc(UI_BUILD)+'</div>'+
   '</div></div>';
@@ -226,22 +222,6 @@ renderTop=function(){
 };
 
 /* ---------- isolation card (proves native dashboard is untouched) ---------- */
-function isolationCard(){
- var d=state.isolation,head='<span class="tag ok">不影响原生 Dashboard</span>';
- if(!d)return card('与 Ceph 原生 Dashboard 的隔离',
-  '<div class="note">登录后端后，此处会显示实时检查结果：原生 Dashboard 地址、端口占用、独立凭证与未改动项。'+
-  '本控制台使用独立进程、独立端口与独立 client keyring，不修改 <span class="code-inline">ceph.conf</span>、不改动 mgr 模块配置。</div>',head);
- var rows=(d.checks||[]).map(function(x){
-  return '<div class="stat-line"><span><span class="tag '+(x.status==='err'?'err':'ok')+'">'+(x.status==='err'?'冲突':'正常')+'</span> '+esc(x.item)+
-   '</span><span class="tm" style="max-width:62%;text-align:right">'+esc(x.detail)+'</span></div>';}).join('');
- return card('与 Ceph 原生 Dashboard 的隔离',
-  '<div class="stat-line"><span>原生 Dashboard</span><b class="mono">'+(d.native_dashboard&&d.native_dashboard.detected?esc(d.native_dashboard.url):'未探测到 / 使用 REST 地址')+'</b></div>'+
-  '<div class="stat-line"><span>本控制台</span><b class="mono tp">ceph-console : '+esc(d.port)+'</b></div>'+
-  '<div class="stat-line"><span>独立凭证</span><b class="mono mini">'+esc(d.dedicated_client)+'</b></div>'+
-  '<div class="hr"></div>'+rows+
-  '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>原生 Dashboard 继续按原地址和原账号使用；本控制台只是通过只读命令与独立 client 凭证观察集群。写操作同样经该凭证下发，不会修改 mgr dashboard 的任何配置。</div></div>',head);
-}
-
 /* ---------- one-click kick / replace one disk / add a disk / in ---------- */
 function quickTitle(k){
  return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':

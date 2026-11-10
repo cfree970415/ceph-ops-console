@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 CONF_PATH = "/etc/ceph-console/config.json"
 USERS_PATH = "/etc/ceph-console/users.json"
@@ -2401,6 +2401,9 @@ class Handler(BaseHTTPRequestHandler):
             placeholder = b"/*__BOOTSTRAP__*/ null"
             injection = json.dumps(boot, ensure_ascii=False).encode("utf-8")
             data = data.replace(placeholder, injection)
+            # 静态资源的 cache-bust 跟随后端版本：升级后浏览器必定重新拉取 JS，
+            # 不再依赖用户手动 Ctrl+F5，也避免「改了这个页面还是旧的」。
+            data = re.sub(rb"\?v=[A-Za-z0-9._-]+", b"?v=" + VERSION.encode(), data)
             ctype = "text/html; charset=utf-8"
         elif name.endswith(".js"):
             ctype = "application/javascript; charset=utf-8"

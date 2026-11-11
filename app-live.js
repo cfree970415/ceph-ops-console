@@ -10,6 +10,49 @@ state.link={apiBase:'',stateOk:false,stateError:'',stateHttp:0,stateAt:0,
 state.quick=null;
 state.isolation=null;
 
+/* ---------- state.quick 的唯一真相 ----------
+   现场事故（138，服务器重启后首次登录）：弹窗还开着、复选框也勾上了，
+   点「立即执行」却报「弹窗状态已丢失」——某个分支把 state.quick 静默清成
+   null，DOM 却留在页面上，用户对着一个僵尸弹窗填表、勾选，全部落空。
+   这类问题只靠读代码查不动，所以在这里做两件事：
+   1) 每次「有 -> 无」都在服务端日志留一条 reset（带调用栈行号），
+      下次再出现直接看日志就知道是谁清的；
+   2) 清空的同时把残留弹窗关掉，保证「状态没了，UI 也跟着没了」，
+      用户不会再对着点不动的弹窗浪费时间。 */
+(function(){
+ var q0=state.quick;
+ try{
+  Object.defineProperty(state,'quick',{
+   configurable:true,
+   get:function(){return q0;},
+   set:function(v){
+    var prev=q0;q0=v;
+    if(!prev||v)return;
+    var where='';
+    try{
+     var lines=String((new Error()).stack||'').split('\n');
+     for(var i=1;i<lines.length;i++){
+      var s=lines[i];
+      if(s.indexOf('set (')>=0||s.indexOf('defineProperty')>=0)continue;
+      where=s.replace(/^\s*at\s*/,'').replace(/https?:\/\/[^/]+\//,'').replace(/\?v=[\d.]+/,'').slice(0,120);
+      break;}
+    }catch(e){}
+    prev.clearedAt=Date.now();
+    /* 留一份「最后一次清空」的凭据：即使 quick 已经没了，q-run 报
+       no-state 时也能把「谁在什么时候清的」一起送到服务端日志。 */
+    state.quickLastReset={at:Date.now(),where:where||'unknown',kind:prev.kind||''};
+    try{if(typeof qTrace==='function')qTrace(prev,'reset',where||'unknown');}catch(e){}
+    /* 只清那些「正在操作中」的弹窗（有 q-run / 清单 / 输入框），
+       避免误关建池弹窗等别的模态。 */
+    try{
+     var m=document.querySelector('#modal-root .modal');
+     if(m&&m.querySelector('[data-act="q-run"],[data-bind^="quick."]')&&typeof closeModal==='function')closeModal();
+    }catch(e){}
+   }
+  });
+ }catch(e){}
+})();
+
 function authReset(){return {required:state.auth.required,authenticated:false,user:'',role:'viewer',
  allowWrite:false,readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false};}
 /* faultOsd() / backendBase() live in app-core.js so they exist before first render */
@@ -1189,8 +1232,14 @@ function quickAction(act,el){
       否则「点了没反应」只能靠猜。qTrace 同时写进 q.trace，
       弹窗底部的状态行会显示最近一次点击的结果。 */
    if(!q){
-    qTrace(null,'no-state','state.quick 为空（弹窗已被关闭或状态被重置）');
-    toast('弹窗状态已丢失，请关闭后重新打开','e');return;}
+    /* 走到这里说明弹窗和状态已经不一致了。与其留一个点不动的弹窗，
+       不如立刻关掉并说清原因，让用户重开一次就能干活。 */
+    var zombie=document.querySelector('#modal-root .modal');
+    var lr=state.quickLastReset;
+    qTrace(null,'no-state','state.quick 为空'+(zombie?'，但弹窗仍在 DOM 里（僵尸弹窗）':'')+
+     (lr?('；最后一次清空 '+new Date(lr.at).toLocaleTimeString()+' 来自 '+lr.where):'；本次会话没有记录到清空动作'));
+    if(zombie&&typeof closeModal==='function')closeModal();
+    toast('弹窗状态已失效（页面可能刚同步过），已关闭，请重新打开','e');return;}
    /* 幂等：一次点击可能被重复绑定 / 冒泡触发两次，写操作绝不能跑两遍
       （实测会连发两个 POST /api/quick/init，等于把盘初始化两次）。 */
    if(q.phase==='running'||q.phase==='paused'){

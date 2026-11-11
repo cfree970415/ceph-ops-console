@@ -337,7 +337,14 @@ function exportAudit(){var lines=state.audit.map(function(a){return JSON.stringi
 var NUMKEYS={nearfull:1,full:1,downMin:1,pgDegraded:1,slowOps:1,'wizard.osdId':1,
              'pool.size':1,'pool.minSize':1,'pool.pg':1,'pool.pgp':1};
 function setBind(path,val,el){var ks=path.split('.'),o=state;
- for(var i=0;i<ks.length-1;i++)o=o[ks[i]];var k=ks[ks.length-1];
+ for(var i=0;i<ks.length-1;i++){o=o[ks[i]];
+  if(!o||typeof o!=='object'){
+   /* 父级对象不存在：最典型的就是弹窗状态刚被清空、DOM 还留在页面上。
+      以前这里直接抛 TypeError（输入框的事件回调里没人接），表现为
+      「明明输入/勾选了，清单还是灰的」。宁可报一句，也不要静默丢输入。 */
+   if(ks[0]==='quick'&&typeof toast==='function')toast('弹窗状态已失效，请关闭后重新打开','e');
+   return;}}
+ var k=ks[ks.length-1];
  if(el&&el.type==='checkbox')o[k]=el.checked;
  else if(NUMKEYS[path]||NUMKEYS[k])o[k]=Number(val)||0;
  else o[k]=val;
@@ -520,12 +527,39 @@ function boot(){
    if(window.console&&console.error)console.error('[onAct] '+act,err);
    if(typeof toast==='function')toast('操作异常：'+((err&&err.message)||err),'e');}
  });
- document.addEventListener('input',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
-  /* 补填之后校验一旦通过，就把「还不能执行」红条与标红撤掉（不重绘，不打断输入） */
-  if(el&&String(el.getAttribute('data-bind')||'').indexOf('quick.')===0&&typeof qErrRefresh==='function')qErrRefresh();});
- document.addEventListener('change',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
-  /* 下拉框本身带 data-act（例如换盘时切换新盘设备）时也要触发动作 */
-  var a=e.target.closest('select[data-act]');if(a&&!a.disabled)onAct(a.getAttribute('data-act'),a);});
+ /* 事件源 -> 真正带 data-bind 的控件。
+    点 <label class="chk"> 里的文字时，不同浏览器给到的 target 可能是
+    label / span 而不是里面的 input；沿 label 再找一次，避免
+    「框勾上了、状态里还是 false」这种幽灵勾选。 */
+ function bindEl(e){
+  if(!e.target||!e.target.closest)return null;
+  var el=e.target.closest('[data-bind]');
+  if(el)return el;
+  var lab=e.target.closest('label');
+  return lab?lab.querySelector('input[data-bind],select[data-bind],textarea[data-bind]'):null;}
+ document.addEventListener('input',function(e){
+  state.lastInputAt=Date.now();
+  try{
+   var el=bindEl(e);
+   if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
+   /* 补填之后校验一旦通过，就把「还不能执行」红条与标红撤掉（不重绘，不打断输入） */
+   if(el&&String(el.getAttribute('data-bind')||'').indexOf('quick.')===0&&typeof qErrRefresh==='function')qErrRefresh();
+  }catch(err){
+   if(window.console&&console.error)console.error('[input] 写状态失败',err);
+   if(typeof toast==='function')toast('输入没有生效：'+((err&&err.message)||err),'e');}
+ });
+ document.addEventListener('change',function(e){
+  state.lastInputAt=Date.now();
+  try{
+   var el=bindEl(e);
+   if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
+   if(el&&String(el.getAttribute('data-bind')||'').indexOf('quick.')===0&&typeof qErrRefresh==='function')qErrRefresh();
+   /* 下拉框本身带 data-act（例如换盘时切换新盘设备）时也要触发动作 */
+   var a=e.target.closest('select[data-act]');if(a&&!a.disabled)onAct(a.getAttribute('data-act'),a);
+  }catch(err){
+   if(window.console&&console.error)console.error('[change] 写状态失败',err);
+   if(typeof toast==='function')toast('输入没有生效：'+((err&&err.message)||err),'e');}
+ });
  if(typeof liveBoot==='function'){liveBoot();return;}
  render();
  if(state.mode==='live')syncState();

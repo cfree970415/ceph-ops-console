@@ -306,7 +306,7 @@ function wApplyResult(){var w=state.wizard;if(w.aborted)return;
  state.lastRefresh=Date.now();}
 
 /* ---------- small actions ---------- */
-function addAudit(act,target,cmd,note){state.audit.unshift({id:uid(),ts:Date.now(),user:state.auth.user||'console',act:act,target:target,cmd:cmd,result:state.settings.allowWrite?'OK':'DRY-RUN',note:note||''});}
+function addAudit(act,target,cmd,note){(state.audit=state.audit||[]).unshift({id:uid(),ts:Date.now(),user:state.auth.user||'console',act:act,target:target,cmd:cmd,result:state.settings.allowWrite?'OK':'DRY-RUN',note:note||''});}
 function osdMark(id,inn){
  var o=state.osds.filter(function(x){return x.id===Number(id);})[0];if(!o)return;
  var act=inn?'in':'out',cmd='ceph osd '+act+' '+o.id;
@@ -501,6 +501,9 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
 
 /* ---------- bootstrap ---------- */
 function boot(){
+ /* 幂等：boot 可能被 DOMContentLoaded 与脚本自身各调一次，重复注册监听
+    会让一次点击触发两遍动作（写操作就是两次下发）。 */
+ if(window.__ccBooted)return;window.__ccBooted=true;
  var b=window.__CEPH_BOOT__,q=new URLSearchParams(location.search),t=q.get('t');
  if(t){state.token=t;try{sessionStorage.setItem('cc_token',t);}catch(e){}
   try{var _api=q.get('api');history.replaceState({},'',location.pathname+(_api?'?api='+encodeURIComponent(_api):''));}catch(e){}}
@@ -510,7 +513,13 @@ function boot(){
  document.addEventListener('click',function(e){var el=e.target.closest('[data-act]');if(!el)return;
   var act=el.getAttribute('data-act');
   if(act==='overlay'){if(!e.target.closest('.modal'))onAct('overlay',el);return;}
-  if(el.disabled)return;onAct(act,el);});
+  if(el.disabled)return;
+  /* 任何动作抛异常都不能静默：那样用户看到的就是"点了没反应"。
+     异常照样打 console，同时用 toast 说明，便于现场反馈。 */
+  try{onAct(act,el);}catch(err){
+   if(window.console&&console.error)console.error('[onAct] '+act,err);
+   if(typeof toast==='function')toast('操作异常：'+((err&&err.message)||err),'e');}
+ });
  document.addEventListener('input',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
  document.addEventListener('change',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
   /* 下拉框本身带 data-act（例如换盘时切换新盘设备）时也要触发动作 */

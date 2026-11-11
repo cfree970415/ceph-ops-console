@@ -401,7 +401,7 @@ function quickOpenInit(o){
 }
 /* 换了新盘 / 改了设备路径 / 改了服务器：重新向后端要命令序列 */
 function replanQuick(q){
- q.phase='loading';q.phrase='';quickPaintModal();
+ q.phase='loading';q.phrase='';q.inputError='';quickPaintModal();
  return quickPlan(q.kind,q).then(function(steps){
   if(state.quick!==q)return;
   q.steps=steps;
@@ -411,9 +411,15 @@ function replanQuick(q){
   if(!state.settings.confirm){
    q.phrase=(isPhase(q.kind)||q.kind==='replace')?'osd.'+q.osdId:q.dev;
    q.confirmed=true;}
+  /* 用户在 loading 阶段就点了「立即执行」：命令一生成就接着跑，不等第二次点击。 */
+  if(q.pendingRun){
+   q.pendingRun=false;
+   quickExec((q.kind==='init'||isPhase(q.kind))?'auto':'pre');
+   return;}
   quickPaintModal();
  }).catch(function(e){
   if(state.quick!==q)return;
+  q.pendingRun=false;
   q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
 function qHead(){var q=state.quick;
@@ -428,7 +434,10 @@ function quickPaintModal(){
  var o=state.osds.filter(function(x){return x.id===q.osdId;})[0]||{},b='',foot='';
  if(q.phase==='loading'){
   b='<div class="empty">'+ic('refresh',34)+'<div>正在向后端请求该版本的命令序列…</div></div>';
-  foot='<div class="sp"></div><button class="btn" data-act="q-close">取消</button>';
+  /* 按钮照旧存在：点下去会记住意图，命令生成完自动开始。
+     以前这里只给「取消」，用户点到 footer 位置没任何反馈，看起来就是"点了没反应"。 */
+  foot='<div class="sp"></div><button class="btn" data-act="q-close">取消</button>'+
+   '<button class="btn pri" data-act="q-run">'+ic('zap',14)+' 立即执行（等命令生成完自动开始）</button>';
  }else if(q.phase==='error'){
   b='<div class="dangerbox">'+ic('alert')+'<div>'+esc(q.error)+'</div></div>'+
     '<div class="note" style="margin-top:12px">请确认已登录、后端为 CLI 通道且 /api/plan 可访问。</div>';
@@ -517,6 +526,8 @@ function quickPaintModal(){
      '<input class="inp mono" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="'+esc(q.dev)+'" autocomplete="off"></div>'+
      '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对盘位与设备名 <span class="mono">'+esc(q.dev)+'</span></span></label>';
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
+  /* 点「立即执行」没过校验时，把原因留在弹窗里；只弹 toast 会被忽略。 */
+  if(q.inputError)b+='<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div><b>还不能执行</b><br>'+esc(q.inputError)+'</div></div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
    '<button class="btn pri" data-act="q-run">'+ic(isRep?'wrench':'zap',14)+' '+
@@ -545,6 +556,8 @@ function quickPaintModal(){
     '<input class="inp" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="osd.'+q.osdId+'" autocomplete="off"></div>'+
     '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对物理盘位与 SN <span class="mono">'+esc(q.serial||'-')+'</span></span></label>';
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
+  /* 点「立即执行」没过校验时，把原因留在弹窗里；只弹 toast 会被忽略。 */
+  if(q.inputError)b+='<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div><b>还不能执行</b><br>'+esc(q.inputError)+'</div></div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
    (isIn?'':'<button class="btn" data-act="q-wizard" title="'+(isKick?'踢盘只做 down + out；需要彻底移除 OSD 时走完整退役向导（含 purge / 清盘）':'改用带自动预检的完整向导')+'">'+(isKick?'完整退役向导':'高级向导')+'</button>')+
@@ -1027,17 +1040,35 @@ function quickAction(act,el){
     });}return;
   case 'q-run':
    if(!q)return;
+   /* 幂等：一次点击可能被重复绑定 / 冒泡触发两次，写操作绝不能跑两遍
+      （实测会连发两个 POST /api/quick/init，等于把盘初始化两次）。 */
+   if(q.phase==='running'||q.phase==='paused')return;
+   /* 命令序列还在生成：记住意图，生成完自动开始，而不是把点击吞掉。 */
+   if(q.phase==='loading'){
+    q.pendingRun=true;toast('命令序列还在生成，生成完会自动开始','w');return;}
+   /* 校验失败必须留下痕迹：只弹 toast 太容易被忽略（尤其是弹窗盖住屏幕时），
+     同时在弹窗里写一条红字，并记住是哪一步没填。 */
+   var bad='';
    if(q.kind==='init'){
-    if(!q.dev){toast('请先选择或填写新盘设备','e');return;}
-    if(state.settings.confirm&&(q.phrase!==q.dev||!q.confirmed)){toast('请输入设备路径 '+q.dev+' 并勾选盘位确认','e');return;}
+    if(!q.dev)bad='请先填写或选择新盘设备路径（例如 /dev/nvme0n2）';
+    else if(!q.host)bad='请填写目标服务器（新盘插在哪台机器上）';
+    else if(state.settings.confirm&&!q.confirmed)bad='请在下方勾选「我已现场核对盘位与设备名」';
+    else if(state.settings.confirm&&q.phrase!==q.dev)bad='二次确认未通过：请在输入框里原样输入设备路径 '+q.dev;
    }else if(q.kind==='replace'||q.kind==='deploy'){
-    if(!q.dev){toast('请先选择或填写换上新盘的设备路径','e');return;}
-    if(!q.host){toast('请填写新盘所在的服务器','e');return;}
-    if(state.settings.confirm&&(q.phrase!=='osd.'+q.osdId||!q.confirmed)){toast('请输入 osd.'+q.osdId+' 并勾选确认（删除旧编号 / 新盘分配新编号）','e');return;}
+    if(!q.dev)bad='请先选择或填写换上新盘的设备路径';
+    else if(!q.host)bad='请填写新盘所在的服务器';
+    else if(state.settings.confirm&&!q.confirmed)bad='请在下方勾选确认';
+    else if(state.settings.confirm&&q.phrase!=='osd.'+q.osdId)bad='二次确认未通过：请输入 osd.'+q.osdId;
    }else if(q.kind==='retire'){
     /* ① 清退不需要选新盘；down 与否由后端执行前硬校验，这里只收确认短语。 */
-    if(state.settings.confirm&&(q.phrase!=='osd.'+q.osdId||!q.confirmed)){toast('请输入 osd.'+q.osdId+' 并勾选清退确认','e');return;}
-   }else if(q.phrase!=='osd.'+q.osdId||!q.confirmed){toast('请输入 osd.'+q.osdId+' 并勾选盘位确认','e');return;}
+    if(state.settings.confirm&&!q.confirmed)bad='请勾选清退确认（旧编号删除不可恢复）';
+    else if(state.settings.confirm&&q.phrase!=='osd.'+q.osdId)bad='二次确认未通过：请输入 osd.'+q.osdId;
+   }else{
+    if(!q.confirmed)bad='请勾选盘位确认';
+    else if(q.phrase!=='osd.'+q.osdId)bad='二次确认未通过：请输入 osd.'+q.osdId;
+   }
+   if(bad){q.inputError=bad;quickPaintModal();toast(bad,'e');return;}
+   q.inputError='';
    if(state.mode==='live'&&state.auth.role!=='admin'){toast('只读账号无法执行写操作，请用管理员登录','e');return;}
    quickExec((q.kind==='init'||isPhase(q.kind))?'auto':'pre');return;
   case 'q-resume':if(q)quickExec('post');return;
@@ -1060,6 +1091,11 @@ function authAction(act,el){
 }
 var __baseOnAct=onAct;
 onAct=function(act,el){
+ /* 只读闸门必须放在最前面：q-*（踢盘 / 换盘 / 新增盘）与 pool-*（建池）
+    在这下面就被分流到 quickAction / poolAction，根本到不了 __baseOnAct，
+    所以写在 app-wizard.js 的 onAct 里永远不生效——1.1.25 的提示框就是这样
+    被绕过去的。 */
+ if(typeof roBlocked==='function'&&roBlocked(act,el))return;
  if(act.indexOf('auth-')===0)return authAction(act,el);
  if(act.indexOf('q-')===0)return quickAction(act,el);
  if(act.indexOf('pool-')===0)return poolAction(act,el);

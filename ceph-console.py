@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.24"
+VERSION = "1.1.25"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
@@ -1195,6 +1195,24 @@ def replace_prereq(cfg, oid, dev=None):
     return info
 
 
+def orch_osd_daemon(cfg, oid):
+    """cephadm 侧某个 osd 的 daemon 记录（ceph orch ps 的一行）。
+
+    `check_replace` 要区分「容器还在起」和「容器起不来」：前者等几秒就好，
+    后者等多久都不会自愈。status_desc 是唯一能区分这两者的字段。
+    """
+    if cfg.backend != "cli":
+        return None
+    doc, _ = ceph_json(cfg, ["orch", "ps", "--daemon-type", "osd"], 15)
+    items = doc if isinstance(doc, list) else []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        if str(d.get("daemon_name") or "") == "osd.%d" % int(oid):
+            return d
+    return None
+
+
 def check_replace(cfg, oid, dev=None):
     """② 入群后复核：新盘是否被一个 up/in 的 OSD 接管。
 
@@ -1204,7 +1222,8 @@ def check_replace(cfg, oid, dev=None):
     """
     owner = device_owner(cfg, dev)
     base = {"ok": False, "up": None, "in": None, "deployed": False,
-            "pending": False, "newOsd": owner, "action": None}
+            "pending": False, "newOsd": owner, "action": None,
+            "stale": False, "fix": None}
     if owner is not None:
         st = osd_upin_state(cfg, owner)
         base["up"] = (st or {}).get("up")
@@ -1218,6 +1237,29 @@ def check_replace(cfg, oid, dev=None):
                 % (dev or "<新盘>", owner, oid))
             return base
         base.update({"pending": True, "action": "recheck"})
+        # 区分「还在起」和「起不来」：cephadm 报 error 说明 daemon 已经反复重启失败。
+        # 最常见的成因是编号复用后 unit.run 里的 --osd-uuid 还是上一块盘的
+        # （旧 LV 已被 zap），ceph-volume activate 找不到设备，容器秒退。
+        # 这种情况不会自愈，必须 redeploy 让 cephadm 按当前 osdmap 重建 unit。
+        dmn = orch_osd_daemon(cfg, owner)
+        if dmn and str(dmn.get("status_desc") or "") == "error":
+            base.update({
+                "pending": False, "action": "redeploy", "stale": True,
+                "fix": {
+                    "osd": owner,
+                    "command": "ceph orch daemon redeploy osd.%d" % owner,
+                    "why": ("osd.%d 的守护进程处于 error：cephadm 侧 unit 可能还写着"
+                            "上一块盘的 osd uuid（编号复用后常见），"
+                            "activate 找不到 LV，容器起来就退" % owner),
+                },
+            })
+            base["message"] = (
+                "新盘 %s 已登记到 osd.%d，但守护进程起不来（cephadm 状态 error，"
+                "不是还在启动）。多半是编号复用后 unit.run 里的 --osd-uuid 还是"
+                "上一块盘的，activate 找不到设备。点「修复守护进程」执行 "
+                "ceph orch daemon redeploy osd.%d：只重建 unit 与容器，不 zap、不删数据"
+                % (dev or "<新盘>", owner, owner))
+            return base
         base["message"] = (
             "新盘 %s 已登记到 osd.%d，但守护进程还没 up/in（%s）："
             "cephadm 拉起容器常需几十秒，稍后点「重新复核」即可"
@@ -1305,6 +1347,65 @@ def read_free_devices(cfg, probe):
                 continue
             out.append({"host": "", "dev": dev, "size": d.get("size") or 0,
                         "available": True, "note": d.get("model") or ""})
+    return out
+
+
+_LSBLK_OSD_CACHE = {"ts": 0.0, "map": {}}
+
+
+def osd_lsblk_map():
+    """osd fsid -> {"dev": 整盘, "size": 字节, "rota": bool}。
+
+    `ceph osd metadata` 只在 OSD 进程活着时才有；OSD down / daemon 起不来时
+    metadata 只剩 {"id": n}，平台就会把服务器 / 设备 / 容量全显示成"未采集"。
+    这里不依赖任何 ceph 命令，直接读 ceph-volume 建出来的 LVM 命名
+    （ceph--<vg>--osd--block--<osd_fsid>）反查盘符与容量，down 的 OSD 也能定位。
+    读不到就返回空字典，调用方保持"未采集"，不猜。
+    """
+    now = time.time()
+    if _LSBLK_OSD_CACHE["map"] and now - _LSBLK_OSD_CACHE["ts"] < 30:
+        return _LSBLK_OSD_CACHE["map"]
+    out = {}
+    rc, txt, _ = run(["lsblk", "-J", "-b", "-o",
+                      "NAME,KNAME,SIZE,TYPE,FSTYPE,PKNAME,ROTA"], 10)
+    if rc == 0 and txt.strip():
+        try:
+            doc = json.loads(txt)
+        except ValueError:
+            doc = {}
+        flat = {}
+
+        def walk(nodes, parent):
+            for n in nodes or []:
+                if not isinstance(n, dict):
+                    continue
+                flat[n.get("name") or ""] = (n, parent)
+                walk(n.get("children") or [], n.get("name") or "")
+
+        walk(doc.get("blockdevices") or [], "")
+        for name, (n, parent) in flat.items():
+            if str(n.get("fstype") or "") != "ceph_bluestore":
+                continue
+            m = re.search(r"osd--block--([0-9a-f]{8}(?:--[0-9a-f]{4}){3}--[0-9a-f]{12})",
+                          name)
+            if not m:
+                continue
+            fsid = m.group(1).replace("--", "-")
+            # 顺着 PKNAME 往上追到整盘（type=disk），盘符与容量都以整盘为准。
+            cur_name, dev, size = parent, "", int(n.get("size") or 0)
+            seen = set()
+            while cur_name and cur_name not in seen:
+                seen.add(cur_name)
+                cur, cur_parent = flat.get(cur_name, ({}, ""))
+                if cur.get("type") == "disk":
+                    dev = _dev_path(cur.get("name"))
+                    size = int(cur.get("size") or size)
+                    break
+                cur_name = cur_parent
+            rota = str(n.get("rota") or n.get("ROTA") or "") == "1"
+            out[fsid] = {"dev": dev, "size": size, "rota": rota}
+    _LSBLK_OSD_CACHE["ts"] = now
+    _LSBLK_OSD_CACHE["map"] = out
     return out
 
 
@@ -1443,6 +1544,27 @@ def osd_device_map(cfg, want=None):
                 if sn and (dev_by_id.get(oid) == dev or len(oids) == 1):
                     serial_by_id.setdefault(oid, sn)
 
+    # 4) lsblk 兜底：OSD down 时 `ceph osd metadata` 只剩 {"id": n}，前三步都拿
+    #    不到设备。ceph-volume 的 LVM 名里带着 osd fsid，能反查回盘符。
+    #    没有这一条，down 的 OSD 会被当成"盘没被占用"，换盘时这块盘会出现在
+    #    「可选新盘」里，zap 一下就把还在的数据抹了。
+    missing = [i for i in ids if i not in dev_by_id]
+    if missing:
+        uuid_by_id = {}
+        dump, _ = ceph_json(cfg, ["osd", "dump"], 20)
+        if isinstance(dump, dict):
+            for o in (dump.get("osds") or []):
+                if isinstance(o, dict):
+                    try:
+                        uuid_by_id[int(o.get("osd"))] = str(o.get("uuid") or "")
+                    except (TypeError, ValueError):
+                        continue
+        lb = osd_lsblk_map()
+        for oid in missing:
+            backing = lb.get(uuid_by_id.get(oid, "")) or {}
+            if backing.get("dev"):
+                dev_by_id[oid] = backing["dev"]
+
     # 最后再过一遍：任何重复都清空，宁可显示“未采集”也不给错设备名。
     _purge_dupes(dev_by_id)
     return dev_by_id, host_by_id, serial_by_id
@@ -1529,6 +1651,9 @@ def read_osds(cfg):
 
     # 真实设备 / SN：按 osd id 精确映射，不能拿“第一个设备”套给所有 OSD。
     dev_by_id, dev_host_by_id, serial_by_id = osd_device_map(cfg, ids)
+    # OSD 进程挂掉时 metadata 是空的，设备和容量只能从宿主机 lsblk 反查
+    # （ceph-volume 的 LVM 名里带 osd fsid）。读不到就仍是"未采集"。
+    lsblk_by_fsid = osd_lsblk_map()
 
     out = []
     for oid in ids:
@@ -1539,6 +1664,15 @@ def read_osds(cfg):
         util = n.get("utilization", 0) or 0
         dev = dev_by_id.get(oid) or _dev_path(n.get("device") or "")
         host = host_by_id.get(oid) or dev_host_by_id.get(oid) or ""
+        fsid = str(d.get("uuid") or "")
+        backing = lsblk_by_fsid.get(fsid) or {}
+        size = int(kb) * 1024 if kb else 0
+        if not dev and backing.get("dev"):
+            dev = backing["dev"]
+        if not size and backing.get("size"):
+            # 没有 df 统计行（OSD down / 刚创建）时用整盘容量，标注 capacityKnown，
+            # 让「设备 / 容量」不再是"未采集"——盘是哪块、多大本来就是事实。
+            size = int(backing["size"])
         # up/in 以 osd dump 为准（df 里没有这两个字段），tree 兜底。
         if "up" in d:
             up = bool(d.get("up"))
@@ -1555,14 +1689,19 @@ def read_osds(cfg):
         weight = d.get("weight")
         if not isinstance(weight, (int, float)):
             weight = n.get("crush_weight", 1) or 1
-        # 介质类型只有 df 提供；新盘还没进 df 时留空，前端显示“未采集”。
+        # 介质类型只有 df 提供；新盘还没进 df 时用 lsblk 的 ROTA 兜底。
         cls = str(n.get("device_class") or n.get("type") or "").upper()
+        if not cls and backing:
+            cls = "HDD" if backing.get("rota") else "SSD"
         # SMART 需要 cephadm / node_exporter 侧的真实指标，这里不伪造 "OK"。
         out.append({"id": oid, "host": host,
                     "dev": dev,
                     "type": cls[:8] if cls else "",
-                    "size": int(kb * 1024), "used": int(used * 1024),
-                    "capacityKnown": bool(kb),
+                    "size": size, "used": int(used * 1024),
+                    "capacityKnown": bool(size),
+                    # capacityKnown=有容量（df 或 lsblk 整盘）；
+                    # usageKnown=有 df 统计行（down 的 OSD 没有，使用率不能显示 0%）
+                    "usageKnown": oid in stats,
                     "up": up, "inn": inn,
                     "pgs": n.get("pgs", 0) or 0, "weight": weight,
                     "smart": "", "serial": serial_by_id.get(oid, ""),
@@ -2651,10 +2790,22 @@ def _plan_retire(cfg, probe, oid, add):
         add("删除认证", ["ceph", "auth", "del", "osd.%d" % oid])
         add("删除 OSD", ["ceph", "osd", "rm", str(oid)])
     if orch:
+        # 现场踩过的坑（11-11）：只 purge 不清 cephadm 的 daemon 定义时，
+        # 宿主机 /var/lib/ceph/<fsid>/osd.<id>/unit.run 里还写着上一块盘的
+        # --osd-uuid。新盘拿到同一个编号后 cephadm 认为「这个 daemon 已部署」，
+        # 只做 activate 不重建 unit，于是去激活一个已被 zap 掉的 LV，
+        # 容器起不来、OSD 永远 error/down，metadata 为空 → 设备/容量全"未采集"。
+        # 放在 purge 之后：先让 mon 侧没这个编号，再清 daemon，避免编排器抢跑重建。
+        add("清掉 cephadm 的旧 daemon 定义",
+            ["ceph", "orch", "daemon", "rm", "osd.%d" % oid, "--force"],
+            "删除 cephadm 侧 osd.%d 的 daemon 记录，以及宿主机上的 systemd unit 与 "
+            "/var/lib/ceph/<fsid>/osd.%d 目录（只删守护进程定义，不碰数据盘）。"
+            "不清理的话，新盘复用同一编号时会沿用旧的 --osd-uuid，OSD 起来就是 "
+            "error/down。daemon 已不存在时报错属正常，流程继续" % (oid, oid))
         add("确认旧 daemon 已退出",
             ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
-            "只读：若仍残留 stopped 的 osd.%d，可手工 ceph orch daemon rm osd.%d --force；"
-            "不自动执行，避免编排器把还没换下的旧盘重新纳管" % (oid, oid))
+            "只读复核：列表里不应再有 osd.%d 的 daemon；若还在且状态 error，"
+            "说明上一步没删掉，可手工 ceph orch daemon rm osd.%d --force" % (oid, oid))
     add("复核旧编号已从 osdmap 删除", ["ceph", "osd", "dump", "--format=json"],
         "只读复核：osds[] 里不应再有 osd.%d。成功后才能现场换盘" % oid)
 
@@ -2837,6 +2988,8 @@ TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止�
                   # ① 清退：队列里没有任务时 orch osd rm stop 会报错，属正常；
                   # ② 入群：已有 managed OSDSpec 时 daemon add 会提示已被管理，属正常。
                   "清掉旧版的僵尸移除任务", "确认旧 daemon 已退出",
+                  # ① 清退：daemon 记录可能已被 cephadm 自己清掉，报错属正常。
+                  "清掉 cephadm 的旧 daemon 定义",
                   "复核旧编号已从 osdmap 删除",
                   "创建并部署新 OSD（分配新编号）", "等待新 OSD 上线",
                   "确认新盘已被新 OSD 接管", "确认新 OSD 的 CRUSH 权重",
@@ -3609,6 +3762,62 @@ class Handler(BaseHTTPRequestHandler):
                            "dry_run": dry, "version": self.probe.version,
                            "orchestrator": self.probe.orchestrator})
 
+    def _osd_redeploy(self, body):
+        """修复 cephadm 侧陈旧的 daemon unit（编号复用后 osd 永远 error/down）。
+
+        只重建守护进程的 systemd unit / 容器：不 zap、不删数据、不动 osdmap。
+        现场证据：purge 掉旧 osd.0 后新盘又拿到编号 0，cephadm 沿用旧的
+        /var/lib/ceph/<fsid>/osd.0/unit.run（里面 --osd-uuid 还是上一块盘的），
+        ceph-volume activate 找不到 LV，容器起来 1 秒就退，OSD 永远 down。
+        """
+        if not self._authorized():
+            return self._auth_error()
+        s = self._session()
+        if s is not None and s.get("role") != "admin" and bool(body.get("allow_write")):
+            return self._json({"error": "viewer role cannot redeploy daemons"}, 403)
+        if self.cfg.read_only:
+            return self._json({"error": "read-only keyring: write operations are disabled"}, 403)
+        if self.cfg.backend != "cli" or not self.probe.caps.get("orch"):
+            return self._json({"error": "redeploy needs the cephadm orchestrator"}, 400)
+        try:
+            oid = int(str(body.get("osd_id", "")).replace("osd.", ""))
+        except (TypeError, ValueError):
+            raise ValueError("invalid osd id")
+        if oid < 0 or oid > 99999:
+            raise ValueError("osd_id out of range")
+        phrase = "osd.%d" % oid
+        if self._confirm_required() and str(body.get("confirm_phrase", "") or "") != phrase:
+            return self._json({"error": "confirm_phrase mismatch (expected %s)" % phrase}, 403)
+        plan = [("重新部署 OSD 守护进程（重建 unit）",
+                 ["ceph", "orch", "daemon", "redeploy", "osd.%d" % oid],
+                 "只重建 daemon 的 systemd unit 与容器，不 zap、不删数据")]
+        allow = bool(body.get("allow_write")) and self._write_allowed() and self._can_write()
+        commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
+        verify = None
+        if not dry:
+            # redeploy 是异步的：给 cephadm 几秒把容器拉起来再回读。
+            time.sleep(6)
+            st = osd_upin_state(self.cfg, oid)
+            dmn = orch_osd_daemon(self.cfg, oid) or {}
+            verify = {"ok": bool(st and st.get("up")),
+                      "up": (st or {}).get("up"), "in": (st or {}).get("in"),
+                      "daemon": dmn.get("status_desc") or "",
+                      "message": ("osd.%d 已重新部署并 up" % oid)
+                      if (st and st.get("up")) else
+                      ("已提交 redeploy，但 osd.%d 还没 up（cephadm 状态 %s）；"
+                       "cephadm 拉起容器常需几十秒，稍后重新复核 "
+                       "ceph orch ps --daemon-type osd" % (oid, dmn.get("status_desc") or "unknown"))}
+            results.append("verify: " + verify["message"])
+            _STATE_CACHE["data"] = None
+            _STATE_CACHE["ts"] = 0
+        audit("OSD_REDEPLOY", phrase, " ; ".join(commands),
+              "DRY-RUN" if dry else ("EXECUTED" if (verify or {}).get("ok") else "UNVERIFIED"),
+              "remote=%s ceph=%s" % (self._client(), self.probe.version),
+              self._client(), self._user())
+        return self._json({"ok": True, "commands": commands, "results": results,
+                           "target": phrase, "verify": verify, "dry_run": dry,
+                           "allow_write": allow})
+
     def _alert_ack(self, body):
         """确认 / 静音告警。状态存在后端，刷新页面和换浏览器都保持，
         不会下一轮采集又被 health detail 覆盖成「未处置」。"""
@@ -3659,6 +3868,8 @@ class Handler(BaseHTTPRequestHandler):
                                "ts": int(time.time())})
         if path == "/api/alert/ack":
             return self._alert_ack(body)
+        if path == "/api/osd/redeploy":
+            return self._osd_redeploy(body)
         if path == "/api/security":
             return self._security_update(body)
         if path == "/api/password":

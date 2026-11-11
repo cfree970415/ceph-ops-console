@@ -573,7 +573,9 @@ function quickPaintModal(){
      1.1.24 起不再校验编号是否复用，只看新盘有没有被 up/in 的 OSD 接管。 */
   var pending=!!(badVerify&&v.pending),hardFail=badVerify&&!pending;
   var stateColor=hardFail?'td':pending?'tw':'t';
-  var headline=hardFail?(v&&v.blocked?'清退未完成（不会自动完成）':'未完全生效'):
+  var staleFix=!!(v&&v.stale&&v.fix&&v.fix.command);
+  var headline=hardFail?(staleFix?'守护进程起不来（可一键修复）':
+                 (v&&v.blocked?'清退未完成（不会自动完成）':'未完全生效')):
                pending?(q.kind==='retire'?'等待旧编号从 osdmap 消失':'已提交，等待新 OSD 上线'):'流程已完成';
   b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+stateColor+'">'+
    ic(badVerify?'alert':'check',38)+'</div>'+
@@ -590,11 +592,15 @@ function quickPaintModal(){
     q.kind==='deploy'?(badVerify?'新盘入群未完成，详见下方复核结论':'新盘已由 osd.'+((v&&v.newOsd!=null)?v.newOsd:'?')+' 接管并上线，数据开始回填'):
     '命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
    (hardFail?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>'+
-     (q.kind==='retire'?(v&&v.blocked?'清退被阻塞，等也不会自动完成':'清退复核未通过'):'换盘复核未通过')+
+     (staleFix?'OSD 守护进程处于 error，等不会自愈':
+      q.kind==='retire'?(v&&v.blocked?'清退被阻塞，等也不会自动完成':'清退复核未通过'):'换盘复核未通过')+
      (v.newOsd?'：新盘当前归属 osd.'+v.newOsd:'')+'</b><br>'+
      esc(v.message).replace(/\n/g,'<br>')+
-     ((v.fix&&v.fix.length)?'<div class="cmdbox" style="margin-top:8px;max-height:190px;overflow:auto">'+
+     ((v.fix&&v.fix.map)?'<div class="cmdbox" style="margin-top:8px;max-height:190px;overflow:auto">'+
        v.fix.map(function(x){return '<div>'+esc(x)+'</div>';}).join('')+'</div>':'')+
+     (staleFix?'<div class="cmdbox" style="margin-top:8px" title="只重建 unit 与容器，不 zap、不删数据">'+
+       esc(v.fix.command)+'</div><div class="tiny" style="margin-top:6px">'+esc(v.fix.why||'')+
+       '</div>':'')+
      (v.newOsd?'<br>新编号由 mon 分配，与旧编号不同属正常；若复核失败请按下方结论处理。':'')+
      '</div></div>':
     pending?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>'+
@@ -615,6 +621,8 @@ function quickPaintModal(){
   foot='<div class="sp"></div>'+
    (badVerify?'<button class="btn" data-act="q-recheck"'+(q.recheckBusy?' disabled':'')+'>'+ic('refresh',14)+
     (q.recheckBusy?' 复核中…':' 重新复核')+'</button>':'')+
+   (staleFix?'<button class="btn pri" data-act="q-fix"'+(q.fixBusy?' disabled':'')+'>'+ic('wrench',14)+
+    (q.fixBusy?' 修复中…':' 修复守护进程')+'</button>':'')+
    '<button class="btn" data-act="q-alerts">查看告警</button>'+
    '<button class="btn" data-act="q-audit">变更审计</button><button class="btn pri" data-act="q-close">完成</button>';
  }
@@ -642,8 +650,33 @@ function qRecheck(q,cb){
   if(cb)cb();
  });
 }
-function qAutoRecheck(q,left){
- if(!state.quick||state.quick!==q||q.phase!=='done'||!q.verify||!q.verify.pending)return;
+/* 修复守护进程：唯一会下发写命令的动作，但只重建 unit / 容器。
+   走与其它写操作同一套闸门（写权限 + 二次确认），执行后回读 up/in。 */
+function qFixDaemon(q){
+ if(!state.quick||state.quick!==q||q.fixBusy)return;
+ if(state.mode!=='live'||!state.auth.authenticated){toast('演示模式无法连接后端','w');return;}
+ if(!state.settings.allowWrite){
+  toast('当前是只读模式，请先打开 系统设置 → 允许真实写操作','e');return;}
+ var oid=(q.verify&&q.verify.fix&&q.verify.fix.osd!=null)?q.verify.fix.osd:q.osdId;
+ q.fixBusy=true;quickPaintModal();
+ qLog('p','$ ceph orch daemon redeploy osd.'+oid);
+ apiFetch('POST','/api/osd/redeploy',{osd_id:oid,confirm_phrase:'osd.'+oid,allow_write:true})
+  .then(function(r){
+   if(!state.quick||state.quick!==q)return;
+   q.fixBusy=false;
+   (r.commands||[]).forEach(function(c){qLog('p','$ '+c);});
+   (r.results||[]).forEach(function(x){qLog('d','  '+String(x).slice(0,240));});
+   if(r.dry_run){qLog('w','  dry-run：未下发');}
+   qLog('c','  '+(r.verify?(r.verify.message||''):'已提交 redeploy'));
+   /* 修复后立即走一次只读复核，把 down/up 的真实结果带回来。 */
+   qRecheck(q,null);
+  }).catch(function(e){
+   if(!state.quick||state.quick!==q)return;
+   q.fixBusy=false;qLog('e','! '+e.message);
+   toast('修复失败：'+e.message,'e');quickPaintModal();
+  });
+}
+function qAutoRecheck(q,left){ if(!state.quick||state.quick!==q||q.phase!=='done'||!q.verify||!q.verify.pending)return;
  if(left<=0){q.recheckDone=true;quickPaintModal();return;}
  setTimeout(function(){
   if(!state.quick||state.quick!==q||q.phase!=='done'||!q.verify||!q.verify.pending)return;
@@ -1010,6 +1043,9 @@ function quickAction(act,el){
   case 'q-resume':if(q)quickExec('post');return;
   case 'q-abort':if(q){q.aborted=true;toast('已发送中止请求','w');}return;
   case 'q-recheck':if(q)qRecheck(q,null);return;
+  /* 修复 daemon：编号复用后 cephadm 的 unit.run 还指向上一次的 --osd-uuid，
+     OSD 起来就 error/down。redeploy 只重建 unit 与容器，不 zap、不删数据。 */
+  case 'q-fix':if(q)qFixDaemon(q);return;
   case 'q-alerts':state.quick=null;closeModal();state.view='alerts';render();return;
   case 'q-audit':state.quick=null;closeModal();state.view='audit';render();return;
   default:return;

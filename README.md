@@ -143,6 +143,16 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 第 1 条是「进程有没有写权限」，第 3 条是「人授权了没有」——只装一次就能动手是不允许的。关掉二次确认仍需第 1~4 条，只是不用手输编号。
 
+### 只读模式下点写操作会怎样
+
+踢盘 / 换盘（① 清退、② 入群）/ 新增磁盘 / IN / OUT / 建池 —— 只要「允许真实写操作」是关的，点击按钮**不会静默变成 DRY-RUN**，而是先弹一个提示框：
+
+- 说清当前是**只读模式（DRY-RUN）**：命令只生成并写审计，不下发、不 zap、OSD 状态不变
+- 给两个出口：**「去打开写权限」**（直接跳到 系统设置 → 安全策略，需 admin 密码）、**「仅预览命令」**（照常走流程看步骤与预检，只是不落盘）
+- 若服务端是干跑的（缺 `--allow-write`），提示框额外标红：即使打开开关也不会下发，需给进程加参数重启
+
+按钮不置灰：灰掉会被当成功能坏了，而且预览命令本身是有用的。
+
 ### 安全策略的两个开关
 
 | 设置 | 默认 | 含义 |
@@ -193,7 +203,7 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 | 步骤 | 时机 | 平台做什么 | 完成标志 |
 | --- | --- | --- | --- |
-| **① 换盘前·清退** | 坏盘还在机器上 | 只读确认 OSD 确实 down → `ceph orch osd rm stop <id>` 清掉旧版僵尸任务 → `ceph osd out` → `ceph osd purge <id> --yes-i-really-mean-it` 删除旧编号 → 回读 `ceph osd dump` | `osds[]` 里不再有 `osd.<id>` |
+| **① 换盘前·清退** | 坏盘还在机器上 | 只读确认 OSD 确实 down → `ceph orch osd rm stop <id>` 清掉旧版僵尸任务 → `ceph osd out` → `ceph osd purge <id> --yes-i-really-mean-it` 删除旧编号 → `ceph orch daemon rm osd.<id> --force` 清掉 cephadm 侧陈旧 daemon → 回读 `ceph osd dump` | `osds[]` 里不再有 `osd.<id>` |
 | — 现场换盘 — | 人工 | 按 SN / 盘位换上同规格新盘，装回原盘位 | — |
 | **② 换盘后·入群** | 新盘已装好 | 校验目标盘没被健康 OSD 占用 → `ceph orch device zap` → `ceph orch daemon add osd <host>:<dev>` 创建新 OSD → 回读新盘归属 / up/in 与健康 | 新盘被某个 `up/in` 的 OSD 接管 |
 
@@ -242,11 +252,34 @@ ceph -s
 | --- | --- | --- |
 | ② 新盘被某个 OSD 接管且 up/in | 绿色「流程已完成」 | 完成；弹窗显示新编号，可能与旧编号不同 |
 | ② 新盘已登记到某个 OSD，但还没 up/in | 黄色「已提交，等待新 OSD 上线」 | 部署延迟，不是失败：每 5 秒只读复核一次（最多 12 次），可手动点「重新复核」 |
+| ② 已登记且 cephadm 状态是 `error` | 红色「守护进程起不来」 | 不会自愈，点「修复守护进程」执行 `ceph orch daemon redeploy`；见下一节 |
 | ② 新盘还没被任何 OSD 认领 | 黄色「等待新 OSD 上线」 | 设备信息可能还没采到，稍后复核 |
 | ① `ceph osd purge` 后旧编号仍在 osdmap | 红色「清退未完成（不会自动完成）」 | purge 失败，不靠等待自愈；弹窗直接列出 `ceph osd out` / `ceph osd purge` / `ceph orch osd rm stop` 等命令 |
 | ② 目标盘被 up/in 的健康 OSD 占用 | 红色「未完全生效」 | 409 拒绝 zap，核对设备路径 |
 
 只读复核接口 `POST /api/osd/verify`（`osd_id` + `dev` + `phase=retire|deploy`），不重跑流程、不下发写命令。若本意是**扩容**（保留所有旧盘、只加一块新盘），请用下一节的「新增磁盘」入口。
+
+#### 新盘入群后一直是 down / error（编号复用后的 daemon 残留）
+
+现场踩过（11-11）：① 清退 `purge` 掉 osd.0 后，② 新盘又拿到编号 0，但 `ceph orch ps` 里 osd.0 一直 `error`，OSD 永远 down，`ceph osd metadata` 也只剩 `{"id": 0}` → 列表里设备 / 容量全「未采集」。
+
+根因是**只删了 mon 侧的编号，没清 cephadm 侧的 daemon 定义**：宿主机 `/var/lib/ceph/<fsid>/osd.0/unit.run` 里还写着上一块盘的 `--osd-uuid`，cephadm 认为「这个 daemon 已部署过」，只做 `activate` 而不重建 unit，于是去激活一个已被 zap 掉的 LV，容器起来 1 秒就退。
+
+1.1.25 两道处理：
+
+- ① 清退流程在 `purge` 之后追加 `ceph orch daemon rm osd.<id> --force`（只删守护进程记录、systemd unit 与 `/var/lib/ceph/<fsid>/osd.<id>` 目录，**不碰数据盘**），从源头不留残留
+- ② 复核读 `ceph orch ps` 的 `status_desc`：`error` 判「起不来」（不会自愈），弹出「修复守护进程」按钮 → `POST /api/osd/redeploy` → `ceph orch daemon redeploy osd.<id>`，只重建 unit 与容器，不 zap、不删数据，之后自动只读复核一次
+
+手工等价命令：
+
+```bash
+ceph orch ps --daemon-type osd                    # 看 status_desc 是不是 error
+ceph orch daemon rm osd.<id> --force              # 清掉陈旧 daemon 定义（若还在）
+ceph orch daemon redeploy osd.<id>                # 按当前 osdmap 重建 unit 与容器
+ceph orch ps --daemon-type osd                    # 复核 running
+```
+
+> 已经卡在这个状态的集群：**先 redeploy，不要 zap**。zap 只会把新盘再抹一遍，问题依旧。
 
 #### 旧版遗留：`done, waiting for purge` 与多出来的 OSD
 
@@ -273,6 +306,16 @@ ceph orch ps --daemon-type osd
 - cephadm：`ceph orch device zap <host> <dev> --force` → `ceph orch daemon add osd <host>:<dev>`
 - 包安装：`ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev>`
 - 安全闸：执行前比对现有 OSD 设备名，已被占用直接拒绝（zap 不可逆）；前端还要输入设备路径确认
+
+新 OSD 刚创建、或在 down / error 状态时，`ceph osd metadata` 是空的，设备和容量本来取不到。1.1.25 起改用宿主机 `lsblk` 兜底：ceph-volume 的 LVM 名里带 osd fsid（`ceph--<vg>--osd--block--<fsid>`），顺着 `PKNAME` 追到整盘就能拿到**盘符、整盘容量、ROTA（HDD/SSD）**。三条口径：
+
+| 列 | 数据来源 | 取不到时 |
+| --- | --- | --- |
+| 服务器 / 设备 | metadata → lsblk 反查 fsid | 显示「未采集」 |
+| 容量 | `osd df` 优先，否则整盘容量（`capacityKnown`） | 显示 `—` |
+| 使用率 | 只认 `osd df` 统计行（`usageKnown`） | 显示 `—`，**不显示 0%** |
+
+盘是哪块、多大是事实，所以容量可以兜底；但「用了多少」没有统计行就是未知，写 0% 会让页面说谎。
 
 ### 一键 IN 盘（维护结束 / 误 out 后恢复）
 
@@ -505,6 +548,7 @@ sudo python3 ~/ceph-ops-console/ceph-console.py \
 | POST | `/api/quick/retire` | ① 换盘前·清退：校验 OSD 确实 down → `ceph osd purge` 删除旧编号 → 复核已从 osdmap 消失 |
 | POST | `/api/quick/deploy` | ② 换盘后·新盘入群：校验目标盘归属 → zap → `daemon add osd` 分配新编号 → 复核 up/in |
 | POST | `/api/osd/verify` | 只读复核：`osd_id` + `dev` + `phase=retire\|deploy`，不重跑流程 |
+| POST | `/api/osd/redeploy` | 修复守护进程：`ceph orch daemon redeploy osd.<id>`，只重建 unit 与容器，不 zap、不删数据 |
 | POST | `/api/quick/replace` | 高级向导的完整流程（`stage=pre` / `stage=post`） |
 | POST | `/api/execute` | 高级向导执行 |
 | GET | `/api/pool/options` | 建池下拉项：OSD 数、池名、CRUSH rule、EC profile、PG 建议 |
@@ -582,10 +626,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.24-20261111'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.25-20261111'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.24-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.25-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 
@@ -622,7 +666,13 @@ journalctl -u ceph-console -n 50 --no-pager
 
 ### 常见问题
 
-**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.24-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.25-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+
+**清退后这块盘从列表里消失了，只能「新增磁盘」加回来？** 正常。① 清退执行的是 `ceph osd purge <id>`，mon 侧编号被删掉，`osd dump` 里没有它了，列表自然不显示——数据本来就要跟着盘一起走。新盘装好后走 ② 换盘后·新盘入群（或独立用「新增磁盘」扩容），会拿到一个**新编号**。若加回来一直 down，见下一条。
+
+**新盘入群后一直是 down / error？** 编号复用后 cephadm 的 daemon 定义没清干净：`/var/lib/ceph/<fsid>/osd.<id>/unit.run` 里还是上一块盘的 `--osd-uuid`，cephadm 只 `activate` 不重建 unit，去激活已 zap 的 LV，容器秒退。1.1.25 的 ① 会追加 `ceph orch daemon rm osd.<id> --force` 从源头清掉；已经卡住的在复核弹窗点「修复守护进程」（`ceph orch daemon redeploy osd.<id>`，只重建 unit 与容器）。**不要靠 zap 重来**，zap 抹盘不解决 unit 陈旧。
+
+**新盘在列表里设备 / 容量是「未采集」？** OSD 还没起来时 `ceph osd metadata` 是空的。1.1.25 起用宿主机 `lsblk` 反查 ceph-volume 的 LVM 名（带 osd fsid）拿盘符与整盘容量，还能按 ROTA 标 HDD/SSD；仍为空说明盘上没有可识别的 ceph LVM 标签（多半 OSD 根本没创建成功）。使用率只认 `osd df`，没有统计行就显示 `—`，不会显示 0%。
 
 **为什么不再保留 OSD 编号？** 1.1.24 之前要求编号不变，必须走 cephadm 的 `--replace` → `destroyed` → `osd_id_claims` 异步链；mgr 每次 purge 前重跑 `osd safe-to-destroy`，单节点双盘 + 2 副本拓扑下 PG 永远不 `active+clean`，队列会永久停在 `done, waiting for purge`。这不是命令写错、也不是「OSD 启动慢」，加长等待没用。现在 ① 用 mon 命令式 `ceph osd purge` 删除旧编号、② 用 `ceph orch daemon add osd` 分配新编号，绕开了整条异步链。代价是旧编号不可恢复、历史监控引用会断，详见换盘章节。
 

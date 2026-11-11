@@ -393,7 +393,57 @@ function secApply(key,next){
   if(msg){msg.className='hint e';msg.textContent=(err&&err.message)||'修改失败';}
  });
 }
+/* 只读模式（DRY-RUN）下的写操作闸门。
+   踢盘 / 换盘 / OUT / IN / 建池这些入口先拦一道：说清「现在不会下发」，
+   再给两个选择——去打开开关，或者只看命令。直接灰掉按钮用户会以为功能坏了。 */
+var RO_WRITE_ACTS={'q-open':1,'osd-in':1,'osd-out':1,'wizard':1,'w-exec':1,'pool-run':1};
+function roLabel(act,el){
+ if(act==='q-open'){
+  var k=el.getAttribute('data-kind')||'';
+  return {'kick':'一键踢盘','retire':'① 换盘前 · 清退','deploy':'② 换盘后 · 新盘入群',
+   'replace':'一键换盘','init':'新增磁盘','in':'OSD IN'}[k]||'写操作';
+ }
+ if(act==='wizard')return '踢盘换盘向导';
+ if(act==='osd-in')return '标记 OSD IN';
+ if(act==='osd-out')return '标记 OSD OUT';
+ if(act==='pool-run')return '创建存储池';
+ return '写操作';
+}
+/* 返回 true 表示已拦下，调用方直接 return，不执行原动作。 */
+function roBlocked(act,el){
+ if(state.mode!=='live')return false;
+ if(state.settings.allowWrite)return false;
+ if(!RO_WRITE_ACTS[act])return false;
+ if(!state.auth.authenticated)return false;
+ var label=roLabel(act,el);
+ state.roPending={act:act,kind:el.getAttribute('data-kind')||'',id:el.getAttribute('data-id'),
+  intent:el.getAttribute('data-intent')||'replace'};
+ var cap=state.auth.writeCapability!==false;
+ /* viewer 身份连开关都改不了（服务端只接受 admin + 重新验密码），
+    所以这里直接说实话，别让人点进去再吃一个 403。 */
+ var notAdmin=state.auth.role!=='admin';
+ var b='<div class="modal-h"><div><div class="tiny">只读模式 · DRY-RUN</div>'+
+  '<div style="font-size:15px;font-weight:650">当前不会真正执行「'+esc(label)+'」</div></div>'+
+  '<div class="sp"></div><button class="btn sm" data-act="modal-close">关闭</button></div>'+
+  '<div class="modal-b"><div class="warnbox">'+ic('shield')+'<div>'+
+  '平台现在是 <b>只读模式（DRY-RUN）</b>：命令只会生成并写进审计日志，<b>不会下发到集群</b>，'+
+  '磁盘不会被 zap，OSD 状态也不会改变。<br>要真正执行踢盘 / 换盘，请先打开 '+
+  '<b>系统设置 → 安全策略 →「允许真实写操作」</b>（需要输入 admin 密码）。</div></div>'+
+  (notAdmin?'<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div>'+
+   '当前登录身份是 <b>'+esc(state.auth.role==='viewer'?'只读账号 viewer':(state.auth.role||'未登录'))+
+   '</b>，只有 <b>admin</b> 能打开这个开关。请用管理员账号登录，或让管理员代为开启。</div></div>':'')+
+  (cap?'':'<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div>'+
+   '检测到服务端以 <b>DRY-RUN 启动</b>（缺 --allow-write）：即使打开上面的开关也不会下发命令，'+
+   '需要先给 <span class="mono">ceph-console</span> 进程加上 <span class="mono">--allow-write</span> 并重启服务。</div></div>')+
+  '<div class="tiny" style="margin-top:12px">仍然可以点「仅预览命令」：流程、参数、预检结果都会照常展示，只是不落盘。</div>'+
+  '</div><div class="modal-f"><button class="btn" data-act="modal-close">取消</button><div class="sp"></div>'+
+  '<button class="btn" data-act="ro-preview">仅预览命令</button>'+
+  (notAdmin?'':'<button class="btn pri" data-act="ro-settings">'+ic('shield',13)+' 去打开写权限</button>')+'</div>';
+ openModal(b,'md');
+ return true;
+}
 function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data-value'),w=state.wizard;
+ if(roBlocked(act,el))return;
  switch(act){
   case 'nav':
    state.view=el.getAttribute('data-view');closeModal();
@@ -406,6 +456,17 @@ function onAct(act,el){var id=el.getAttribute('data-id'),v=el.getAttribute('data
   case 'sec-apply':secApply(el.getAttribute('data-key'),el.getAttribute('data-value'));break;
   case 'refresh':state.lastRefresh=Date.now();if(state.mode==='live')testConn();else render();toast('已刷新','ok');break;
   case 'modal-close':closeModal();break;
+  /* 只读提示框的两个出口：去设置页打开开关，或者明确选择只看命令。 */
+  case 'ro-settings':state.roPending=null;state.view='settings';closeModal();render();break;
+  case 'ro-preview':{
+   var rp=state.roPending;state.roPending=null;closeModal();
+   if(!rp)break;
+   var rid=(rp.id===null||rp.id==='')?null:Number(rp.id);
+   if(rp.act==='q-open')quickOpen(rp.kind,rid);
+   else if(rp.act==='wizard')startWizard(rid,rp.intent);
+   else if(rp.act==='pool-run')poolRun();
+   else if(rp.act==='osd-in'||rp.act==='osd-out')osdMark(rid,rp.act==='osd-in');
+   break;}
   case 'overlay':case 'w-close':return;
   case 'alert-ack':{
    var a=state.alerts.filter(function(x){return x.id===id;})[0];if(!a)break;

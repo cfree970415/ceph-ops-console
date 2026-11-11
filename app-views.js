@@ -171,6 +171,9 @@ function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !
   card('OSD 列表','<div id="osd-table-wrap">'+osdTable()+'</div>','<span class="tag info">共 '+state.osds.length+' 台</span>',false)+
   '<div style="margin-top:14px">'+card('版本命令适配','<div class="grid g2" style="gap:0 34px">'+
    '<div class="stat-line"><span>编排器</span><b class="mono tp">'+esc(p.orchestrator)+'</b></div>'+
+   '<div class="stat-line"><span>部署方式</span><b class="mono">'+esc(p.deploy_mode||'未探测')+'</b></div>'+
+   '<div class="stat-line"><span>动盘执行</span><b class="mono '+((p.deploy_mode==='cephadm'||(state.settings.ssh||{}).ready)?'t':'tw')+'">'+
+    (p.deploy_mode==='cephadm'?'mon 侧下发（orch）':((state.settings.ssh||{}).ready?'ssh 下发到目标主机':'ssh 未就绪 → 不能真实执行'))+'</b></div>'+
    '<div class="stat-line"><span>osd purge</span><b class="mono '+(p.caps.purge?'t':'td')+'">'+(p.caps.purge?'可用':'不可用 → 三步式移除')+'</b></div>'+
    '<div class="stat-line"><span>ok-to-stop</span><b class="mono '+(p.caps.ok_to_stop?'t':'tw')+'">'+(p.caps.ok_to_stop?'可用':'降级为 PG 冗余检查')+'</b></div>'+
    '<div class="stat-line"><span>orch daemon add osd</span><b class="mono '+(p.caps.orch?'t':'td')+'">'+(p.caps.orch?'可用':'不可用 → ceph-volume')+'</b></div></div>')+'</div>';}
@@ -315,6 +318,43 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
   var extra=cap?'':'<div class="hint" style="margin-top:2px">'+ic('alert',12)+' 服务端以 DRY-RUN 启动（缺 --allow-write），此开关打开也不会下发命令。</div>';
   return '<div class="setrow"><div><div class="l">'+label+' '+ic('lock',12)+'</div><div class="d">'+desc+'</div>'+extra+'</div>'+
    '<button class="switch '+(val?'on':'')+'" data-act="sec-toggle" data-key="'+key+'" data-value="'+(val?'0':'1')+'" title="修改需要验证 admin 密码"></button></div>';};
+ /* ---- 远程执行（二进制 / 包安装集群）----
+    cephadm 集群由 mon 代跑 systemctl / ceph-volume，本节可以忽略；
+    包安装集群没有这一层，动盘必须由控制台 ssh 到盘所在主机。
+    这里只配「怎么连」，不配「能不能写」——后者是上面的安全策略。 */
+ var ssh=state.settings.ssh||{},pr=state.profile||{};
+ var dmKey=(pr.deploy_mode||state.settings.deployMode||'unknown');
+ var dmName={'cephadm':'cephadm / orchestrator（由 mon 代跑）',
+  'ceph-volume':'ceph-volume · 二进制包安装','ceph-disk':'ceph-disk · 12.x 老集群',
+  'unknown':'未探测'};
+ var isOrch=dmKey==='cephadm';
+ var hostList=state.sshProbe||ssh.hosts||[];
+ var hostRows=hostList.map(function(h){
+  var ok=h.ok;
+  return '<tr><td class="mono">'+esc(h.host)+'</td><td>'+(h.local?'本机':'远程')+'</td>'+
+   '<td class="mono '+((ok===true)?'t':(ok===false?'tw':''))+'">'+(ok===true?'可达':(ok===false?'不可达':'未测试'))+'</td>'+
+   '<td class="tm">'+esc(h.err||h.out||'')+'</td></tr>';}).join('');
+ var sshCard=card('远程执行 · 二进制 / 包安装集群',
+  '<div class="stat-line"><span>部署方式</span><b class="mono '+(isOrch?'t':'tw')+'">'+esc(dmName[dmKey]||dmKey)+'</b></div>'+
+  '<div class="stat-line"><span>远程执行</span><b class="mono '+(ssh.ready?'t':'tw')+'">'+
+   (ssh.ready?'就绪 · '+esc((ssh.user||'root')+'@<host>:'+(ssh.port||22)):'未就绪 · '+esc(ssh.reason||'未配置'))+'</b></div>'+
+  '<div class="stat-line"><span>sudo</span><b class="mono">'+(ssh.sudo===false?'关（直接用 ssh 账号）':'开（sudo -n，需 NOPASSWD）')+'</b></div>'+
+  '<div class="note" style="margin:8px 0 10px">'+
+   (isOrch?'当前是 cephadm 集群：踢盘 / 换盘 / 新增盘由 orchestrator 下发，<b>本节可以不配</b>。'
+          :'当前是 <b>二进制 / 包安装集群</b>：systemctl、ceph-volume 必须在「盘所在主机」上执行，'+
+           '控制台会用 ssh 下发。单节点部署（控制台就在 OSD 主机上）自动本地执行，不需要配 ssh。')+'</div>'+
+  '<div class="grid g2" style="gap:10px">'+
+   '<div class="fgrp"><label class="fld">SSH 用户</label><input class="inp" data-bind="settings.ssh.user" value="'+esc(ssh.user||'root')+'" placeholder="root"></div>'+
+   '<div class="fgrp"><label class="fld">SSH 端口</label><input class="inp" type="number" data-bind="settings.ssh.port" value="'+(ssh.port||22)+'" placeholder="22"></div></div>'+
+  '<div class="fgrp"><label class="fld">私钥路径（留空用默认 agent / ~/.ssh）</label><input class="inp" data-bind="settings.ssh.key" value="'+esc(ssh.key||'')+'" placeholder="/root/.ssh/id_rsa"></div>'+
+  sw('settings.ssh.enabled','启用远程执行','关闭后动盘命令一律在本机执行；多节点集群会直接拒绝执行（不会把命令打到错误的机器上）',ssh.enabled!==false)+
+  sw('settings.ssh.sudo','远程命令走 sudo -n','目标机上的 ceph-volume 需要 root；sudo 必须配 NOPASSWD，否则会明确报错而不是挂住',ssh.sudo!==false)+
+  '<div class="btn-row" style="margin-top:12px"><button class="btn pri" data-act="ssh-save">'+ic('settings',14)+' 保存配置</button>'+
+   '<button class="btn" data-act="ssh-test">'+ic('link',14)+' 测试连通性</button>'+
+   '<button class="btn" data-act="nav" data-view="deploy">'+ic('wrench',14)+' 看部署说明</button></div>'+
+  (hostRows?'<div class="tbl-wrap" style="margin-top:12px"><table><thead><tr><th>主机</th><th>位置</th><th>ssh</th><th>说明</th></tr></thead><tbody>'+hostRows+'</tbody></table></div>':
+   '<div class="hint" style="margin-top:10px">点「测试连通性」逐台确认哪些主机能连上（只跑 hostname，不下发任何命令）。</div>'),
+  '<span class="tag '+(ssh.ready?'ok':'warn')+'">'+esc(isOrch?'cephadm':'ssh')+'</span>',false);
  return pageH('系统设置','数据源、安全策略、告警阈值与版本适配')+'<div class="grid g2">'+
   card('连接与数据源',connInfo+
    '<div class="fgrp"><label class="fld">API 基地址（留空为同源）</label><input class="inp" data-bind="apiBase" value="'+esc(state.apiBase)+'" placeholder="http://192.168.27.134:8780"></div>'+
@@ -324,7 +364,7 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
    swSec('settings.confirm','危险操作二次确认','开启时踢盘 / 换盘 / 建池前必须手工输入 OSD 编号或池名。默认开启，关闭需验证密码。',state.settings.confirm,true)+
    '<div class="fgrp" style="margin-top:14px"><label class="fld">强制版本覆盖（用于命令模板）</label><select class="inp" data-bind="settings.forceVersion">'+[['auto','自动探测（推荐）']].concat(CEPH_VERSIONS.map(function(v){return [v.v,v.v+' '+v.name];})).map(function(o){return '<option value="'+o[0]+'"'+(s.forceVersion===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select></div>'+
    '<div class="fgrp"><label class="fld">部署方式覆盖</label><select class="inp" data-bind="settings.deployMode">'+[['auto','自动探测'],['cephadm','cephadm / orchestrator'],['legacy','ceph-volume / 传统']].map(function(o){return '<option value="'+o[0]+'"'+(s.deployMode===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select></div>'+
-   '')+'</div>'+
+   '')+sshCard+'</div>'+
   '<div class="grid g2" style="margin-top:14px">'+card('告警阈值','<div class="grid g2">'+
    '<div class="fgrp"><label class="fld">OSD nearfull（%）</label><input class="inp" type="number" data-bind="settings.nearfull" value="'+s.nearfull+'"></div>'+
    '<div class="fgrp"><label class="fld">OSD full（%）</label><input class="inp" type="number" data-bind="settings.full" value="'+s.full+'"></div>'+

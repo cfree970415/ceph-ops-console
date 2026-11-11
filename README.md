@@ -18,6 +18,7 @@
 - [快速开始](#快速开始)
 - [写操作闸门](#写操作闸门)
 - [磁盘运维](#磁盘运维)
+- [二进制 / 包安装集群（无 cephadm）](#二进制--包安装集群无-cephadm)
 - [创建存储池](#创建存储池)
 - [告警中心](#告警中心)
 - [主机 CPU / 内存](#主机-cpu--内存)
@@ -62,6 +63,7 @@ flowchart LR
 | --- | --- |
 | Ceph | 12.x Luminous ~ 19.x Squid，运行时能力探测 |
 | OSD 管理 | `cephadm / orch`、`ceph-volume`、`ceph-disk` 自动选择；含 `ok-to-stop`、`safe-to-destroy` |
+| 部署方式 | cephadm 由 mon 代跑；**二进制 / 包安装集群走 ssh 下发**（单节点自动本地），见「二进制 / 包安装集群」 |
 | Linux | RHEL / CentOS 7-9、Rocky / Alma、Fedora、Ubuntu / Debian、openEuler、Kylin V10 / UOS、SUSE |
 | 初始化系统 | systemd（主）/ SysVinit（回退） |
 | 防火墙 | firewalld / ufw / iptables，可 `--no-firewall` 跳过；SELinux 仅提示 |
@@ -254,7 +256,8 @@ ceph osd dump --format=json                  # 新盘被某个 up/in 的 OSD 接
 ceph -s
 ```
 
-- 包安装（非 cephadm）：① 用 `ceph osd purge`（老版本用 `crush remove` + `auth del` + `osd rm` 三步），② 用 `ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev>`（**不带 `--osd-id`**）。12.x 用 `ceph-disk prepare` / `activate`。新 OSD 默认 CRUSH 权重 1.0；若原盘是自定义权重，按**新编号**手工 `ceph osd crush reweight osd.<新编号> <原权重>`。
+- 包安装（非 cephadm）：① 先 `systemctl disable --now ceph-osd@<id>`（**purge 不会停 systemd 服务**，不停掉进程会继续占着旧盘，之后 zap 新盘会因占用失败）→ `ceph osd purge`（老版本用 `crush remove` + `auth del` + `osd rm` 三步）；② 用 `ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev>`（**不带 `--osd-id`**）。12.x 用 `ceph-disk prepare` / `activate`。新 OSD 默认 CRUSH 权重 1.0；若原盘是自定义权重，按**新编号**手工 `ceph osd crush reweight osd.<新编号> <原权重>`。
+- 包安装的 ①② 命令要在**盘所在的主机**上执行，平台会经 ssh 下发（见「二进制 / 包安装集群」）；单节点部署自动本地执行。
 - 若已 `ceph orch apply osd` 自动纳管，zap 后编排器可能抢先部署，此时 `daemon add osd` 会提示已被管理而失败——该步骤被列为容错，不中断流程，复核仍以「新盘是否被 up/in 的 OSD 接管」为准。
 - **不要**为了换盘再执行 `ceph orch osd rm <id> --replace`：那是保留编号的旧路径，会重新引入 `safe-to-destroy` 死循环。
 
@@ -346,6 +349,89 @@ IN 只清「被标记 OUT」类告警，硬件类（SMART、心跳丢失）仍�
 > 换盘是「① 清退 → 现场人工换盘 → ② 新盘入群」两个独立请求，**不会假装自动完成物理换盘**；高级向导仍用 `stage=pre` / `stage=post` 展示完整命令序列。
 
 ---
+
+## 二进制 / 包安装集群（无 cephadm）
+
+> 面向 `yum install ceph` / `apt install ceph` / 手工二进制部署的集群，也包括 12.x 的 `ceph-disk` 老集群。
+> 这一节回答一个问题：**没有 orchestrator，平台的「动盘」还能不能用。**
+
+### 能直接用（与部署方式无关）
+
+只依赖 mon 侧通用命令的部分，任何方式建出来的集群行为一致：
+
+集群总览、容量 / IOPS 趋势、PG 状态、MON·MGR 拓扑、告警中心、告警确认与静音、主机 CPU / 内存、OSD 列表与设备归属、**创建存储池**、变更审计、登录与角色。
+
+### 动盘：多了一层「命令去哪台机器执行」
+
+cephadm 集群里 `ceph orch daemon stop osd.3` 由 mon 转发，控制台装在哪台机器上都行。
+包安装没有这一层：
+
+| 动作 | cephadm | 包安装（ceph-volume） | 12.x（ceph-disk） |
+| --- | --- | --- | --- |
+| 停 / 起 OSD 进程 | `orch daemon stop/start` | `systemctl stop/start ceph-osd@N` | 同左 |
+| 清退 | `purge` + `orch daemon rm` | `osd purge`（老版本三步式） | 无 purge，三步式 |
+| 新盘入群 | `orch device zap` + `daemon add osd` | `ceph-volume lvm zap/create` | `ceph-disk prepare/activate` |
+| 设备清单 | `orch device ls`（全集群） | 逐台 `lsblk`（**需 ssh**） | 逐台 `lsblk`（**需 ssh**） |
+
+`systemctl` 和 `ceph-volume` 只能在**盘所在的那台主机**上执行，所以 1.2.0 加了一层远程执行：
+
+```mermaid
+flowchart LR
+    UI["浏览器"] --> PY["ceph-console.py"]
+    PY -- "ceph osd purge / dump<br/>（mon 侧，本机）" --> MON[("MON")]
+    PY -- "ssh root@node02<br/>systemctl / ceph-volume" --> N2["node02"]
+    PY -- "ssh root@node03<br/>systemctl / ceph-volume" --> N3["node03"]
+```
+
+- **本机步骤**（`ceph ...`）照旧本地执行，不经 ssh；
+- **远程步骤**在命令列表里带 `@node02` 徽标，命令行渲染成 `ssh root@node02 -- ceph-volume lvm zap /dev/sdc --destroy`；
+- 单节点部署（控制台就是 OSD 主机）自动判定为本机，**不需要配 ssh**；
+- 命令仍然是 argv 数组、每个参数过 `shlex.quote`，主机名只作为 ssh 参数，不拼进命令。
+
+### 配置远程执行
+
+三种方式，任选一种，效果一样（优先级：命令行 > 环境变量 > `config.json`）。
+
+**① 页面上配（推荐）**：`系统设置 → 远程执行 · 二进制 / 包安装集群`，填 SSH 用户 / 端口 / 私钥，点「保存配置」，再点「测试连通性」逐台确认。保存后立即生效，不用重启。
+
+**② 命令行 / 环境变量**：
+
+```bash
+--ssh-user root --ssh-port 22 --ssh-key /root/.ssh/id_rsa   # --no-ssh-sudo 关闭 sudo
+CEPH_CONSOLE_SSH_USER / _SSH_PORT / _SSH_KEY / _SSH_NOSUDO  # 同名环境变量
+--no-ssh                                                    # 彻底关掉远程执行
+```
+
+**③ 部署时写死**（`deploy.sh`，写进 0600 的 env 文件，不进进程参数）：
+
+```bash
+sudo bash deploy.sh --install --local --host 192.168.27.134 \
+  --ssh-user root --ssh-key /root/.ssh/id_rsa --allow-write
+```
+
+前置条件：
+
+1. 控制台主机能 `ssh root@<node>` 免密登录每台 OSD 主机（`ssh-keygen` + `ssh-copy-id`）；
+2. 目标机 `sudo` 配 NOPASSWD（走 root 直连可忽略）：`echo 'root ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/ceph-console`；
+3. 目标机能执行 `ceph-volume` / `systemctl`，并能读 `/etc/ceph/ceph.conf`。
+
+> 页面上的「部署方式覆盖」用于纠偏：某些包安装集群仍装着 cephadm 包，`orch` 命令能跑但没接管，自动探测会误判成 cephadm。此时选 `ceph-volume / 传统` 即可强制按传统方式生成命令。
+
+### 送不到就拒绝，绝不误伤
+
+- 计划里出现非本机步骤、而远程执行不可用时，后端返回 **409** 并列出目标主机，**不会退化成在本机执行**（那会把盘操作打到控制台自己的盘上）；
+- 前端在弹窗里直接红字拦住，但**仍然显示命令**，可以先 DRY-RUN 生成、拿到目标机手工执行；
+- 设备清单逐台采集，某台主机 ssh 不通时，弹窗里会点名「哪台没采到、为什么」，不会让「列表里没有新盘」被误判成「盘没插好」。
+
+### 已知边界
+
+| 场景 | 结论 |
+| --- | --- |
+| 单节点包安装（MON + OSD 同机） | 全功能直接用，不需要 ssh |
+| 多节点包安装 | 配好 ssh 后与 cephadm 体验一致；不配只能观测 + 建池 |
+| 12.x `ceph-disk` | 命令模板齐备，但老集群能力有限（无 `purge`、无 `device ls`），SMART 列常显示「未采集」 |
+| Rook / K8s 上的 Ceph | **不支持动盘**：CLI 在 toolbox 里，宿主没有 `ceph-osd@N` 服务、没有 `ceph-volume`，盘是 PVC |
+| 控制台无 `ssh` 客户端 | 远程步骤全部拒绝执行，页面提示装 `openssh-clients` |
 
 ## 创建存储池
 
@@ -554,7 +640,10 @@ sudo python3 ~/ceph-ops-console/ceph-console.py \
 | GET | `/api/progress` | 回填与任务进度 |
 | GET | `/api/isolation` | 原生 Dashboard 隔离自检 |
 | GET | `/api/audit` | 审计记录 |
-| GET | `/api/devices` | 各主机磁盘清单与 available 标记 |
+| GET | `/api/devices` | 各主机磁盘清单与 available 标记（包安装集群逐台 ssh 采集，附每台主机的采集结果） |
+| GET | `/api/remote` | 远程执行配置；`?probe=1` 逐台 ssh 探活 |
+| POST | `/api/remote/config` | 保存 SSH 用户 / 端口 / 私钥 / sudo 与部署方式覆盖（admin） |
+| POST | `/api/remote/test` | 逐台主机 ssh 探活（只跑 `hostname`，不下发任何命令） |
 | GET | `/api/osd/<id>/meta` | OSD 元数据 |
 | POST | `/api/quick/kick` | 踢盘（停服务 + down + out，返回 `verify`） |
 | POST | `/api/quick/in` | IN 盘（启服务 + in + 回填观察） |
@@ -597,6 +686,9 @@ curl -H "X-Console-Token: <token>" http://192.168.27.134:8780/api/probe
 | `--cors-origin` | `*` | 允许的 UI 来源，逗号分隔 |
 | `--token` | 自动生成 | 服务 API token |
 | `--no-auth` | 关 | 禁用登录（不推荐） |
+| `--ssh-user` `--ssh-port` `--ssh-key` | root / 22 / 默认 | 远程执行凭据，写入 0600 env 文件 |
+| `--no-ssh-sudo` | 关 | 远程命令不加 `sudo -n`（ssh 账号为 root 时用） |
+| `--no-ssh` | 关 | 彻底关闭远程执行（单节点 / cephadm 集群） |
 | `--no-firewall` `--no-service` | 关 | 跳过防火墙 / 服务注册 |
 | `--install-deps` | 关 | 尝试安装 python3 / ceph-common |
 | `--uninstall` `--purge` | — | 卸载 / 连配置一起删 |
@@ -641,10 +733,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.31-20261111'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.2.0-20261111'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.31-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.2.0-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 
@@ -681,7 +773,7 @@ journalctl -u ceph-console -n 50 --no-pager
 
 ### 常见问题
 
-**只读模式下点踢盘 / 换盘，怎么没有提示框？** 1.1.25 的提示框挂错了位置（挂在 `onAct` 的后半段，而 `q-*` / `pool-*` 在前面就被分流了），所以点了直接进流程。1.1.26 已修，8 个写入口（踢盘 / ① 清退 / ② 入群 / 新增磁盘 / 向导 / IN / OUT / 建池）全部弹提示。升级后 Ctrl+F5 强制刷新，构建号要是 `1.1.31-20261111`。
+**只读模式下点踢盘 / 换盘，怎么没有提示框？** 1.1.25 的提示框挂错了位置（挂在 `onAct` 的后半段，而 `q-*` / `pool-*` 在前面就被分流了），所以点了直接进流程。1.1.26 已修，8 个写入口（踢盘 / ① 清退 / ② 入群 / 新增磁盘 / 向导 / IN / OUT / 建池）全部弹提示。升级后 Ctrl+F5 强制刷新，构建号要是 `1.2.0-20261111`。
 
 **第一次点「立即执行初始化」没反应？** 现在有两条固定线索，不用猜：
 
@@ -698,7 +790,19 @@ journalctl -u ceph-console -n 50 --no-pager
 
 **弹窗里「命令序列」是空的？** 还没填设备路径时后端没有可预览的步骤，1.1.27 起框里会直接说明「填好路径后点重新生成命令，或直接点立即执行由后端现算」，不再是一个空框。**没有探测到空闲盘**（提示「未探测到可自动纳管的空闲盘」）时，要手工填设备路径并自己确认这块盘没被别的 OSD 用。
 
-**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.31-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+**包安装集群里「新增磁盘」下拉是空的 / 只有控制台本机的盘？** 说明该主机的磁盘没采到。
+1.2.0 起设备清单是**逐台主机** `lsblk` 采的，弹窗里会直接点名哪台失败、原因是什么：
+- `控制台未启用远程执行（SSH）` → 去「系统设置 → 远程执行」填用户 / 端口 / 私钥并保存；
+- `Permission denied (publickey)` → 控制台到该主机没配免密，`ssh-copy-id root@<node>`；
+- `No route to host` / 超时 → 网络或防火墙（8780 之外，**22 端口也要通**）；
+- 命令里出现 `sudo: a password is required` → 目标机 `sudo` 没配 NOPASSWD。
+点「测试连通性」会逐台跑一遍 `hostname`，只读、不下发任何命令。
+
+**升级后页面上的 SSH / 安全策略设置丢了？** 1.2.0 起 `deploy.sh` 不再覆盖已存在的 `/etc/ceph-console/config.json`（会先备份成 `config.json.bak.<时间戳>` 再保留），因为里面除了阈值还有页面上保存的安全策略与远程执行配置。
+
+**包安装集群点「立即执行」报 409「缺少远程执行能力」？** 这是**故意的**：计划里有命令要在别的主机上执行，而控制台 ssh 不过去。后端拒绝退化成在本机执行——那会把 `ceph-volume zap` 打到控制台自己的盘上。配好 ssh 或改用 DRY-RUN 拿命令手工执行。
+
+**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.2.0-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
 
 **清退后这块盘从列表里消失了，只能「新增磁盘」加回来？** 正常。① 清退执行的是 `ceph osd purge <id>`，mon 侧编号被删掉，`osd dump` 里没有它了，列表自然不显示——数据本来就要跟着盘一起走。新盘装好后走 ② 换盘后·新盘入群（或独立用「新增磁盘」扩容），会拿到一个**新编号**。若加回来一直 down，见下一条。
 

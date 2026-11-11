@@ -19,6 +19,12 @@ NO_KEYRING=0
 INSTALL_DEPS=0
 ALLOW_WRITE=0
 BACKEND="cli"
+# 远程执行（二进制 / 包安装集群）：默认 root + 22 + sudo，需要用 --ssh-* 覆盖
+SSH_USER=""
+SSH_PORT=""
+SSH_KEY=""
+SSH_SUDO=1
+SSH_DISABLE=0
 HOST=""
 PORT="8780"
 DIR="/opt/ceph-console"
@@ -79,6 +85,12 @@ Usage:  sudo bash deploy.sh [options]
   --backend-url URL   Backend API URL for --mode frontend, e.g. http://IP:8780
   --cors-origin LIST  Allowed UI origins (default *; comma separated to restrict)
   --no-auth           Disable login (NOT recommended)
+  --ssh-user USER     Remote-exec user for binary/package-installed clusters
+                      (without cephadm, disk ops must run on the disk's host)
+  --ssh-port N        Remote-exec SSH port (default 22)
+  --ssh-key PATH      SSH private key for remote execution
+  --no-ssh-sudo       Run remote commands without sudo -n (ssh user is root)
+  --no-ssh            Disable remote execution (single node / cephadm only)
   --no-firewall       Do not modify firewall rules
   --no-service        Do not register systemd/SysV service
   --install-deps       Attempt to install python3 / ceph-common via package manager
@@ -91,6 +103,9 @@ Examples:
   bash deploy.sh --local --host 192.168.27.134 --port 8780
   # One-click install on the Ceph admin node (real OSD ops enabled):
   sudo bash deploy.sh --local --host 192.168.27.134 --allow-write --install
+  # Binary/package cluster with several OSD hosts (disk ops over ssh):
+  sudo bash deploy.sh --local --host 192.168.27.134 --allow-write --install \
+    --ssh-user root --ssh-key /root/.ssh/id_rsa
   # Split deployment: UI on a separate web server, backend on the Ceph node:
   sudo bash deploy.sh --local --mode frontend --dir /var/www/ceph-console \
     --backend-url http://192.168.27.134:8780 --install
@@ -125,6 +140,12 @@ while [ $# -gt 0 ]; do
     --backend) BACKEND="$2"; shift ;;
     --rest-url) REST_URL="$2"; shift ;;
     --rest-token) REST_TOKEN="$2"; shift ;;
+    # 远程执行（二进制 / 包安装集群动盘时用）：不配则只有本机能动盘
+    --ssh-user) SSH_USER="$2"; shift ;;
+    --ssh-port) SSH_PORT="$2"; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
+    --no-ssh-sudo) SSH_SUDO=0 ;;
+    --no-ssh) SSH_DISABLE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (use --help)" ;;
   esac
@@ -423,6 +444,13 @@ READ_ONLY_FLAG=0
 [ "$KEYRING_MODE" = "readonly" ] && READ_ONLY_FLAG=1
 
 # ---- config / env (token never appears in the unit file or process list) ----
+# config.json 里除了阈值，还有从页面上保存的安全策略与远程执行配置。
+# 重装时直接覆盖会把这些设置清掉（用户会以为「升级后配置丢了」），
+# 所以只在不存在时写入；已存在就备份一份再原样保留。
+if [ -f "$CONF_DIR/config.json" ]; then
+  cp -a "$CONF_DIR/config.json" "$CONF_DIR/config.json.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  ok "existing config.json kept (backup written next to it)"
+else
 cat > "$CONF_DIR/config.json" <<EOF
 {
   "nearfull": 85,
@@ -435,12 +463,19 @@ cat > "$CONF_DIR/config.json" <<EOF
 }
 EOF
 chmod 0644 "$CONF_DIR/config.json"
+fi
 
 cat > "$CONF_DIR/env" <<EOF
 CEPH_CONSOLE_TOKEN=$TOKEN
 CEPH_CONSOLE_ALLOW_WRITE=$ALLOW_WRITE
 CEPH_CONSOLE_READ_ONLY=$READ_ONLY_FLAG
 EOF
+# 远程执行：写进 env（0600），不进 unit 文件也不进进程参数
+if [ -n "$SSH_USER" ]; then echo "CEPH_CONSOLE_SSH_USER=$SSH_USER" >> "$CONF_DIR/env"; fi
+if [ -n "$SSH_PORT" ]; then echo "CEPH_CONSOLE_SSH_PORT=$SSH_PORT" >> "$CONF_DIR/env"; fi
+if [ -n "$SSH_KEY" ]; then echo "CEPH_CONSOLE_SSH_KEY=$SSH_KEY" >> "$CONF_DIR/env"; fi
+if [ "$SSH_SUDO" -eq 0 ]; then echo "CEPH_CONSOLE_SSH_NOSUDO=1" >> "$CONF_DIR/env"; fi
+if [ "$SSH_DISABLE" -eq 1 ]; then echo "CEPH_CONSOLE_SSH_DISABLE=1" >> "$CONF_DIR/env"; fi
 chmod 0600 "$CONF_DIR/env"
 ok "config and token env written ($CONF_DIR/env, mode 0600)"
 

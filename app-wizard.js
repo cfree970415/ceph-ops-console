@@ -167,6 +167,10 @@ function syncState(force){
    if(typeof d.settings.downMin==='number')state.settings.downMin=d.settings.downMin;
    if(typeof d.settings.allow_write==='boolean')state.settings.allowWrite=d.settings.allow_write;
    if(typeof d.settings.confirm==='boolean')state.settings.confirm=d.settings.confirm;
+   /* 二进制 / 包安装集群：远程执行配置随状态下发，页面据此提示
+      「动盘命令要 ssh 到哪台机器」「还没配好 ssh 就别点执行」。 */
+   if(d.settings.ssh&&typeof d.settings.ssh==='object')state.settings.ssh=d.settings.ssh;
+   if(d.settings.deploy_mode)state.settings.deployMode=d.settings.deploy_mode;
   }
   if(err)console.warn('backend state:',err);
   if(d.profile)state.profile=d.profile;

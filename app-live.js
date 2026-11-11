@@ -178,6 +178,42 @@ function doLogout(){
  state.auth=authReset();render();renderAuth();toast('已退出登录','ok');
 }
 /* ---------- change the signed-in account's password ---------- */
+/* ---------- 远程执行（二进制 / 包安装集群） ----------
+   动盘命令必须在「盘所在主机」上执行：cephadm 由 mon 代跑，包安装没有这一层。
+   这两个动作只改配置 / 只做探活，不执行任何写命令。 */
+function sshForm(){
+ var s=state.settings.ssh||{};
+ return {enabled:s.enabled!==false,user:s.user||'root',
+  port:Number(s.port)||22,key:s.key||'',sudo:s.sudo!==false};
+}
+function sshSave(){
+ if(state.mode!=='live'||!state.auth.authenticated){toast('请先登录后再保存','w');return;}
+ var body={ssh:sshForm(),deploy_mode:state.settings.deployMode||'auto'};
+ toast('正在保存远程执行配置…','');
+ apiFetch('POST','/api/remote/config',body).then(function(r){
+  if(r.profile)state.profile=r.profile;
+  if(r.ssh)state.settings.ssh=Object.assign({},state.settings.ssh||{},r.ssh);
+  if(r.deploy_mode)state.settings.deployMode=r.deploy_mode;
+  render();
+  var st=state.settings.ssh||{};
+  toast(st.ready?('已保存 · 远程执行就绪（'+(st.user||'root')+'@<host>:'+(st.port||22)+'）')
+                :('已保存，但远程执行还不可用：'+(st.reason||'请检查 ssh 客户端')), st.ready?'ok':'w');
+  syncState(true);
+ }).catch(function(e){toast('保存失败：'+(e.message||'未知错误'),'e');});
+}
+function sshTest(){
+ if(state.mode!=='live'||!state.auth.authenticated){toast('请先登录后再测试','w');return;}
+ toast('正在逐台测试 ssh 连通性（只跑 hostname，不下发任何命令）…','');
+ apiFetch('POST','/api/remote/test',{}).then(function(r){
+  state.sshProbe=r.hosts||[];
+  if(r.ssh)state.settings.ssh=Object.assign({},state.settings.ssh||{},r.ssh);
+  render();
+  var bad=(r.hosts||[]).filter(function(h){return !h.ok&&!h.local;});
+  if(!r.ready){toast('远程执行不可用：'+((r.ssh&&r.ssh.reason)||'未配置'),'e');return;}
+  toast(bad.length?(bad.length+' 台主机不可达：'+bad.map(function(h){return h.host;}).join('、'))
+                  :('全部 '+(r.hosts||[]).length+' 台主机 ssh 可达'), bad.length?'w':'ok');
+ }).catch(function(e){toast('测试失败：'+(e.message||'未知错误'),'e');});
+}
 function changePassword(){
  var $=function(id){return document.getElementById(id);},msg=$('pw-msg');
  var show=function(text,bad){if(msg)msg.innerHTML='<span class="'+(bad?'td':'t')+'">'+esc(text)+'</span>';};
@@ -317,7 +353,10 @@ function quickPlan(k,w){
   return apiFetch('POST','/api/plan',{intent:quickIntent(k),osd_id:w.osdId,host:w.host,dev:w.dev})
    .then(function(r){
     var steps=(r.steps||[]).map(function(s){
-     return {n:s.name,c:s.command||('# '+s.name+'：'+s.note),note:s.note||'',manual:!!s.manual};});
+     /* host / remote：二进制包安装集群里，systemctl、ceph-volume 必须 ssh 到
+        盘所在主机执行。步骤上标出来，用户一眼就知道这条不是在本机跑。 */
+     return {n:s.name,c:s.command||('# '+s.name+'：'+s.note),note:s.note||'',manual:!!s.manual,
+      host:s.host||'',remote:!!s.remote,via:s.via||''};});
     /* 只读预检（清退前是否 down / 入群前新盘归属）挂在数组上，
        不改变步骤结构，原有调用方不用改。 */
     steps.precheck=r.precheck||null;
@@ -427,7 +466,11 @@ function quickOpenReplace(o){
 /* 新增磁盘（扩容）：目标是「设备」，不是某个 OSD；先探测可用的空闲盘再生成命令 */
 function loadFreeDevices(q){
  if(!(state.mode==='live'&&state.auth.authenticated))return Promise.resolve([]);
- return apiFetch('GET','/api/devices',null).then(function(r){return (r&&r.devices)||[];})
+ return apiFetch('GET','/api/devices',null).then(function(r){
+  /* 多节点包安装集群：盘是逐台 ssh 采的，哪台没采到必须让用户看见，
+     否则「列表里没有新盘」会被误认为「盘没插好」。 */
+  state.deviceScan={hosts:(r&&r.hosts)||[],mode:(r&&r.mode)||'',remote:(r&&r.remote)||null};
+  return (r&&r.devices)||[];})
   .catch(function(){return [];});
 }
 function quickOpen(kind,osdId){
@@ -647,11 +690,31 @@ function qHead(){var q=state.quick;
   ' · osd.'+q.osdId;
  return modalHead(quickTitle(q.kind)+tail,
  '后端按 Ceph 版本自动选择命令模板 · '+(q.dryRun?'DRY-RUN 只生成命令':'真实执行'));}
+function qRemoteHosts(q){
+ var seen={},out=[];(q.steps||[]).forEach(function(s){
+  if(s.host&&s.remote&&!seen[s.host]){seen[s.host]=1;out.push(s.host);}});
+ return out;}
+function qRemoteWarn(q){
+ var hosts=qRemoteHosts(q);if(!hosts.length)return '';
+ var ssh=state.settings.ssh||{},far=hosts;
+ if(ssh.ready!==false){
+  var nCmd=(q.steps||[]).filter(function(s){return s.host&&s.remote;}).length;
+  return '<div class="warnbox" style="margin-bottom:10px">'+ic('link')+
+   '<div>这 '+nCmd+' 条命令要在 '+far.length+' 台目标主机上执行（ssh）：<b class="mono">'+esc(far.join('、'))+'</b>'+
+   '<br><span class="note">执行时后端会 ssh 到该主机（'+(ssh.user||'root')+'@host:'+(ssh.port||22)+'），'+
+   '不是在这台控制台上跑。本机步骤照旧本地执行。</span></div></div>';}
+ return '<div class="dangerbox" style="margin-bottom:10px">'+ic('alert')+
+  '<div><b>远程执行未就绪，真实下发会被后端拒绝</b><br>目标主机（'+far.length+' 台，'+nCmd+' 条命令）：<b class="mono">'+esc(far.join('、'))+
+  '</b><br><span class="note">'+esc(ssh.reason||'控制台未配置 SSH')+
+  '。到「系统设置 → 远程执行」配置 SSH 用户 / 端口 / 私钥，并点「测试连通性」。'+
+  '现在可以先用 DRY-RUN 生成命令，拿到目标主机上手工执行。</span></div></div>';
+}
 function cmdLines(q){
  if(!q.steps.length)return '<div class="cm"># 还没有可预览的命令：先在下面填好设备路径，点「重新生成命令」即可预览；'+
   '直接点「立即执行」也行，后端会按当前参数现算。</div>';
- return q.steps.map(function(s,i){
-  return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
+ return qRemoteWarn(q)+q.steps.map(function(s,i){
+  var tag=(s.host&&s.remote)?'<span class="tag info" title="在 '+esc(s.host)+' 上执行">@'+esc(s.host)+'</span> ':'';
+  return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+tag+esc(s.c)+
    (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('');
 }
 function quickPaintModal(){
@@ -690,6 +753,13 @@ function quickPaintModal(){
    return '<option value="'+esc(d.dev)+'"'+(d.dev===q.dev?' selected':'')+'>'+esc(d.dev)+' · '+bytes(d.size||0)+
     ' · '+esc(d.host||'本机')+(isRep&&d.dev===q.oldDev?' · 原盘位':'')+
     (d.available?'':' · 需先清理')+(d.note?' · '+esc(d.note):'')+'</option>';}).join('');
+  /* 多节点包安装：盘是逐台 ssh 采的。有主机没采到就明说，
+     避免「列表里没有新盘」被误判成「盘没插好 / 平台坏了」。 */
+  var scan=state.deviceScan||{},badHosts=(scan.hosts||[]).filter(function(h){return !h.ok;});
+  var scanWarn=badHosts.length?'<div class="warnbox" style="margin-bottom:10px">'+ic('alert')+
+   '<div><b>'+badHosts.length+' 台主机没采到磁盘清单</b><br>'+
+   badHosts.map(function(h){return '· <b class="mono">'+esc(h.host)+'</b>：'+esc(h.err||'原因未知');}).join('<br>')+
+   '<br><span class="note">这些主机上的盘不会出现在下拉里。到「系统设置 → 远程执行」检查该主机的 ssh 连通性。</span></div></div>':'';
   var flowTitle=isRetire?'把 osd.'+q.osdId+' 从集群彻底删除（编号不保留，现场再换盘）':
    isDeploy?'把换好的新盘接回集群，由 mon 分配一个新 OSD 编号':
    q.kind==='init'?'把新插入的磁盘初始化并加入集群（会新增一个 OSD 编号）':
@@ -711,7 +781,7 @@ function quickPaintModal(){
   b='<div class="warnbox" style="margin-bottom:14px">'+ic(isRep?'disk':'zap')+
    '<div><b>'+flowTitle+'</b><br>'+flowText+
    '<br>'+flowNote+
-   '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+preBox+
+   '<br>当前为 <b>'+(q.dryRun?'DRY-RUN 演示（命令不下发）':'真实 EXECUTE 模式')+'</b>。</div></div>'+preBox+scanWarn+
    (isRep?'<div class="grid g2" style="margin-bottom:14px"><div>'+
      '<div class="stat-line"><span>目标 OSD</span><b class="mono tp">osd.'+q.osdId+'</b></div>'+
      '<div class="stat-line"><span>原设备</span><b class="mono">'+esc(q.oldDev||'未采集')+'</b></div></div><div>'+
@@ -1380,6 +1450,8 @@ onAct=function(act,el){
  if(act==='diag-run'){runDiag();return;}
  if(act==='logout')return doLogout();
  if(act==='change-password')return changePassword();
+ if(act==='ssh-save')return sshSave();
+ if(act==='ssh-test')return sshTest();
  if(act==='overlay'){
   if(state.quick&&(state.quick.phase==='running'||state.quick.phase==='paused')){
    toast('操作进行中，请先完成或中止','w');return;}

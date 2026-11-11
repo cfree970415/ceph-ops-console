@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.31"
+VERSION = "1.2.0"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
@@ -92,6 +92,23 @@ POOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # --------------------------------------------------------------------------
 # config
 # --------------------------------------------------------------------------
+def _int_arg(raw, env, default, lo=1, hi=65535):
+    """从若干候选值里取第一个能转成整数的（带范围钳制），都不行就用兜底。
+
+    ssh 端口 / 超时既可能来自命令行、环境变量，也可能来自 config.json，
+    任何一处填错都不应该让整个进程起不来 —— 一律回退到安全默认值。
+    """
+    for v in (raw, env):
+        if v in (None, ""):
+            continue
+        try:
+            n = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue
+        return max(lo, min(hi, n))
+    return default
+
+
 class Config(object):
     def __init__(self, args):
         self.backend = args.backend
@@ -115,6 +132,27 @@ class Config(object):
                                       os.environ.get("CEPH_CONSOLE_NO_AUTH") == "1")
         self.session_ttl = int(getattr(args, "session_ttl", 0) or SESSION_TTL)
         self.cors_origin = getattr(args, "cors_origin", "") or os.environ.get("CEPH_CONSOLE_CORS", "") or "*"
+        # 远程执行（二进制 / 包安装集群）：systemctl、ceph-volume、ceph-disk 必须
+        # 在「盘所在的那台机器」上跑，cephadm 有 orchestrator 代劳，包安装没有。
+        # 优先级：命令行 > 环境变量 > config.json 的 ssh 段 > 默认值。
+        self.ssh = {
+            "enabled": not bool(getattr(args, "no_ssh", False)
+                                or os.environ.get("CEPH_CONSOLE_SSH_DISABLE") == "1"),
+            "user": (getattr(args, "ssh_user", "") or os.environ.get("CEPH_CONSOLE_SSH_USER", "")
+                     or getattr(args, "host_ssh_user", "") or "root"),
+            "port": _int_arg(getattr(args, "ssh_port", ""),
+                             os.environ.get("CEPH_CONSOLE_SSH_PORT"), 22, 1, 65535),
+            "key": (getattr(args, "ssh_key", "") or os.environ.get("CEPH_CONSOLE_SSH_KEY", "") or ""),
+            "sudo": not bool(getattr(args, "no_ssh_sudo", False)
+                             or os.environ.get("CEPH_CONSOLE_SSH_NOSUDO") == "1"),
+            "connect_timeout": _int_arg(getattr(args, "ssh_timeout", ""),
+                                        os.environ.get("CEPH_CONSOLE_SSH_TIMEOUT"), 6, 2, 60),
+        }
+        # --host-metrics 沿用同一套凭据，避免出现「两处 ssh 配置互相打架」
+        self.host_ssh_user = self.ssh["user"]
+        # 「部署方式覆盖」：某些包安装集群仍然装着 cephadm 包（orch 命令能跑但没用），
+        # 自动探测会误判成 cephadm。这里允许在页面上强制按传统方式生成命令。
+        self.deploy_override = "auto"
         self.dry_run = not self.allow_write
         if not self.token:
             self.token = "change-me-" + str(int(time.time()))
@@ -370,6 +408,7 @@ class Probe(object):
         self.major = 0
         self.codename = "unknown"
         self.orchestrator = "legacy"
+        self.deploy_mode = "unknown"   # cephadm | ceph-volume | ceph-disk
         self.caps = {}
         self.detected = False
         self.error = ""
@@ -401,11 +440,32 @@ class Probe(object):
                 rc2, _, e2 = ceph_run(self.cfg, ["orch", "status"], 8)
                 if rc2 != 0 and ("unknown" in e2.lower() or "invalid" in e2.lower()):
                     self.caps["orch"] = False
+            # 「部署方式覆盖」：包安装集群也可能装了 cephadm 包（orch 命令能执行，
+            # 但没有实际接管）。此时自动探测会把命令模板带偏，允许人工强制。
+            ov = str(getattr(self.cfg, "deploy_override", "auto") or "auto").lower()
+            if ov == "legacy":
+                self.caps["orch"] = False
             self.orchestrator = "cephadm" if self.caps["orch"] else "legacy"
+            # 真正决定「动盘命令长什么样」的是 OSD 是怎么创建出来的：
+            #   cephadm  -> orch daemon add / orch device zap
+            #   包安装    -> ceph-volume lvm create / zap（12.x 前是 ceph-disk）
+            if self.caps["orch"]:
+                self.deploy_mode = "cephadm"
+            elif self.major and self.major < 13:
+                self.deploy_mode = "ceph-disk"
+            elif self.major or shutil.which("ceph-volume"):
+                self.deploy_mode = "ceph-volume"
+            else:
+                self.deploy_mode = "unknown"
+            if ov == "cephadm" and not self.caps["orch"]:
+                # 覆盖成 cephadm 但集群确实没有 orchestrator：如实标记，不假装可用
+                self.orchestrator = "legacy (orch 不可用)"
+            _DEPLOY_STATE.update({"mode": self.deploy_mode, "orch": bool(self.caps["orch"])})
         else:
             self.caps = {"orch": False, "purge": False, "ok_to_stop": False,
                          "safe_to_destroy": False, "device_ls": False, "mgr_services": True}
             self.orchestrator = "legacy"
+            self.deploy_mode = "unknown"
             self.codename = "rest-proxy"
         if self.cfg.read_only:
             self.orchestrator += " (read-only)"
@@ -416,6 +476,10 @@ class Probe(object):
                   "orchestrator": self.orchestrator, "backend": self.cfg.backend,
                   "caps": self.caps, "detected": self.detected, "error": self.error,
                   "dry_run": self.cfg.dry_run, "read_only": self.cfg.read_only,
+                  "deploy_mode": self.deploy_mode,
+                  "deploy_override": getattr(self.cfg, "deploy_override", "auto"),
+                  # remote 只是一份配置概况（不探活），逐主机连通性走 /api/remote
+                  "remote": ssh_summary(self.cfg),
                   "console_version": VERSION})
         return d
 
@@ -688,6 +752,183 @@ def remote_usage(cfg, target, timeout=6):
                                         err or ""):
             break
     return None, last
+
+
+# --------------------------------------------------------------------------
+# remote execution (binary / package-installed clusters)
+#   cephadm 有 orchestrator：`ceph orch daemon stop` / `orch device zap` 都是
+#   mon 侧下发，控制台在哪台机器上跑都行。二进制包安装没有这一层：
+#   systemctl、ceph-volume、ceph-disk 必须落到「盘所在的那台主机」上执行。
+#   这里只补这一个能力缺口，命令本身仍然由 build_plan 生成，argv 原样传递：
+#     * 本机命令直接 exec，不经 shell；
+#     * 远端命令由 ssh 拼成一行，每个 token 都过 shlex.quote；
+#     * 主机名只作为 ssh 的 argv 参数，不会被拼进命令里（防注入）。
+#   执行层不可用时绝不用本机命令顶替 —— 那会把盘操作打到错误的机器上。
+# --------------------------------------------------------------------------
+SSH_PROBE_CACHE = {}       # host -> {"ts":..., "ok":..., "out":..., "err":...}
+_SSH_LOCK = threading.Lock()
+SSH_OK_TTL = 60            # 连通时缓存 60s
+SSH_BAD_TTL = 30           # 失败后 30s 内不再重试，避免每次刷新都卡超时
+
+
+def ssh_settings(cfg):
+    """当前生效的远程执行配置（已做过范围钳制与兜底）。"""
+    st = dict(getattr(cfg, "ssh", None) or {})
+    return {"enabled": st.get("enabled", True) is not False,
+            "user": str(st.get("user") or "root"),
+            "port": _int_arg(st.get("port"), None, 22),
+            "key": str(st.get("key") or ""),
+            "sudo": st.get("sudo", True) is not False,
+            "connect_timeout": _int_arg(st.get("connect_timeout"), None, 6, 2, 60)}
+
+
+def ssh_client():
+    return shutil.which("ssh") or ""
+
+
+def ssh_ready(cfg):
+    """远程执行是否可用：开关打开 + 本机有 ssh 客户端。"""
+    return bool(ssh_settings(cfg)["enabled"] and ssh_client())
+
+
+def host_is_local(host):
+    """这台主机是不是控制台所在的机器（主机名 / 短名 / 本机任一 IP）。"""
+    if not host:
+        return True
+    try:
+        u = local_usage()
+    except Exception:
+        u = {}
+    name = str(host).split(".")[0].lower()
+    lh = (u.get("host") or socket.gethostname() or "").split(".")[0].lower()
+    if name and lh and name == lh:
+        return True
+    return bool(host) and host in (u.get("ips") or [])
+
+
+def _sudo_wrap(cfg, argv, sudo, local=False):
+    """需要提权时前置 sudo -n（-n = 不提示输入密码，失败就报错，绝不挂住）。"""
+    st = ssh_settings(cfg)
+    use = st["sudo"] if sudo is None else bool(sudo)
+    if not use:
+        return list(argv)
+    try:
+        if os.geteuid() == 0:
+            return list(argv)     # 本地已经是 root，再加 sudo 反而多一层
+    except AttributeError:
+        # 非 Linux（开发机 / 测试）：谈不上 sudo，原样执行
+        if local:
+            return list(argv)
+    return ["sudo", "-n"] + list(argv)
+
+
+def host_run(cfg, host, argv, timeout=60, sudo=None):
+    """在指定主机执行 argv，返回 (rc, out, err, via)。
+
+    host 为空或就是本机 → 直接执行（via='local'）；
+    否则经 ssh 下发（via='ssh'）。任何「做不到」都返回 rc=127 与原因，
+    调用方据此报错，绝不静默改成在本机执行。
+    """
+    argv = [str(x) for x in argv]
+    via = "local"
+    if host and not host_is_local(host):
+        st = ssh_settings(cfg)
+        if not st["enabled"]:
+            return 127, "", "远程执行未启用：系统设置 → 远程执行（或 --ssh-user）", "disabled"
+        if not ssh_client():
+            return 127, "", "控制台主机上没有 ssh 客户端（openssh-clients）", "nossh"
+        if not HOST_RE.match(str(host)):
+            return 127, "", "主机名不合法：%s" % host, "badhost"
+        dest = "%s@%s" % (st["user"], host)
+        remote = cmd_str(_sudo_wrap(cfg, argv, sudo))
+        base = ["ssh", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
+                "-o", "ConnectTimeout=%d" % st["connect_timeout"],
+                "-p", str(st["port"])]
+        if st["key"]:
+            base += ["-i", st["key"]]
+        # accept-new 需要 OpenSSH 7.6+；CentOS 7（7.4）只认 StrictHostKeyChecking=no。
+        # 只在「参数不被支持」时降级重试，避免命令已经执行成功再跑第二遍。
+        plans = [base + ["-o", "StrictHostKeyChecking=accept-new", "--", dest, remote],
+                 base + ["-o", "StrictHostKeyChecking=no",
+                         "-o", "UserKnownHostsFile=/dev/null", "--", dest, remote]]
+        for i, cmd in enumerate(plans):
+            rc, out, err = run(cmd, timeout)
+            if rc == 0:
+                return rc, out, err, "ssh"
+            if i == 0 and re.search(r"Bad configuration option|Unsupported option|"
+                                    r"command-line: line 0", err or ""):
+                continue
+            return rc, out, err, "ssh"
+        return 127, "", "ssh 不可用", "ssh"
+    return run(_sudo_wrap(cfg, argv, sudo, local=True), timeout) + (via,)
+
+
+def ssh_probe(cfg, host, timeout=6, force=False):
+    """只读探活：能不能 ssh 到这台主机。结果缓存，避免页面刷新卡 ssh 超时。"""
+    host = str(host or "")
+    if not host:
+        return {"host": host, "local": True, "ok": True, "out": "", "err": ""}
+    local = host_is_local(host)
+    if local:
+        return {"host": host, "local": True, "ok": True, "out": socket.gethostname(), "err": ""}
+    now = time.time()
+    with _SSH_LOCK:
+        c = dict(SSH_PROBE_CACHE.get(host) or {})
+    if c and not force and now - c.get("ts", 0) < (SSH_OK_TTL if c.get("ok") else SSH_BAD_TTL):
+        return {"host": host, "local": False, "ok": bool(c.get("ok")),
+                "out": c.get("out", ""), "err": c.get("err", "")}
+    rc, out, err, via = host_run(cfg, host, ["hostname"], timeout, sudo=False)
+    msg = (err or out or "").strip().splitlines()
+    res = {"host": host, "local": False, "ok": rc == 0,
+           "out": (out or "").strip().splitlines()[0][:80] if rc == 0 and out.strip() else "",
+           "err": "" if rc == 0 else ((msg[-1] if msg else "ssh 失败")[:160] + ("" if via == "ssh" else "（%s）" % via))}
+    with _SSH_LOCK:
+        SSH_PROBE_CACHE[host] = {"ts": now, "ok": res["ok"], "out": res["out"], "err": res["err"]}
+    return res
+
+
+def ssh_summary(cfg, hosts=None, probe=False):
+    """给页面用的远程执行概况：配置 + 可选逐主机连通性。"""
+    st = ssh_settings(cfg)
+    ready = ssh_ready(cfg)
+    out = {"enabled": st["enabled"], "ready": ready, "user": st["user"],
+           "port": st["port"], "key": st["key"], "sudo": st["sudo"],
+           "connect_timeout": st["connect_timeout"], "client": ssh_client(),
+           "hosts": [], "local_host": (local_usage().get("host") or socket.gethostname())}
+    if not ready:
+        out["reason"] = ("远程执行已关闭" if not st["enabled"]
+                         else "控制台主机上没有 ssh 客户端（openssh-clients）")
+    for h in (hosts or []):
+        out["hosts"].append(ssh_probe(cfg, h) if probe
+                            else {"host": h, "local": host_is_local(h), "ok": None, "err": ""})
+    return out
+
+
+def apply_remote_settings(cfg, settings):
+    """把 config.json 里的 ssh / deploy_mode 合并进运行时配置。
+
+    命令行显式给过值的项优先（避免页面上改一次就把运维的启动参数覆盖掉）。
+    """
+    st = ssh_settings(cfg)
+    saved = settings.get("ssh") if isinstance(settings.get("ssh"), dict) else {}
+    if saved:
+        if "user" in saved and saved.get("user"):
+            st["user"] = str(saved["user"])[:64]
+        if "port" in saved:
+            st["port"] = _int_arg(saved.get("port"), None, st["port"])
+        if "key" in saved:
+            st["key"] = str(saved.get("key") or "")[:512]
+        if "enabled" in saved:
+            st["enabled"] = saved.get("enabled") is not False
+        if "sudo" in saved:
+            st["sudo"] = saved.get("sudo") is not False
+        if "connect_timeout" in saved:
+            st["connect_timeout"] = _int_arg(saved.get("connect_timeout"), None, 6, 2, 60)
+    cfg.ssh = st
+    cfg.host_ssh_user = st["user"]
+    mode = str(settings.get("deploy_mode") or "auto").lower()
+    cfg.deploy_override = mode if mode in ("auto", "cephadm", "legacy") else "auto"
+    return cfg
 
 
 def host_usage(cfg, name, ip):
@@ -1294,13 +1535,138 @@ def osd_used_devices(cfg):
     return dev_by_id, host_by_id
 
 
-def read_free_devices(cfg, probe):
-    """各主机的磁盘清单，供「一键换盘 / 新增磁盘」选择新盘。"""
-    out, seen = [], set()
+_OSD_HOST_CACHE = {"ts": 0.0, "map": {}}
+
+
+def osd_host_map(cfg, force=False):
+    """osd id -> 主机名。
+
+    包安装集群没有 orchestrator 代跑 systemctl / ceph-volume，这两类命令必须
+    落到 OSD 所在的那台机器上。主机名一律以 CRUSH 树为准（`ceph osd tree`），
+    它不依赖 OSD 进程是否活着 —— metadata 在 OSD down 时是空的，靠不住。
+    """
+    now = time.time()
+    if not force and _OSD_HOST_CACHE["map"] and now - _OSD_HOST_CACHE["ts"] < 30:
+        return _OSD_HOST_CACHE["map"]
+    out = {}
+    doc, _ = ceph_json(cfg, ["osd", "tree"], 20)
+    nodes = doc.get("nodes") if isinstance(doc, dict) else doc
+    by_id = {}
+    for n in (nodes or []):
+        if isinstance(n, dict) and n.get("id") is not None:
+            by_id[n.get("id")] = n
+
+    def walk(n, host):
+        if not isinstance(n, dict):
+            return
+        h = n.get("name") if n.get("type") == "host" else host
+        if n.get("type") == "osd":
+            try:
+                out[int(n.get("id"))] = h or ""
+            except (TypeError, ValueError):
+                pass
+        for c in (n.get("children") or []):
+            walk(by_id.get(c) if not isinstance(c, dict) else c, h)
+
+    for n in by_id.values():
+        if n.get("type") in ("root", "host"):
+            walk(n, "")
+    _OSD_HOST_CACHE["ts"] = now
+    _OSD_HOST_CACHE["map"] = out
+    return out
+
+
+_DEV_SCAN = {"ts": 0.0, "devices": [], "hosts": [], "mode": "", "key": ""}
+_DEV_SCAN_TTL = 20
+_DEV_SCAN_LOCK = threading.Lock()
+_LSBLK_COLS = "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL"
+
+
+def cluster_hosts(cfg):
+    """动盘要下发到哪些主机：CRUSH 树里的 host 节点 + 本机。
+
+    cephadm 时代这些命令都由 mon 转发，主机名只是参数；包安装没有转发层，
+    主机名就是「ssh 去哪台机器执行」，所以这份清单必须来自集群真实拓扑。
+    """
+    hosts = []
     if cfg.backend != "cli":
-        return out
+        return hosts
+    doc, _ = ceph_json(cfg, ["osd", "tree"], 20)
+    nodes = doc.get("nodes") if isinstance(doc, dict) else doc
+    for n in (nodes or []):
+        if not isinstance(n, dict) or n.get("type") != "host":
+            continue
+        name = str(n.get("name") or "").strip()
+        if name and name not in hosts:
+            hosts.append(name)
+    try:
+        me = (local_usage().get("host") or socket.gethostname() or "").split(".")[0]
+    except Exception:
+        me = ""
+    if me and me not in hosts:
+        hosts.append(me)
+    return hosts
+
+
+def _lsblk_json(cfg, host, timeout=12):
+    """在一台主机上跑 lsblk，返回 (blockdevices, err)。"""
+    rc, out, err, via = host_run(cfg, host, ["lsblk", "-J", "-b", "-o", _LSBLK_COLS],
+                                 timeout, sudo=False)
+    if rc != 0:
+        msg = (err or out or "lsblk 执行失败").strip().splitlines()
+        reason = (msg[-1] if msg else "lsblk 执行失败")[:160]
+        if via == "local":
+            reason = "本机 lsblk 执行失败：" + reason
+        return [], reason
+    try:
+        doc = json.loads(out) if out.strip() else {}
+    except ValueError:
+        return [], "lsblk 返回的不是合法 JSON"
+    return (doc.get("blockdevices") or []), ""
+
+
+def _free_from_lsblk(nodes, used):
+    """从 lsblk 树里挑「没有任何签名、没挂载、没子分区」的整盘。"""
+    out = []
+    for d in (nodes or []):
+        if not isinstance(d, dict):
+            continue
+        dev = _dev_path(d.get("name"))
+        if (d.get("type") != "disk" or not dev or dev in used
+                or d.get("fstype") or d.get("mountpoint") or d.get("children")):
+            continue
+        out.append({"dev": dev, "size": d.get("size") or 0, "note": d.get("model") or ""})
+    return out
+
+
+def device_scan(cfg, probe, force=False):
+    """各主机的磁盘清单，供「一键换盘 / 新增磁盘」选择新盘。
+
+    返回 {"devices": [...], "hosts": [...], "mode": "...", "ts": ...}：
+      * cephadm：`ceph orch device ls` 本来就能看到全集群，一轮就够；
+      * 包安装：mon 没有设备视图，只能逐个宿主机 lsblk。以前只跑本机，
+        多节点集群里永远看不到别的机器的盘 —— 这是「平移不了」的核心原因之一。
+    每台主机读不到都会在 hosts 里留下原因（ssh 未启用 / 不可达 / 无 lsblk），
+    宁可显示「该主机未采集」，也不把本机的盘冒充成全集群的盘。
+    """
+    now = time.time()
+    orch = bool(probe.caps.get("orch"))
+    mode = getattr(probe, "deploy_mode", "") or ""
+    # 缓存必须带「采集方式」：同一进程里 cephadm 与 legacy 的取盘逻辑完全不同，
+    # 只按时间缓存会让切换部署方式后仍返回上一轮的结果。
+    key = "%s|%s" % ("orch" if orch else "legacy", mode)
+    with _DEV_SCAN_LOCK:
+        cached = dict(_DEV_SCAN)
+    if (not force and cached["devices"] and cached.get("key") == key
+            and now - cached["ts"] < _DEV_SCAN_TTL):
+        return cached
+    out, hosts_info = [], []
+    if cfg.backend != "cli":
+        return {"devices": out, "hosts": hosts_info, "mode": mode, "ts": now, "key": key}
+
     if probe.caps.get("orch"):
         doc, _ = ceph_json(cfg, ["orch", "device", "ls"], 30)
+        seen = set()
         for it in (doc if isinstance(doc, list) else []):
             if not isinstance(it, dict):
                 continue
@@ -1309,9 +1675,9 @@ def read_free_devices(cfg, probe):
             if isinstance(devs, list) and devs and isinstance(devs[0], dict):
                 for d in devs:
                     dev = _dev_path(d.get("path") or d.get("dev") or "")
-                    if not dev or dev in seen:
+                    if not dev or (host, dev) in seen:
                         continue
-                    seen.add(dev)
+                    seen.add((host, dev))
                     out.append({"host": host, "dev": dev,
                                 "size": d.get("size") or 0,
                                 "available": bool(d.get("available")),
@@ -1319,91 +1685,171 @@ def read_free_devices(cfg, probe):
             else:
                 for p in (devs or []):
                     dev = _dev_path(p)
-                    if not dev or dev in seen:
+                    if not dev or (host, dev) in seen:
                         continue
-                    seen.add(dev)
+                    seen.add((host, dev))
                     out.append({"host": host, "dev": dev,
                                 "size": it.get("size") or 0,
                                 "available": bool(it.get("available")),
                                 "note": ""})
-        return sorted(out, key=lambda x: (x.get("host") or "", x.get("dev") or ""))
+        hosts_info = [{"host": h, "local": host_is_local(h), "ok": bool(doc is not None),
+                       "err": "" if doc is not None else "ceph orch device ls 无返回",
+                       "src": "orch"} for h in sorted(set(x["host"] for x in out if x["host"]))]
+        res = {"devices": sorted(out, key=lambda x: (x.get("host") or "", x.get("dev") or "")),
+               "hosts": hosts_info, "mode": mode or "cephadm", "ts": now, "key": key}
+        with _DEV_SCAN_LOCK:
+            _DEV_SCAN.update(res)
+        return res
 
-    # 包安装 / legacy：用 lsblk 找没有分区、没有文件系统、没有挂载的整盘，
-    # 再排掉已经被 OSD 用掉的设备（宁可少列，也不能把在用的盘当成新盘）。
-    used = set(osd_used_devices(cfg)[0].values())
-    rc, txt, _ = run(["lsblk", "-J", "-b", "-o",
-                      "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL"], 10)
-    if rc == 0 and txt.strip():
+    # 包安装 / legacy：逐台宿主机 lsblk。设备「是否在用」必须按主机算 ——
+    # /dev/sda 在每台机器上都存在，拿全集群的集合去比对会把新盘全排掉。
+    hosts = cluster_hosts(cfg)
+    remote_ok = ssh_ready(cfg)
+    dev_by_id, host_by_id = osd_used_devices(cfg)
+    used_by_host = {}
+    for oid, d in dev_by_id.items():
+        if not d:
+            continue
+        h = host_by_id.get(oid) or ""
+        used_by_host.setdefault(h, set()).add(d)
+    results = {}
+
+    def work(h):
+        if h and not host_is_local(h) and not remote_ok:
+            results[h] = ([], "控制台未启用远程执行（SSH），读不到该主机的磁盘")
+            return
         try:
-            doc = json.loads(txt)
-        except ValueError:
-            doc = {}
-        for d in (doc.get("blockdevices") or []):
-            if not isinstance(d, dict):
-                continue
-            dev = _dev_path(d.get("name"))
-            if (d.get("type") != "disk" or not dev or dev in used
-                    or d.get("fstype") or d.get("mountpoint") or d.get("children")):
-                continue
-            out.append({"host": "", "dev": dev, "size": d.get("size") or 0,
-                        "available": True, "note": d.get("model") or ""})
-    return out
+            nodes, err = _lsblk_json(cfg, h)
+        except Exception as e:
+            results[h] = ([], str(e))
+            return
+        used = used_by_host.get(h)
+        if used is None:
+            # 该主机没有已知 OSD 设备记录：仍按全集群集合排一遍（宁可少列）
+            used = set(d for d in dev_by_id.values() if d)
+        results[h] = (_free_from_lsblk(nodes, used), err)
+
+    threads = []
+    for h in hosts:
+        t = threading.Thread(target=work, args=(h,))
+        t.daemon = True
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(15)
+    for h in hosts:
+        devs, err = results.get(h, ([], "采集超时（主机无响应）"))
+        for d in devs:
+            out.append({"host": h, "dev": d["dev"], "size": d["size"],
+                        "available": True, "note": d["note"]})
+        hosts_info.append({"host": h, "local": host_is_local(h), "ok": not err,
+                           "err": err, "src": "lsblk",
+                           "devices": len(devs)})
+    res = {"devices": sorted(out, key=lambda x: (x.get("host") or "", x.get("dev") or "")),
+           "hosts": hosts_info, "mode": mode or "ceph-volume", "ts": now, "key": key}
+    with _DEV_SCAN_LOCK:
+        _DEV_SCAN.update(res)
+    return res
+
+
+def read_free_devices(cfg, probe):
+    """各主机的磁盘清单（保持旧签名：只返回设备数组）。"""
+    return device_scan(cfg, probe)["devices"]
 
 
 _LSBLK_OSD_CACHE = {"ts": 0.0, "map": {}}
+# Probe 每次刷新都会把「当前是不是 cephadm」记在这里，供不持有 probe 的
+# 读路径（read_osds → osd_lsblk_map）判断要不要跨主机扫盘。
+_DEPLOY_STATE = {"mode": "unknown", "orch": False}
 
 
-def osd_lsblk_map():
-    """osd fsid -> {"dev": 整盘, "size": 字节, "rota": bool}。
+def _lsblk_osd_map_on(cfg, host):
+    """单台主机：ceph-volume LVM 名 → 整盘。返回 {fsid: {...}}。"""
+    rc, txt, err, via = host_run(cfg, host, ["lsblk", "-J", "-b", "-o",
+                                             "NAME,KNAME,SIZE,TYPE,FSTYPE,PKNAME,ROTA"],
+                                 10, sudo=False)
+    if rc != 0 or not txt.strip():
+        return {}
+    try:
+        doc = json.loads(txt)
+    except ValueError:
+        return {}
+    flat = {}
+
+    def walk(nodes, parent):
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            flat[n.get("name") or ""] = (n, parent)
+            walk(n.get("children") or [], n.get("name") or "")
+
+    walk(doc.get("blockdevices") or [], "")
+    out = {}
+    for name, (n, parent) in flat.items():
+        if str(n.get("fstype") or "") != "ceph_bluestore":
+            continue
+        m = re.search(r"osd--block--([0-9a-f]{8}(?:--[0-9a-f]{4}){3}--[0-9a-f]{12})",
+                      name)
+        if not m:
+            continue
+        fsid = m.group(1).replace("--", "-")
+        # 顺着 PKNAME 往上追到整盘（type=disk），盘符与容量都以整盘为准。
+        cur_name, dev, size = parent, "", int(n.get("size") or 0)
+        seen = set()
+        while cur_name and cur_name not in seen:
+            seen.add(cur_name)
+            cur, cur_parent = flat.get(cur_name, ({}, ""))
+            if cur.get("type") == "disk":
+                dev = _dev_path(cur.get("name"))
+                size = int(cur.get("size") or size)
+                break
+            cur_name = cur_parent
+        rota = str(n.get("rota") or n.get("ROTA") or "") == "1"
+        out[fsid] = {"dev": dev, "size": size, "rota": rota, "host": host}
+    return out
+
+
+def osd_lsblk_map(cfg=None):
+    """osd fsid -> {"dev": 整盘, "size": 字节, "rota": bool, "host": 主机}。
 
     `ceph osd metadata` 只在 OSD 进程活着时才有；OSD down / daemon 起不来时
     metadata 只剩 {"id": n}，平台就会把服务器 / 设备 / 容量全显示成"未采集"。
     这里不依赖任何 ceph 命令，直接读 ceph-volume 建出来的 LVM 命名
     （ceph--<vg>--osd--block--<osd_fsid>）反查盘符与容量，down 的 OSD 也能定位。
+
+    包安装集群里 OSD 分散在多台主机，本机 lsblk 只看得到本机的盘，所以
+    cephadm 之外会按主机并行扫一遍并合并（fsid 全局唯一，合并是安全的）。
     读不到就返回空字典，调用方保持"未采集"，不猜。
     """
     now = time.time()
     if _LSBLK_OSD_CACHE["map"] and now - _LSBLK_OSD_CACHE["ts"] < 30:
         return _LSBLK_OSD_CACHE["map"]
-    out = {}
-    rc, txt, _ = run(["lsblk", "-J", "-b", "-o",
-                      "NAME,KNAME,SIZE,TYPE,FSTYPE,PKNAME,ROTA"], 10)
-    if rc == 0 and txt.strip():
+    hosts = [""]
+    if cfg is not None and getattr(cfg, "backend", "cli") == "cli" and not _DEPLOY_STATE.get("orch"):
+        if ssh_ready(cfg):
+            try:
+                hosts = cluster_hosts(cfg) or [""]
+            except Exception:
+                hosts = [""]
+    out, lock = {}, threading.Lock()
+
+    def work(h):
         try:
-            doc = json.loads(txt)
-        except ValueError:
-            doc = {}
-        flat = {}
+            m = _lsblk_osd_map_on(cfg, h)
+        except Exception:
+            m = {}
+        with lock:
+            for k, v in (m or {}).items():
+                out.setdefault(k, v)
 
-        def walk(nodes, parent):
-            for n in nodes or []:
-                if not isinstance(n, dict):
-                    continue
-                flat[n.get("name") or ""] = (n, parent)
-                walk(n.get("children") or [], n.get("name") or "")
-
-        walk(doc.get("blockdevices") or [], "")
-        for name, (n, parent) in flat.items():
-            if str(n.get("fstype") or "") != "ceph_bluestore":
-                continue
-            m = re.search(r"osd--block--([0-9a-f]{8}(?:--[0-9a-f]{4}){3}--[0-9a-f]{12})",
-                          name)
-            if not m:
-                continue
-            fsid = m.group(1).replace("--", "-")
-            # 顺着 PKNAME 往上追到整盘（type=disk），盘符与容量都以整盘为准。
-            cur_name, dev, size = parent, "", int(n.get("size") or 0)
-            seen = set()
-            while cur_name and cur_name not in seen:
-                seen.add(cur_name)
-                cur, cur_parent = flat.get(cur_name, ({}, ""))
-                if cur.get("type") == "disk":
-                    dev = _dev_path(cur.get("name"))
-                    size = int(cur.get("size") or size)
-                    break
-                cur_name = cur_parent
-            rota = str(n.get("rota") or n.get("ROTA") or "") == "1"
-            out[fsid] = {"dev": dev, "size": size, "rota": rota}
+    threads = []
+    for h in hosts:
+        t = threading.Thread(target=work, args=(h,))
+        t.daemon = True
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(12)
     _LSBLK_OSD_CACHE["ts"] = now
     _LSBLK_OSD_CACHE["map"] = out
     return out
@@ -1559,7 +2005,7 @@ def osd_device_map(cfg, want=None):
                         uuid_by_id[int(o.get("osd"))] = str(o.get("uuid") or "")
                     except (TypeError, ValueError):
                         continue
-        lb = osd_lsblk_map()
+        lb = osd_lsblk_map(cfg)
         for oid in missing:
             backing = lb.get(uuid_by_id.get(oid, "")) or {}
             if backing.get("dev"):
@@ -1653,7 +2099,7 @@ def read_osds(cfg):
     dev_by_id, dev_host_by_id, serial_by_id = osd_device_map(cfg, ids)
     # OSD 进程挂掉时 metadata 是空的，设备和容量只能从宿主机 lsblk 反查
     # （ceph-volume 的 LVM 名里带 osd fsid）。读不到就仍是"未采集"。
-    lsblk_by_fsid = osd_lsblk_map()
+    lsblk_by_fsid = osd_lsblk_map(cfg)
 
     out = []
     for oid in ids:
@@ -1858,6 +2304,96 @@ def security_update(cfg, settings, user, role, body, remote=""):
                               "confirm": settings.get("confirm", True) is not False},
                  "capability": bool(cfg.allow_write),
                  "read_only": bool(getattr(cfg, "read_only", False)),
+                 "path": path}
+
+
+def remote_update(cfg, settings, user, role, body, remote=""):
+    """保存「远程执行」配置（SSH 账号 / 端口 / 私钥 / sudo）与部署方式覆盖。
+
+    为什么单独一个入口：二进制包安装的集群没有 orchestrator，动盘命令必须
+    由控制台 ssh 到目标主机执行。这是唯一需要落盘、且会改变命令「跑到哪台
+    机器上」的设置，必须能一眼看清、随时能关。
+
+    权限：只认 admin 会话。它本身不下发任何命令，真正危险的是「允许真实
+    写操作」（另需密码），两者是分开的两道闸门。
+    """
+    if not user:
+        return 403, {"error": "请用账号密码登录后修改远程执行配置（服务令牌不支持）"}
+    if role != "admin":
+        return 403, {"error": "只有 admin 角色可以修改远程执行配置"}
+    cur = ssh_settings(cfg)
+    want = {}
+    src = body.get("ssh") if isinstance(body.get("ssh"), dict) else body
+    if "enabled" in src:
+        if not isinstance(src.get("enabled"), bool):
+            return 400, {"error": "ssh.enabled 必须是布尔值"}
+        want["enabled"] = src["enabled"]
+    if "sudo" in src:
+        if not isinstance(src.get("sudo"), bool):
+            return 400, {"error": "ssh.sudo 必须是布尔值"}
+        want["sudo"] = src["sudo"]
+    if "user" in src:
+        u = str(src.get("user") or "").strip()
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$", u or ""):
+            return 400, {"error": "ssh 用户名不合法（字母数字 . _ - ，不超过 32 字符）"}
+        want["user"] = u
+    if "port" in src:
+        try:
+            p = int(str(src.get("port")).strip())
+        except (TypeError, ValueError):
+            return 400, {"error": "ssh 端口必须是 1-65535 的整数"}
+        if p < 1 or p > 65535:
+            return 400, {"error": "ssh 端口必须是 1-65535 的整数"}
+        want["port"] = p
+    if "key" in src:
+        k = str(src.get("key") or "").strip()
+        if k and (not k.startswith("/") or re.search(r"\s|[\"'`$;&|<>]", k)):
+            return 400, {"error": "私钥路径必须是绝对路径，且不能含空格或 shell 特殊字符"}
+        want["key"] = k
+    if "connect_timeout" in src:
+        want["connect_timeout"] = _int_arg(src.get("connect_timeout"), None, 6, 2, 60)
+    mode = body.get("deploy_mode")
+    if mode is not None:
+        mode = str(mode or "auto").lower()
+        if mode not in ("auto", "cephadm", "legacy"):
+            return 400, {"error": "deploy_mode 只能是 auto / cephadm / legacy"}
+    if not want and mode is None:
+        return 400, {"error": "没有需要修改的项"}
+    if "key" in want and want["key"] and not os.path.isfile(want["key"]):
+        return 400, {"error": "私钥文件不存在：%s（请在控制台主机上确认路径）" % want["key"]}
+
+    merged = dict(cur)
+    merged.update(want)
+    old_ssh = settings.get("ssh")
+    old_mode = settings.get("deploy_mode")
+    settings["ssh"] = merged
+    if mode is not None:
+        settings["deploy_mode"] = mode
+    path = conf_path(cfg)
+    ok, err = save_conf(path, settings)
+    if not ok:
+        if old_ssh is None:
+            settings.pop("ssh", None)
+        else:
+            settings["ssh"] = old_ssh
+        if old_mode is None:
+            settings.pop("deploy_mode", None)
+        else:
+            settings["deploy_mode"] = old_mode
+        audit("REMOTE_SETTING", "-", "-", "FAIL", "写入配置失败：%s" % err, remote, user)
+        return 500, {"error": "写入 %s 失败：%s" % (path, err)}
+    apply_remote_settings(cfg, settings)
+    # 配置变了，之前的探测结论和扫盘结果都失效
+    with _SSH_LOCK:
+        SSH_PROBE_CACHE.clear()
+    with _DEV_SCAN_LOCK:
+        _DEV_SCAN.update({"ts": 0.0, "devices": [], "hosts": [], "mode": "", "key": ""})
+    _LSBLK_OSD_CACHE.update({"ts": 0.0, "map": {}})
+    audit("REMOTE_SETTING", ",".join(sorted(want.keys())) or "deploy_mode", "-", "OK",
+          json.dumps({"ssh": merged, "deploy_mode": mode or settings.get("deploy_mode")},
+                     ensure_ascii=False), remote, user)
+    return 200, {"ok": True, "ssh": merged,
+                 "deploy_mode": mode if mode is not None else settings.get("deploy_mode", "auto"),
                  "path": path}
 
 
@@ -2604,7 +3140,11 @@ def read_state(cfg, probe, settings):
                          "full": settings.get("full"),
                          "downMin": settings.get("downMin"),
                          "allow_write": settings.get("allow_write") is True,
-                         "confirm": settings.get("confirm", True) is not False}}
+                         "confirm": settings.get("confirm", True) is not False,
+                         # 二进制 / 包安装集群：动盘要走 ssh。这里给的是配置概况
+                         # （不探活），逐主机连通性由 /api/remote?probe=1 现查。
+                         "ssh": ssh_summary(cfg),
+                         "deploy_mode": getattr(probe, "deploy_mode", "unknown")}}
 
 
 # --------------------------------------------------------------------------
@@ -2759,7 +3299,7 @@ def validate_target(osd_id, host, dev):
     return oid
 
 
-def _plan_retire(cfg, probe, oid, add):
+def _plan_retire(cfg, probe, oid, add, host=""):
     """① 换盘前·清退：确认 down → 从集群彻底删除旧编号（不保留）。
 
     直接用 mon 侧命令式 ceph osd purge，绕过 cephadm 的 --replace 队列：
@@ -2769,6 +3309,16 @@ def _plan_retire(cfg, probe, oid, add):
     """
     orch = probe.caps.get("orch", False)
     purge = probe.caps.get("purge", False)
+    if not orch:
+        # 包安装集群的 OSD 是 systemd 服务：ceph osd purge 只删 mon 侧记录，
+        # 不会停掉进程，而 /etc/systemd/system/ceph-osd.target.wants 下的
+        # 符号链接还会让它开机自启。不停不禁用，进程会继续占着旧盘，
+        # 之后 ceph-volume zap 新盘 / 拔盘都会被占用报错。
+        add("停止并禁用旧 OSD 服务",
+            ["systemctl", "disable", "--now", "ceph-osd@%d" % oid],
+            "只停服务、不动数据：包安装集群必须显式停掉，否则 purge 之后进程仍在跑，"
+            "旧盘一直被占用。服务不存在时报错属正常（12.x 命名可能不同），流程继续",
+            host=host)
     if orch:
         add("清掉旧版的僵尸移除任务",
             ["ceph", "orch", "osd", "rm", "stop", str(oid)],
@@ -2834,15 +3384,18 @@ def _plan_deploy(cfg, probe, oid, host, dev, add):
             ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
             "只读：新 OSD 应为 running；编号可能与 osd.%d 不同，属正常" % oid)
     else:
+        # 这一段的命令全部落在「盘所在的那台机器」上：包安装集群没有 orchestrator
+        # 转发，必须由控制台 ssh 过去执行（本机则直接 exec）。
         if probe.major >= 13:
             add("清理新盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"],
-                "清掉旧签名；只作用于 %s，执行前请核对盘位与 SN" % dev)
+                "清掉旧签名；只作用于 %s，执行前请核对盘位与 SN" % dev, host=host)
             add("创建 OSD（不指定编号，由 mon 分配）",
                 ["ceph-volume", "lvm", "create", "--data", str(dev)],
-                "不带 --osd-id：mon 分配一个新编号，旧编号 osd.%d 不再保留" % oid)
+                "不带 --osd-id：mon 分配一个新编号，旧编号 osd.%d 不再保留" % oid, host=host)
         else:
-            add("准备新盘（12.x）", ["ceph-disk", "prepare", str(dev)])
-            add("激活 OSD（12.x）", ["ceph-disk", "activate", str(dev)])
+            add("准备新盘（12.x）", ["ceph-disk", "prepare", str(dev)],
+                "ceph-disk 时代的老命令；12.x 之后请升到 bluestore + ceph-volume", host=host)
+            add("激活 OSD（12.x）", ["ceph-disk", "activate", str(dev)], "", host=host)
         add("确认新 OSD 的 CRUSH 权重",
             ["ceph", "osd", "crush", "tree", "--format=json"],
             "只读：新 OSD 默认权重 1.0。若原盘是自定义权重，按新编号手工 "
@@ -2872,12 +3425,22 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     # ① 清退阶段此时新盘根本还没换上，要求 dev 是荒谬的。
     if intent not in ("in", "downout", "init", "retire") and not dev and (not orch or intent == "remove"):
         raise ValueError("device path is required for this operation")
-    plan = []  # (name, argv_or_None, note)
+    plan = []  # (name, argv_or_None, note, host)
 
-    def add(name, argv, note=""):
-        plan.append((name, argv, note))
+    def add(name, argv, note="", host=None):
+        # host 只在「包安装 + 非本机」时才有值：它决定这条命令经 ssh 落到哪台机器。
+        # cephadm 的计划一律 host=None —— mon 侧命令在哪执行都一样。
+        plan.append((name, argv, note, host if (host and not orch) else None))
 
     DOWN_NOTE = "先停服务再摘盘：避免故障盘抖动产生 slow ops；已 down 时该命令幂等"
+    # 包安装集群：systemctl / ceph-volume 必须在 OSD 所在主机执行。
+    # 主机名优先用调用方给的（界面上就是这个 OSD 的 host），否则按 CRUSH 树反查。
+    osd_host = ""
+    if not orch and oid is not None:
+        try:
+            osd_host = host or (osd_host_map(cfg).get(int(oid)) or "")
+        except (TypeError, ValueError):
+            osd_host = host or ""
 
     if intent in ("replace", "retire", "deploy"):
         # 换盘（1.1.24 起不保留 OSD 编号）拆成两个互不依赖的动作：
@@ -2895,7 +3458,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             if not host:
                 raise ValueError("换盘后入群必须指定新盘所在的服务器")
         if intent in ("replace", "retire"):
-            _plan_retire(cfg, probe, oid, add)
+            _plan_retire(cfg, probe, oid, add, osd_host)
         if intent == "replace":
             add("物理更换故障盘", None,
                 "现场操作：按盘位 / SN 换上同规格新盘，装回原盘位、原主机。"
@@ -2920,7 +3483,8 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         if orch:
             add("清理设备", ["ceph", "orch", "device", "zap", str(host), str(dev), "--force"])
         elif dev:
-            add("清除磁盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"])
+            add("清除磁盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"],
+                "在本机执行；多节点集群会自动下发到该 OSD 所在主机", host=host)
         add("集群健康验证", ["ceph", "-s", "--format=json"])
     elif intent == "downout":
         # 一键踢盘的真实语义：把盘停掉并从 CRUSH 摘出，保留 OSD 身份与数据。
@@ -2931,7 +3495,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             "只改 osdmap 标记不够：进程还在跑时心跳会把 down 立刻改回 up，必须先停服务。"
             "但若下一步是「① 换盘前·清退」，不要长期停着 daemon：cephadm 在 purge "
             "前需要 OSD 上报 stats 才能通过 osd safe-to-destroy，长期停服务会让"
-            "移除队列卡在 done, waiting for purge")
+            "移除队列卡在 done, waiting for purge", host=osd_host)
         add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
             "从 CRUSH 摘出并触发数据回填；不 purge、不清盘，随时可 osd in 恢复")
@@ -2939,7 +3503,8 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     elif intent == "in":
         # 踢盘时停过守护进程，IN 必须把它拉起来，否则 osd in 之后仍是 down。
         add("启动 OSD 守护进程", osd_daemon_cmd(probe, "start", oid),
-            "踢盘时停过服务；进程没起来时 osd in 只会恢复权重，状态仍是 down")
+            "踢盘时停过服务；进程没起来时 osd in 只会恢复权重，状态仍是 down",
+            host=osd_host)
         add("确认 OSD 仍在 CRUSH map", ["ceph", "osd", "tree", "--format=json"],
             "已被 purge / rm 的 OSD 无法 in，只能重新部署")
         add("重新加入集群（osd in）", ["ceph", "osd", "in", str(oid)],
@@ -2960,12 +3525,19 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             add("等待 OSD 上线", ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
                 "新 OSD 应为 running，且 ceph osd tree 中显示 up / in")
         else:
+            # 包安装：这三步都要在「插了新盘的那台机器」上跑。单节点集群时
+            # 它解析成本机，自动退化成本地执行，不需要配 ssh。
+            try:
+                _hs = cluster_hosts(cfg)
+            except Exception:
+                _hs = []
+            init_host = host or (_hs[0] if len(_hs) == 1 else "")
             add("预检设备是否未被占用", ["ceph-volume", "lvm", "list", "--format=json"],
-                "确认 %s 不在已用设备列表里" % dev)
+                "确认 %s 不在已用设备列表里（在这台机器上执行）" % dev, host=init_host)
             add("清理新盘旧元数据", ["ceph-volume", "lvm", "zap", dev, "--destroy"],
-                "清掉分区表 / LVM / 文件系统签名；执行前请核对盘位与 SN")
+                "清掉分区表 / LVM / 文件系统签名；执行前请核对盘位与 SN", host=init_host)
             add("初始化并创建 OSD", ["ceph-volume", "lvm", "create", "--data", dev],
-                "在该设备上创建 OSD 并自动加入 CRUSH，随后开始回填")
+                "在该设备上创建 OSD 并自动加入 CRUSH，随后开始回填", host=init_host)
         add("集群健康验证", ["ceph", "-s", "--format=json"],
             "新 OSD 上线后数据开始回填，观察 PG 回到 active+clean")
     else:
@@ -2973,16 +3545,38 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     return plan
 
 
-def plan_strings(plan):
+def _step(it):
+    """计划项统一成 (name, argv, note, host)，兼容只有三个字段的旧计划（建池）。"""
+    name, argv, note = it[0], it[1], it[2]
+    host = it[3] if len(it) > 3 else ""
+    return name, argv, note, (host or "")
+
+
+def plan_strings(plan, cfg=None):
+    """把计划渲染成可直接粘贴执行的命令行。
+
+    远程步骤写成 `ssh user@host -- <cmd>`：既让人一眼看出「这条不是在本机跑」，
+    也让复制出去的文本能直接落地执行。本机步骤保持裸命令，不额外加噪声。
+    """
     out = []
-    for name, argv, note in plan:
-        out.append(cmd_str(argv) if argv else "# %s：%s" % (name, note or "人工步骤"))
+    for it in plan:
+        name, argv, note, host = _step(it)
+        if not argv:
+            out.append("# %s：%s" % (name, note or "人工步骤"))
+            continue
+        cmd = cmd_str(argv)
+        if host and not host_is_local(host):
+            out.append("ssh %s@%s -- %s" % (ssh_settings(cfg)["user"], host, cmd))
+        else:
+            out.append(cmd)
     return out
 
 
 # 这些步骤失败不应中断整个流程（权限不足 / 服务本来就没跑 / 编排器未接管），
 # 失败只记警告，后续步骤继续，最后由状态复核给出真实结论。
 TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止故障 OSD 守护进程",
+                  # 包安装集群：服务可能已经不存在（purge 过 / 12.x 命名不同）
+                  "停止并禁用旧 OSD 服务",
                   "预检设备是否可加入集群", "预检设备是否未被占用",
                   "轮询移除进度", "确认新盘已被编排器识别",
                   # ① 清退：队列里没有任务时 orch osd rm stop 会报错，属正常；
@@ -2999,22 +3593,30 @@ TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止�
 
 def execute_plan(cfg, probe, plan, allow_write):
     """DRY-RUN by default. Real execution only with --allow-write (and not read-only)."""
-    commands = plan_strings(plan)
+    commands = plan_strings(plan, cfg)
     if not allow_write or cfg.read_only or cfg.backend != "cli":
         return commands, ["dry-run: not executed"] * len(plan), True
     results = []
-    for name, argv, note in plan:
+    for it in plan:
+        name, argv, note, host = _step(it)
         if argv is None:
             results.append("manual step acknowledged (not automated)")
             continue
-        # ceph commands get conf/keyring/name injected; ceph-volume runs as-is
-        if argv[0] == "ceph":
+        remote = bool(host and not host_is_local(host))
+        # ceph 命令（mon 侧）注入 conf/keyring 后在本机执行；
+        # ceph-volume / systemctl / ceph-disk 必须在目标主机执行（远程步骤走 ssh）。
+        if remote:
+            rc, out, err, _via = host_run(cfg, host, argv, 180)
+            label = "%s@%s: %s" % (ssh_settings(cfg)["user"], host, cmd_str(argv))
+        elif argv[0] == "ceph":
             rc, out, err = ceph_run(cfg, argv[1:], 60)
+            label = cmd_str(argv)
         else:
             rc, out, err = run(argv, 120)
+            label = cmd_str(argv)
         text = (out.strip() or err.strip() or "rc=%d" % rc)[:300]
         results.append("rc=%d %s" % (rc, text))
-        audit("EXEC", name, cmd_str(argv), "OK" if rc == 0 else "FAIL", text)
+        audit("EXEC", name, label, "OK" if rc == 0 else "FAIL", text)
         if rc != 0:
             if name in TOLERANT_STEPS:
                 results.append("warning: %s 未成功，继续执行后续步骤" % name)
@@ -3032,9 +3634,19 @@ def split_plan(plan):
     return plan, None, []
 
 
-def plan_detail(plan):
-    return [{"name": n, "command": cmd_str(argv) if argv else "",
-             "manual": argv is None, "note": note or ""} for n, argv, note in plan]
+def plan_detail(plan, cfg=None):
+    """前端展示用的步骤清单：带上目标主机，界面据此显示「这台机器上执行」。"""
+    out = []
+    for it in plan:
+        name, argv, note, host = _step(it)
+        remote = bool(host and not host_is_local(host))
+        out.append({"name": name,
+                    "command": cmd_str(argv) if argv else "",
+                    "manual": argv is None, "note": note or "",
+                    "host": host, "remote": remote,
+                    "via": (("ssh %s@%s" % (ssh_settings(cfg)["user"], host)) if remote
+                            else ("local" if argv else ""))})
+    return out
 
 
 def isolation_info(cfg, probe):
@@ -3305,6 +3917,43 @@ class Handler(BaseHTTPRequestHandler):
             payload["allow_write"] = self._write_allowed() and self._can_write()
         return self._json(payload, status)
 
+    def _remote_config(self, body):
+        """保存远程执行配置（admin）：写入 config.json 并立即生效，不需要重启。"""
+        s = self._session()
+        status, payload = remote_update(self.cfg, self.settings,
+                                        s["user"] if s else "",
+                                        (s or {}).get("role", ""), body, self._client())
+        if status == 200:
+            # 部署方式可能被改成 legacy：命令模板跟着变，必须重探一次
+            try:
+                self.probe.refresh()
+            except Exception:
+                pass
+            _STATE_CACHE["data"] = None
+            _STATE_CACHE["ts"] = 0
+            payload["profile"] = self.probe.as_dict()
+        return self._json(payload, status)
+
+    def _remote_test(self, body):
+        """只读探活：ssh 到指定主机跑 `hostname`。不执行任何写命令。"""
+        s = self._session()
+        if not s or s.get("role") != "admin":
+            return self._json({"error": "只有 admin 角色可以测试远程执行"}, 403)
+        host = str(body.get("host", "") or "").strip()
+        if not host:
+            hosts = cluster_hosts(self.cfg) if self.cfg.backend == "cli" else []
+        else:
+            if not HOST_RE.match(host):
+                raise ValueError("invalid host")
+            hosts = [host]
+        res = [ssh_probe(self.cfg, h, force=True) for h in hosts]
+        audit("REMOTE_TEST", ",".join(hosts), "ssh <host> hostname", "OK",
+              json.dumps([{"host": r["host"], "ok": r["ok"], "err": r["err"]} for r in res],
+                         ensure_ascii=False), self._client(), self._user())
+        return self._json({"ok": True, "hosts": res,
+                           "ready": ssh_ready(self.cfg),
+                           "ssh": ssh_summary(self.cfg, hosts)})
+
     def _user(self):
         s = self._session()
         return s["user"] if s else "service-token"
@@ -3521,7 +4170,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "items": read_audit()})
         if path == "/api/devices":
             # 「一键换盘」要先选新盘：只返回未被占用、可直接加入集群的设备。
-            return self._json({"ok": True, "devices": read_free_devices(self.cfg, self.probe),
+            # 包安装集群由后端逐台宿主机 lsblk（多节点必须走 ssh），
+            # 每台主机读不到的原因一并返回，前端据此提示「哪台没采到」。
+            scan = device_scan(self.cfg, self.probe)
+            return self._json({"ok": True, "devices": scan["devices"],
+                               "hosts": scan["hosts"], "mode": scan["mode"],
+                               "orchestrator": self.probe.orchestrator,
+                               "deploy_mode": self.probe.deploy_mode,
+                               "remote": ssh_summary(self.cfg,
+                                                     [h["host"] for h in scan["hosts"]])})
+        if path == "/api/remote":
+            # 远程执行配置 + （可选）逐主机连通性。?probe=1 才会真的去连，
+            # 平时只返回配置，避免页面每次刷新都等一遍 ssh 超时。
+            hosts = cluster_hosts(self.cfg) if self.cfg.backend == "cli" else []
+            probe_now = ("probe=1" in (self.path or "")) and self._session() is not None
+            return self._json({"ok": True,
+                               "data": ssh_summary(self.cfg, hosts, probe=probe_now),
+                               "deploy_mode": self.probe.deploy_mode,
+                               "deploy_override": getattr(self.cfg, "deploy_override", "auto"),
                                "orchestrator": self.probe.orchestrator})
         if path == "/api/pool/options":
             # 创建存储池弹窗的下拉项：OSD 数、CRUSH rule、EC profile、已有池名。
@@ -3570,7 +4236,7 @@ class Handler(BaseHTTPRequestHandler):
         full = build_plan(self.cfg, self.probe, intent, oid, host, dev)
         pre, manual, post = split_plan(full)
         if stage == "pre":
-            plan, pending, pause = pre, plan_strings(post), manual is not None
+            plan, pending, pause = pre, plan_strings(post, self.cfg), manual is not None
         elif stage == "post":
             plan, pending, pause = post, [], False
         else:
@@ -3673,6 +4339,28 @@ class Handler(BaseHTTPRequestHandler):
                       "lsblk -o NAME,FSTYPE,LABEL，确认设备路径确实是换上的新盘。"
                       "本方案不保留编号，不需要等 destroyed 或 osd_id_claims。",
                     "prereq": pre_ok}, 409)
+        # 包安装集群的硬门禁：计划里出现「非本机」步骤时必须能 ssh 过去。
+        # 没有远程执行层就拒绝，绝不退化成在本机跑 ceph-volume/systemctl ——
+        # 那会把盘操作打到控制台自己的盘上，是最危险的一类误操作。
+        if allow:
+            remote_hosts = sorted(set(h for h in (_step(x)[3] for x in plan)
+                                      if h and not host_is_local(h)))
+            if remote_hosts and not ssh_ready(self.cfg):
+                st = ssh_settings(self.cfg)
+                reason = ("远程执行已被关闭" if not st["enabled"]
+                          else "控制台主机上没有 ssh 客户端（openssh-clients）")
+                audit("OSD_%s" % intent.upper(), "osd.%s" % oid, "-", "BLOCKED",
+                      "缺少远程执行能力，拒绝下发：" + reason,
+                      self._client(), self._user())
+                return self._json({"error":
+                    "已阻止执行：这些命令必须在目标主机上运行，但控制台现在连不过去。\n"
+                    + "· 目标主机：" + "、".join(remote_hosts) + "\n"
+                    + "· 原因：" + reason + "\n"
+                    + "请在「系统设置 → 远程执行」里配置 SSH（用户 / 端口 / 私钥），"
+                      "并用「测试连通性」确认每台主机都是可达的。\n"
+                      "也可以先用 DRY-RUN 只生成命令，拿到目标主机上手工执行。",
+                    "remote_hosts": remote_hosts,
+                    "ssh": ssh_summary(self.cfg, remote_hosts)}, 409)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
         prereq = None
         if intent == "replace" and not dry and stage == "pre":
@@ -3887,14 +4575,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._osd_redeploy(body)
         if path == "/api/security":
             return self._security_update(body)
+        if path == "/api/remote/config":
+            return self._remote_config(body)
+        if path == "/api/remote/test":
+            return self._remote_test(body)
         if path == "/api/password":
             return self.api_password(body)
         if path == "/api/pool/plan":
             # 只预览不落库：前端第二步展示的必须与执行时同一套模板。
             spec = validate_pool_spec(body)
             plan = build_pool_plan(self.cfg, self.probe, spec)
-            return self._json({"ok": True, "spec": spec, "steps": plan_detail(plan),
-                               "commands": plan_strings(plan),
+            return self._json({"ok": True, "spec": spec,
+                               "steps": plan_detail(plan, self.cfg),
+                               "commands": plan_strings(plan, self.cfg),
                                "exists": spec["name"] in pool_names(self.cfg),
                                "version": self.probe.version,
                                "orchestrator": self.probe.orchestrator,
@@ -3909,8 +4602,8 @@ class Handler(BaseHTTPRequestHandler):
             dev = str(body.get("dev", "") or "")
             # 校验交给 build_plan：init 意图没有 osd_id，只认 host + dev。
             plan = build_plan(self.cfg, self.probe, intent, oid, host, dev)
-            resp = {"ok": True, "steps": plan_detail(plan),
-                    "commands": plan_strings(plan),
+            resp = {"ok": True, "steps": plan_detail(plan, self.cfg),
+                    "commands": plan_strings(plan, self.cfg),
                     "version": self.probe.version,
                     "orchestrator": self.probe.orchestrator,
                     "allow_write": self._write_allowed() and self._can_write(),
@@ -4055,8 +4748,22 @@ def parse_args(argv):
     p.add_argument("--host-metrics", choices=["auto", "ssh", "off"], default="auto",
                    help="per-host CPU/mem source: auto (local /proc + ssh to other nodes) | "
                         "ssh (ssh only) | off (do not collect)")
-    p.add_argument("--host-ssh-user", default="root",
-                   help="ssh user for --host-metrics (default root; cephadm key must be installed)")
+    # 远程执行：二进制 / 包安装集群动盘时必须能把 systemctl、ceph-volume
+    # 下发到「盘所在的主机」。cephadm 集群用不到，可以不配。
+    p.add_argument("--ssh-user", default="",
+                   help="remote-exec user for binary/package clusters (default root)")
+    p.add_argument("--ssh-port", default="", help="remote-exec ssh port (default 22)")
+    p.add_argument("--ssh-key", default="",
+                   help="ssh private key path (default: agent / ~/.ssh/id_* of the service account)")
+    p.add_argument("--ssh-sudo", dest="ssh_sudo", action="store_true", default=None,
+                   help="run remote commands through sudo -n (default on)")
+    p.add_argument("--no-ssh-sudo", dest="no_ssh_sudo", action="store_true",
+                   help="remote commands run as the ssh user without sudo")
+    p.add_argument("--no-ssh", action="store_true",
+                   help="disable remote execution entirely (single-node / cephadm only)")
+    p.add_argument("--ssh-timeout", default="", help="ssh connect timeout seconds (default 6)")
+    p.add_argument("--host-ssh-user", default="",
+                   help="(deprecated) alias of --ssh-user, kept for older deploy scripts")
     p.add_argument("--print-profile", action="store_true", help="print probe result and exit")
     p.add_argument("--set-password", default="", metavar="USER",
                    help="offline: reset USER's password and exit (reads CEPH_CONSOLE_NEW_PASSWORD, "
@@ -4130,6 +4837,15 @@ def main(argv):
                 settings.update(json.load(f))
         except (IOError, ValueError):
             pass
+    # config.json 里的 ssh / deploy_mode 生效后必须重探一次：
+    # 「部署方式覆盖」直接决定命令模板（orch vs ceph-volume），不能沿用启动时的结论。
+    before = (probe.orchestrator, probe.deploy_mode)
+    apply_remote_settings(cfg, settings)
+    if (probe.orchestrator, probe.deploy_mode) != before or cfg.deploy_override != "auto":
+        try:
+            probe.refresh()
+        except Exception:
+            pass
     Handler.cfg, Handler.probe, Handler.settings = cfg, probe, settings
     public = args.host or cfg.bind
     print("Ceph Ops Console %s" % VERSION)
@@ -4143,6 +4859,12 @@ def main(argv):
           ("DRY-RUN" if cfg.dry_run else "EXECUTE", cfg.allow_write, cfg.read_only))
     print("  Auth      : %s (user store: %s)" %
           ("login required" if cfg.auth_required else "DISABLED - not recommended", cfg.users_file))
+    print("  Deploy    : %s (orchestrator=%s, override=%s)" %
+          (probe.deploy_mode, probe.orchestrator, cfg.deploy_override))
+    _st = ssh_settings(cfg)
+    print("  Remote    : %s (%s@<host>:%d, sudo=%s, key=%s)" %
+          ("ssh ready" if ssh_ready(cfg) else "unavailable",
+           _st["user"], _st["port"], _st["sudo"], _st["key"] or "agent/default"))
     print("  CORS      : %s" % cfg.cors_origin)
     print("  URL       : http://%s:%d/  (sign in with deploy.sh credentials)" % (public, cfg.port))
     print("  Token     : service token stored in the 0600 env file (not logged here)")

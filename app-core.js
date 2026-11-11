@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.31-20261111';
+var UI_BUILD='1.2.0-20261111';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -86,9 +86,11 @@ var state={
  /* 真实 24h 历史：来自后端 /api/history（后端每分钟采样并落盘）。 */
  history:{points:[],at:0,span:0,interval:60,loaded:false,err:'',unsupported:false},
  filters:{alertSev:'all',alertStatus:'all',alertQ:'',osdStatus:'all',osdQ:''},
- settings:{nearfull:85,full:95,downMin:10,pgDegraded:1,slowOps:1000,webhook:'',notifyWebhook:true,notifyMail:false,notifyWecom:false,notifyDing:false,deployMode:'auto',forceVersion:'auto',allowWrite:false,confirm:true},
+ settings:{nearfull:85,full:95,downMin:10,pgDegraded:1,slowOps:1000,webhook:'',notifyWebhook:true,notifyMail:false,notifyWecom:false,notifyDing:false,deployMode:'auto',forceVersion:'auto',allowWrite:false,confirm:true,/* 二进制 / 包安装集群的远程执行配置；由后端 /api/state 覆盖，这里只是占位 */ssh:{enabled:true,ready:true,user:'root',port:22,key:'',sudo:true,hosts:[],reason:''}},
  deploy:{host:'',user:'root',port:'8780',dir:'/opt/ceph-console',keytype:'full',restUrl:''},
  profile:null,wizard:null,modal:null,
+ /* 远程执行探活结果 / 最近一次设备扫描结果（多节点包安装集群用来提示哪台没采到） */
+ sshProbe:null,deviceScan:null,
  /* 登录态：未登录时不渲染任何集群数值（由 app-live.js 的 render 包装处理）。 */
  auth:{required:true,authenticated:false,user:'',role:'viewer',allowWrite:false,writeCapability:false,
   readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false},
@@ -191,7 +193,7 @@ function loadAudit(force){
   return true;
  }).catch(function(){__auditAt=0;return false;});
 }
-function liveProfile(){return state.profile||{version:state.cluster.version,codename:state.cluster.codename,major:18,orchestrator:'cephadm',backend:'cli',os:'自动识别',python:'3.6+',init:'systemd',detected:false,caps:{orch:true,purge:true,ok_to_stop:true,safe_to_destroy:true,device_ls:true,mgr_services:true}};}
+function liveProfile(){return state.profile||{version:state.cluster.version,codename:state.cluster.codename,major:18,orchestrator:'cephadm',deploy_mode:'cephadm',deploy_override:'auto',backend:'cli',os:'自动识别',python:'3.6+',init:'systemd',detected:false,remote:{},caps:{orch:true,purge:true,ok_to_stop:true,safe_to_destroy:true,device_ls:true,mgr_services:true}};}
 
 /* ---- charts ---- */
 function spark(data,color,fill){var w=560,h=140,pad=8,mn=Math.min.apply(null,data),mx=Math.max.apply(null,data),rg=(mx-mn)||1;
@@ -417,6 +419,6 @@ function vOverview(){if(liveNoData())return noDataPage();
    recentList.length?recentList.map(function(a){return alertRow(a,true);}).join('')
     :'<div class="empty" style="padding:16px">'+ic('check',22)+'<div>当前没有活跃告警</div></div>',
    '<button class="btn sm" data-act="nav" data-view="alerts">查看全部 '+ic('arrow',12)+'</button>',false);
- var quick=card('快捷运维',quickOps+'<div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
+ var quick=card('快捷运维',quickOps+'<div class="btn-row"><button class="btn pri" data-act="wizard" data-intent="replace">'+ic('wrench',14)+' 发起踢盘换盘</button><button class="btn" data-act="nav" data-view="deploy">'+ic('rocket',14)+' 部署 / 对接集群</button></div><div class="hr"></div><div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">当前适配档案</div><div class="stat-line"><span>Ceph 版本</span><b class="mono">'+esc(p.version||c.version)+' '+esc(c.codename)+'</b></div><div class="stat-line"><span>编排器</span><b class="mono">'+esc(p.orchestrator)+'</b></div><div class="stat-line"><span>部署方式</span><b class="mono">'+esc(p.deploy_mode||'未探测')+'</b></div><div class="stat-line"><span>能力探测</span><b class="mono t">'+(p.detected?'已自动完成':'按版本推断')+'</b></div>');
  return pageH('集群概览','多版本 Ceph 统一视图 · 监控告警 · Web 一键踢盘换盘','<button class="btn" data-act="nav" data-view="alerts">'+ic('bell',14)+' 查看告警页面</button><button class="btn pri" data-act="q-open" data-kind="init">'+ic('zap',14)+' 一键换盘</button>')+
   noData+alertsStaleBox()+'<div class="grid g4" style="margin-bottom:14px">'+kh+'</div><div class="grid g21" style="margin-bottom:14px">'+trend+donutCard+'</div><div class="grid g2" style="margin-bottom:14px">'+io+pg+'</div><div class="grid g2">'+recent+quick+'</div>';}

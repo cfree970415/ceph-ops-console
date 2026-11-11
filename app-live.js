@@ -401,7 +401,7 @@ function quickOpenInit(o){
 }
 /* 换了新盘 / 改了设备路径 / 改了服务器：重新向后端要命令序列 */
 function replanQuick(q){
- q.phase='loading';q.phrase='';q.inputError='';quickPaintModal();
+ q.phase='loading';q.phrase='';q.inputError='';q.errorField='';quickPaintModal();
  return quickPlan(q.kind,q).then(function(steps){
   if(state.quick!==q)return;
   q.steps=steps;
@@ -422,6 +422,63 @@ function replanQuick(q){
   q.pendingRun=false;
   q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
+/* 「立即执行」的前端校验：返回 {msg, field}，field 指向出错的输入框，
+   点一次就能看见是哪一栏没填（把控件标红 + 滚进视野 + 聚焦）。
+   这里只拦明显的漏填，真正的安全闸门在后端。 */
+function qValidate(q){
+ if(!q)return null;
+ if(q.kind==='init'){
+  if(!q.dev)return {msg:'请先填写或选择新盘设备路径（例如 /dev/nvme0n2）',field:'quick.dev'};
+  if(!q.host)return {msg:'请填写目标服务器（新盘插在哪台机器上）',field:'quick.host'};
+  if(state.settings.confirm&&!q.confirmed)return {msg:'请先勾选「我已现场核对盘位与设备名」',field:'quick.confirmed'};
+  if(state.settings.confirm&&q.phrase!==q.dev)
+   return {msg:'二次确认未通过：请在输入框里原样输入设备路径 '+q.dev,field:'quick.phrase'};
+ }else if(q.kind==='replace'||q.kind==='deploy'){
+  if(!q.dev)return {msg:'请先选择或填写换上新盘的设备路径',field:'quick.dev'};
+  if(!q.host)return {msg:'请填写新盘所在的服务器',field:'quick.host'};
+  if(state.settings.confirm&&!q.confirmed)return {msg:'请先勾选确认',field:'quick.confirmed'};
+  if(state.settings.confirm&&q.phrase!=='osd.'+q.osdId)
+   return {msg:'二次确认未通过：请输入 osd.'+q.osdId,field:'quick.phrase'};
+ }else if(q.kind==='retire'){
+  /* ① 清退不需要选新盘；down 与否由后端执行前硬校验，这里只收确认短语。 */
+  if(state.settings.confirm&&!q.confirmed)return {msg:'请勾选清退确认（旧编号删除不可恢复）',field:'quick.confirmed'};
+  if(state.settings.confirm&&q.phrase!=='osd.'+q.osdId)
+   return {msg:'二次确认未通过：请输入 osd.'+q.osdId,field:'quick.phrase'};
+ }else{
+  if(!q.confirmed)return {msg:'请勾选盘位确认',field:'quick.confirmed'};
+  if(q.phrase!=='osd.'+q.osdId)return {msg:'二次确认未通过：请输入 osd.'+q.osdId,field:'quick.phrase'};
+ }
+ return null;
+}
+/* 把出错的控件标红、滚进视野并聚焦。focus() 本身会把该栏带进视线，
+   所以即使弹窗内容已经很长、需要滚动，也一定能看到是哪一栏。 */
+function qMarkBad(path){
+ if(!path)return;
+ var el=document.querySelector('#modal-root [data-bind="'+path+'"]');
+ if(!el)return;
+ try{if(el.classList)el.classList.add('inp-bad');}catch(e){}
+ try{el.focus();}catch(e){}
+}
+/* 用户开始补填后就地更新红条（不重绘，避免打断输入）：
+   - 原来标红的那栏填上了，就撤掉红框
+   - 还差别的，就把文案换成新的那一条（不抢焦点，别在打字时跳走） */
+function qErrRefresh(){
+ var q=state.quick;if(!q||!q.inputError)return;
+ var cur=document.querySelector('#modal-root [data-bind="'+q.errorField+'"]');
+ if(cur&&cur.classList){
+  var filled=cur.type==='checkbox'?!!cur.checked:!!String(cur.value||'').length;
+  if(filled)cur.classList.remove('inp-bad');
+ }
+ var v=qValidate(q);
+ var bar=document.querySelector('#modal-root .modal-err');
+ if(!v){
+  q.inputError='';q.errorField='';
+  if(bar&&bar.parentNode)bar.parentNode.removeChild(bar);
+  return;
+ }
+ q.inputError=v.msg;q.errorField=v.field;
+ if(bar){var t=bar.querySelector('.err-msg');if(t)t.textContent=v.msg;}
+}
 function qHead(){var q=state.quick;
  var tail=q.kind==='init'?' · '+esc(q.dev||'选择新盘'):
   q.kind==='retire'?' · osd.'+q.osdId+' @ '+esc(q.host||'—'):
@@ -429,6 +486,13 @@ function qHead(){var q=state.quick;
   ' · osd.'+q.osdId;
  return modalHead(quickTitle(q.kind)+tail,
  '后端按 Ceph 版本自动选择命令模板 · '+(q.dryRun?'DRY-RUN 只生成命令':'真实执行'));}
+function cmdLines(q){
+ if(!q.steps.length)return '<div class="cm"># 还没有可预览的命令：先在下面填好设备路径，点「重新生成命令」即可预览；'+
+  '直接点「立即执行」也行，后端会按当前参数现算。</div>';
+ return q.steps.map(function(s,i){
+  return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
+   (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('');
+}
 function quickPaintModal(){
  var q=state.quick;if(!q)return;
  var o=state.osds.filter(function(x){return x.id===q.osdId;})[0]||{},b='',foot='';
@@ -509,9 +573,7 @@ function quickPaintModal(){
     '</span><div class="sp"></div><button class="btn sm" data-act="q-replan">'+ic('refresh',12)+' 重新生成命令</button>'+
     '<button class="btn sm" data-act="q-dev-refresh">'+ic('disk',12)+' 重新探测</button></div>')+
    '<div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">后端生成的命令序列（'+esc(liveProfile().version||'')+' / '+esc(liveProfile().orchestrator||'')+'）</div>'+
-   '<div class="cmdbox" style="max-height:190px;overflow:auto">'+q.steps.map(function(s,i){
-     return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
-      (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('')+'</div>';
+   '<div class="cmdbox" style="max-height:190px;overflow:auto">'+cmdLines(q)+'</div>';
   if(state.settings.confirm){
    b+=isRep
     ?'<div class="hr"></div><div class="fgrp"><label class="fld">输入 <span class="mono" style="color:var(--accent2)">osd.'+q.osdId+'</span> '+
@@ -526,8 +588,6 @@ function quickPaintModal(){
      '<input class="inp mono" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="'+esc(q.dev)+'" autocomplete="off"></div>'+
      '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对盘位与设备名 <span class="mono">'+esc(q.dev)+'</span></span></label>';
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
-  /* 点「立即执行」没过校验时，把原因留在弹窗里；只弹 toast 会被忽略。 */
-  if(q.inputError)b+='<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div><b>还不能执行</b><br>'+esc(q.inputError)+'</div></div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
    '<button class="btn pri" data-act="q-run">'+ic(isRep?'wrench':'zap',14)+' '+
@@ -548,16 +608,12 @@ function quickPaintModal(){
     '<div class="stat-line"><span>SMART</span><b class="'+(o.smart&&o.smart!=='OK'?'td':'t')+'">'+esc(o.smart||'-')+'</b></div>'+
     '<div class="stat-line"><span>命令步骤</span><b class="mono">'+q.steps.length+' 条</b></div></div></div>'+
    '<div class="tiny" style="margin-bottom:8px;font-weight:600;color:var(--muted)">后端生成的命令序列（'+esc(liveProfile().version||'')+' / '+esc(liveProfile().orchestrator||'')+'）</div>'+
-   '<div class="cmdbox" style="max-height:190px;overflow:auto">'+q.steps.map(function(s,i){
-     return '<div class="'+(s.manual?'tw':'')+'"><span class="cm">'+('0'+(i+1)).slice(-2)+'</span> '+esc(s.c)+
-      (s.note?' <span class="cm"># '+esc(s.note)+'</span>':'')+'</div>';}).join('')+'</div>';
+   '<div class="cmdbox" style="max-height:190px;overflow:auto">'+cmdLines(q)+'</div>';
   if(state.settings.confirm){
    b+='<div class="hr"></div><div class="fgrp"><label class="fld">输入 <span class="mono" style="color:var(--accent2)">osd.'+q.osdId+'</span> 确认目标</label>'+
     '<input class="inp" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="osd.'+q.osdId+'" autocomplete="off"></div>'+
     '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>我已现场核对物理盘位与 SN <span class="mono">'+esc(q.serial||'-')+'</span></span></label>';
   }else b+='<div class="hint" style="margin-top:10px">已在设置中关闭二次确认：点击「立即执行」将直接开始。</div>';
-  /* 点「立即执行」没过校验时，把原因留在弹窗里；只弹 toast 会被忽略。 */
-  if(q.inputError)b+='<div class="dangerbox" style="margin-top:12px">'+ic('alert')+'<div><b>还不能执行</b><br>'+esc(q.inputError)+'</div></div>';
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
    (isIn?'':'<button class="btn" data-act="q-wizard" title="'+(isKick?'踢盘只做 down + out；需要彻底移除 OSD 时走完整退役向导（含 purge / 清盘）':'改用带自动预检的完整向导')+'">'+(isKick?'完整退役向导':'高级向导')+'</button>')+
@@ -639,7 +695,11 @@ function quickPaintModal(){
    '<button class="btn" data-act="q-alerts">查看告警</button>'+
    '<button class="btn" data-act="q-audit">变更审计</button><button class="btn pri" data-act="q-close">完成</button>';
  }
- openModal(qHead()+'<div class="modal-b">'+b+'</div><div class="modal-f">'+foot+'</div>','lg');
+ /* 校验没过的原因固定贴在这两个位置（body 之外），内容再长也不会被滚出视野。 */
+ var errBar=q.inputError?'<div class="modal-err" role="alert">'+ic('alert',15)+
+  '<div><b>还不能执行</b>　<span class="err-msg">'+esc(q.inputError)+'</span></div></div>':'';
+ openModal(qHead()+'<div class="modal-b">'+b+'</div>'+errBar+'<div class="modal-f">'+foot+'</div>','lg');
+ if(q.inputError)qMarkBad(q.errorField);
  if(q.phase==='running'||q.phase==='paused')quickPaintLogs();
 }
 /* 只读重新复核：zap 后创建 OSD，守护进程起来有延迟。
@@ -1047,29 +1107,13 @@ function quickAction(act,el){
    if(q.phase==='loading'){
     q.pendingRun=true;toast('命令序列还在生成，生成完会自动开始','w');return;}
    /* 校验失败必须留下痕迹：只弹 toast 太容易被忽略（尤其是弹窗盖住屏幕时），
-     同时在弹窗里写一条红字，并记住是哪一步没填。 */
-   var bad='';
-   if(q.kind==='init'){
-    if(!q.dev)bad='请先填写或选择新盘设备路径（例如 /dev/nvme0n2）';
-    else if(!q.host)bad='请填写目标服务器（新盘插在哪台机器上）';
-    else if(state.settings.confirm&&!q.confirmed)bad='请在下方勾选「我已现场核对盘位与设备名」';
-    else if(state.settings.confirm&&q.phrase!==q.dev)bad='二次确认未通过：请在输入框里原样输入设备路径 '+q.dev;
-   }else if(q.kind==='replace'||q.kind==='deploy'){
-    if(!q.dev)bad='请先选择或填写换上新盘的设备路径';
-    else if(!q.host)bad='请填写新盘所在的服务器';
-    else if(state.settings.confirm&&!q.confirmed)bad='请在下方勾选确认';
-    else if(state.settings.confirm&&q.phrase!=='osd.'+q.osdId)bad='二次确认未通过：请输入 osd.'+q.osdId;
-   }else if(q.kind==='retire'){
-    /* ① 清退不需要选新盘；down 与否由后端执行前硬校验，这里只收确认短语。 */
-    if(state.settings.confirm&&!q.confirmed)bad='请勾选清退确认（旧编号删除不可恢复）';
-    else if(state.settings.confirm&&q.phrase!=='osd.'+q.osdId)bad='二次确认未通过：请输入 osd.'+q.osdId;
-   }else{
-    if(!q.confirmed)bad='请勾选盘位确认';
-    else if(q.phrase!=='osd.'+q.osdId)bad='二次确认未通过：请输入 osd.'+q.osdId;
-   }
-   if(bad){q.inputError=bad;quickPaintModal();toast(bad,'e');return;}
-   q.inputError='';
-   if(state.mode==='live'&&state.auth.role!=='admin'){toast('只读账号无法执行写操作，请用管理员登录','e');return;}
+      同时在弹窗里写一条红字，并记住是哪一步没填。 */
+   var bad=qValidate(q);
+   if(bad){q.inputError=bad.msg;q.errorField=bad.field;quickPaintModal();toast(bad.msg,'e');return;}
+   q.inputError='';q.errorField='';
+   if(state.mode==='live'&&state.auth.role!=='admin'){
+    q.inputError='当前是只读账号，后端会拒绝写操作，请用管理员登录';q.errorField='';
+    quickPaintModal();toast(q.inputError,'e');return;}
    quickExec((q.kind==='init'||isPhase(q.kind))?'auto':'pre');return;
   case 'q-resume':if(q)quickExec('post');return;
   case 'q-abort':if(q){q.aborted=true;toast('已发送中止请求','w');}return;

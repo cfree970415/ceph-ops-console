@@ -520,7 +520,9 @@ function boot(){
    if(window.console&&console.error)console.error('[onAct] '+act,err);
    if(typeof toast==='function')toast('操作异常：'+((err&&err.message)||err),'e');}
  });
- document.addEventListener('input',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);});
+ document.addEventListener('input',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el)setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
+  /* 补填之后校验一旦通过，就把「还不能执行」红条与标红撤掉（不重绘，不打断输入） */
+  if(el&&String(el.getAttribute('data-bind')||'').indexOf('quick.')===0&&typeof qErrRefresh==='function')qErrRefresh();});
  document.addEventListener('change',function(e){state.lastInputAt=Date.now();var el=e.target.closest('[data-bind]');if(el&&(el.tagName==='SELECT'||el.type==='checkbox'))setBind(el.getAttribute('data-bind'),el.type==='checkbox'?(el.checked?'1':''):el.value,el);
   /* 下拉框本身带 data-act（例如换盘时切换新盘设备）时也要触发动作 */
   var a=e.target.closest('select[data-act]');if(a&&!a.disabled)onAct(a.getAttribute('data-act'),a);});

@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.26"
+VERSION = "1.1.27"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，

@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.22"
+VERSION = "1.1.23"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
@@ -921,6 +921,73 @@ def osdspec_managed(cfg):
     return True, ""
 
 
+def _queue_age_min(ts):
+    """ceph orch osd rm status 里的时间是 UTC ISO 串，返回已排队分钟数。"""
+    if not ts:
+        return None
+    try:
+        s = str(ts).replace("Z", "").split("+")[0].split(".")[0]
+        start = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+        return max(0.0, (datetime.utcnow() - start).total_seconds() / 60.0)
+    except (ValueError, TypeError):
+        return None
+
+
+def osd_rm_queue(cfg):
+    """只读回读 ceph orch osd rm status：谁还在移除队列里、卡了多久。
+
+    cephadm 的 --replace 是异步队列。只要还留着 draining / done, waiting for
+    purge 的条目，原编号就不会变成 destroyed，这时做第 ② 步一定失败。
+    """
+    doc, err = ceph_json(cfg, ["orch", "osd", "rm", "status"], 30)
+    if doc is None:
+        return None, err or "ceph orch osd rm status 无返回"
+    items = doc if isinstance(doc, list) else (doc.get("osds") or doc.get("queue") or [])
+    rows = []
+    for x in items:
+        if not isinstance(x, dict):
+            continue
+        try:
+            i = int(x.get("osd_id"))
+        except (TypeError, ValueError):
+            continue
+        started = x.get("process_started_at") or x.get("drain_started_at") or ""
+        rows.append({"osd_id": i, "draining": bool(x.get("draining")),
+                     "drainDone": bool(x.get("drain_done_at")),
+                     "replace": bool(x.get("replace")), "force": bool(x.get("force")),
+                     "startedAt": started, "ageMin": _queue_age_min(started)})
+    return rows, ""
+
+
+def queue_state(row):
+    """把一条移除队列记录翻译成人能看懂的状态。"""
+    if not row:
+        return "none"
+    if row.get("drainDone") and not row.get("draining"):
+        return "done-waiting-for-purge"
+    if row.get("draining"):
+        return "draining"
+    return "pending"
+
+
+def osd_safe_to_destroy(cfg, oid):
+    """cephadm 在 purge 前反复执行的只读检查：ceph osd safe-to-destroy <id>。
+
+    ok=True/False/None（None 表示采集不到，不能当成通过）。PG 不是 active+clean、
+    或 OSD 被手工停掉后没有 stats 时，mon 一直返回 EAGAIN / EBUSY，队列就永远
+    停在 "done, waiting for purge"，编号不会变成 destroyed。
+    """
+    rc, out, err = ceph_run(cfg, ["osd", "safe-to-destroy", str(int(oid))], 30)
+    text = (err or "").strip() or (out or "").strip()
+    low = text.lower()
+    if rc == 127 or not text or "no valid command" in low or "unknown command" in low:
+        return {"ok": None, "message": "读不到 ceph osd safe-to-destroy %d（%s）"
+                % (oid, text or "无返回")}
+    if rc == 0 and "Error E" not in text:
+        return {"ok": True, "message": text[:300]}
+    return {"ok": False, "message": text[:400]}
+
+
 def _dev_key(path):
     """把分区路径归一到整盘：/dev/nvme0n2p1、/dev/sda1 -> /dev/nvme0n2、/dev/sda。"""
     p = str(path or "").strip()
@@ -964,17 +1031,22 @@ def device_owner(cfg, dev):
     return None
 
 
-def retire_prereq(cfg, oid):
-    """① 换盘前·清退阶段的硬门禁：OSD 必须真的已经 down。
+def retire_prereq(cfg, oid, cephadm=True):
+    """① 换盘前·清退阶段的硬门禁：OSD 必须真的 down，且移除队列是干净的。
 
-    把一块还在 up 的盘清退掉，等于自己制造一次故障。这一步不能靠前端提示
-    或人工自觉，后端在真实执行前必须从 ceph osd dump 回读确认。
-    已经清退过（destroyed）时视为幂等成功，允许直接跳到第 ② 步。
+    把一块还在 up 的盘清退掉，等于自己制造一次故障；队列里已有卡住的移除
+    任务时再提交，只会叠加第二条永远走不完的任务。两者都在真实执行前从
+    集群回读确认，不靠前端提示。已经清退过（destroyed）视为幂等成功。
+
+    warnings 是「不阻断但必须提前知道」的风险，最典型的是 PG 不是
+    active+clean：cephadm 的 purge 前会反复跑 osd safe-to-destroy，永远
+    不通过时队列会停在 done, waiting for purge，等再久也不会 destroyed。
     """
     oid = int(oid)
     flags, err = osd_map_flags(cfg)
     info = {"ok": False, "down": False, "out": False, "exists": False,
-            "alreadyDestroyed": False, "blockers": [], "message": ""}
+            "alreadyDestroyed": False, "blockers": [], "warnings": [],
+            "queue": [], "safeToDestroy": None, "message": ""}
     if flags and "destroyed" in (flags.get(oid) or []):
         info.update({"ok": True, "down": True, "out": True, "exists": True,
                      "alreadyDestroyed": True})
@@ -990,22 +1062,67 @@ def retire_prereq(cfg, oid):
                                 % (oid, err or "无返回"))
     elif st["up"]:
         info["blockers"].append(
-            "osd.%d 仍是 up：必须先确认故障盘已下线（用「一键踢盘」停服务 + DOWN + OUT，"
-            "或在节点停 ceph-osd@%d），确认 osd tree 里 down 之后再来清退" % (oid, oid))
+            "osd.%d 仍是 up：先让它真正下线再清退。cephadm 环境建议 "
+            "ceph osd down %d && ceph osd out %d（或让故障盘自然 down），"
+            "确认 ceph osd tree 里 down 后立刻回来点清退。"
+            "不要为了制造 down 而长期手工停 daemon（orch daemon stop / "
+            "systemctl stop ceph-osd@%d）：cephadm 的 purge 需要 OSD 上报 "
+            "stats 才能通过 osd safe-to-destroy，手工停服务会让移除队列"
+            "卡在 done, waiting for purge" % (oid, oid, oid, oid))
+    if cephadm:
+        rows, qerr = osd_rm_queue(cfg)
+        info["queue"] = rows or []
+        if rows:
+            mine = [r for r in rows if r["osd_id"] == oid]
+            if mine:
+                info["blockers"].append(
+                    "ceph orch osd rm status 里 osd.%d 已有未完成的移除任务（%s）："
+                    "重复提交只会叠加卡住的任务。先看 ceph orch osd rm status，"
+                    "要重来先 ceph orch osd rm stop %d 清掉队列，再重新清退"
+                    % (oid, queue_state(mine[0]), oid))
+            stale = [r for r in rows if r["osd_id"] != oid
+                     and (r.get("ageMin") or 0) > 30]
+            if stale:
+                info["blockers"].append(
+                    "移除队列里还有别的 OSD 卡了超过 30 分钟（%s）：先用 "
+                    "ceph orch osd rm stop <id> 清掉这些任务（只取消移除，不动 "
+                    "OSD 数据），再重新清退，否则新任务不会被正常调度"
+                    % "、".join("osd.%d/%s" % (r["osd_id"], queue_state(r))
+                                for r in stale))
+        elif rows is None:
+            info["warnings"].append("读不到 ceph orch osd rm status（%s），"
+                                    "无法确认移除队列是否干净" % (qerr or "无返回"))
+        safe = osd_safe_to_destroy(cfg, oid)
+        info["safeToDestroy"] = safe["ok"]
+        if safe["ok"] is False:
+            info["warnings"].append(
+                "ceph osd safe-to-destroy %d 当前返回「%s」：cephadm 每次 purge 前"
+                "都会重跑这条检查，PG 不 active+clean 时它不会放行，--replace "
+                "队列会停在 done, waiting for purge，编号不会自动变成 destroyed。"
+                "建议先让 PG 回到 active+clean；实在不行，确认没有不可恢复的数据"
+                "后再考虑手工 ceph osd destroy %d --force（平台不会自动执行）"
+                % (oid, safe["message"], oid))
     if not info["blockers"]:
         info["ok"] = True
-        info["message"] = ("osd.%d 已 down（%s），可以安全移除并保留编号"
+        info["message"] = ("osd.%d 已 down（%s），移除队列干净，可以安全移除并保留编号"
                            % (oid, "且已 out" if info["out"] else "仍 in，清退流程会先 out"))
+        if info["warnings"]:
+            info["message"] += "；但存在风险提示（见下）"
     else:
         info["message"] = "；".join(info["blockers"])
     return info
 
 
 def check_retire(cfg, oid, cephadm=True):
-    """① 清退后的复核：编号是否真的安全释放，能不能进入第 ② 步。
+    """① 清退后的复核：编号是否真的释放、以及「等下去有没有用」。
 
-    cephadm 看 osdmap 里的 destroyed 标记；包安装看编号是否已从 osdmap 移除
-    （第二步用 ceph-volume --osd-id 显式复用编号）。
+    旧实现只分成功 / 等待两态，把 "done, waiting for purge" 也说成
+    「异步过程，等队列走完」，前端于是每 5 秒自动复核、永远不告诉用户真相。
+    实际上 cephadm 在 purge 前会反复跑 osd safe-to-destroy；PG 不 active+clean
+    或 OSD 被手工停掉没有 stats 时，这个检查永远不通过，编号永远不会 destroyed。
+    所以必须区分：
+      pending = 队列在正常推进，稍后复核有意义
+      blocked = 队列卡死且不会自愈，要人工处理（action=manual，不再自动轮询）
     """
     oid = int(oid)
     st = osd_upin_state(cfg, oid)
@@ -1013,7 +1130,9 @@ def check_retire(cfg, oid, cephadm=True):
     destroyed = bool(flags and "destroyed" in (flags.get(oid) or []))
     base = {"ok": False, "down": bool(st and not st["up"]),
             "out": bool(st and not st["in"]), "destroyed": destroyed,
-            "pending": False, "action": None}
+            "pending": False, "blocked": False, "action": None,
+            "queueState": "unknown", "otherTasks": [], "safeToDestroy": None,
+            "fix": []}
     if cephadm:
         if destroyed:
             base.update({"ok": True, "action": "deploy"})
@@ -1023,11 +1142,53 @@ def check_retire(cfg, oid, cephadm=True):
         if flags is None:
             base["message"] = "读不到 ceph osd dump，无法确认清退结果：%s" % (err or "无返回")
             return base
+        rows, qerr = osd_rm_queue(cfg)
+        mine = next((r for r in (rows or []) if r["osd_id"] == oid), None)
+        others = [r for r in (rows or []) if r["osd_id"] != oid]
+        qs = queue_state(mine)
+        base["queueState"] = qs
+        base["otherTasks"] = ["osd.%d/%s" % (r["osd_id"], queue_state(r)) for r in others]
+        blockers = []
+        if qs == "done-waiting-for-purge":
+            safe = osd_safe_to_destroy(cfg, oid)
+            base["safeToDestroy"] = safe["ok"]
+            if safe["ok"] is not True:
+                blockers.append(
+                    "osd.%d 的 --replace 队列停在 done, waiting for purge："
+                    "cephadm 每次 purge 前都执行 osd safe-to-destroy %d，"
+                    "当前结果是「%s」。PG 不 active+clean、或 OSD 被手工停掉"
+                    "没有上报 stats 时这一步永远不通过，继续等不会变成 destroyed"
+                    % (oid, oid, safe["message"]))
+        elif qs == "draining" and (mine.get("ageMin") or 0) > 30:
+            blockers.append("osd.%d 的移除任务 draining 已超过 30 分钟："
+                            "PG 排不空，队列不会自己往前走" % oid)
+        if base["otherTasks"]:
+            blockers.append("移除队列里还有别的未完成任务 %s，可能一直占用编排器调度"
+                            % "、".join(base["otherTasks"]))
+        if blockers:
+            base.update({"blocked": True, "action": "manual", "pending": False})
+            base["fix"] = [
+                "ceph orch osd rm status",
+                "ceph osd safe-to-destroy %d" % oid,
+                "ceph orch osd rm stop <卡住的 id>   # 只取消移除任务，不动 OSD 数据",
+                "让 PG 回到 active+clean（补齐可用 OSD / 调整副本数）后等 cephadm 自动 purge",
+                "或确认无不可恢复数据后：ceph osd destroy %d --force；再 ceph orch osd rm stop %d"
+                % (oid, oid),
+                "ceph osd dump --format=json   # 看到 state 含 destroyed 才能做第 ② 步",
+            ]
+            base["message"] = ("清退被阻塞，不会自动完成。\n"
+                               + "\n".join("· " + x for x in blockers)
+                               + "\n\n处理（平台不会自动执行，需人工确认数据无碍）：\n  "
+                               + "\n  ".join(base["fix"]))
+            return base
         base.update({"pending": True, "action": "recheck"})
         base["message"] = (
-            "osd.%d 已 down/out，但 --replace 的移除队列还没把编号打成 destroyed"
-            "（常见：队列卡在 done, waiting for purge，或别的 OSD 卡在 draining）。"
-            "这是异步过程，等队列走完再执行第 ② 步；现在还不能 zap 新盘。" % oid)
+            "osd.%d 已提交 --replace，移除队列仍在正常推进（%s），编号还没打成 "
+            "destroyed；稍后复核有意义，现在还不能 zap 新盘。若状态长期停在 "
+            "done, waiting for purge，请执行 ceph osd safe-to-destroy %d 检查"
+            % (oid, qs, oid))
+        if rows is None:
+            base["message"] += "；另外本次没读到移除队列（%s），请用 ceph orch osd rm status 人工核对" % (qerr or "无返回")
         return base
     if st is None:
         base.update({"ok": True, "action": "deploy"})
@@ -1058,12 +1219,25 @@ def replace_prereq(cfg, oid, dev=None):
         return info
     states = flags.get(oid) or []
     info["destroyed"] = "destroyed" in states
+    rows, _ = osd_rm_queue(cfg)
+    mine = next((r for r in (rows or []) if r["osd_id"] == oid), None)
+    info["queueState"] = queue_state(mine)
     if not info["destroyed"]:
+        extra = ""
+        if info["queueState"] == "done-waiting-for-purge":
+            safe = osd_safe_to_destroy(cfg, oid)
+            info["safeToDestroy"] = safe["ok"]
+            extra = ("；移除队列停在 done, waiting for purge，osd safe-to-destroy %d "
+                     "返回「%s」——PG 不 active+clean 时它不会自动放行，"
+                     "先让 PG 恢复或确认数据无碍后手工 ceph osd destroy %d --force"
+                     % (oid, safe["message"], oid))
         blockers.append(
-            "osd.%d 还不是 destroyed（当前 state=%s）。ceph orch osd rm %d --replace "
-            "是异步的，必须等移除队列真正把编号释放掉，OSDSpec 才会复用它；现在 zap "
-            "新盘只会被当成一块全新的盘、分配一个新编号。"
-            % (oid, "/".join(states) if states else "编号不在 osdmap", oid))
+            "osd.%d 还不是 destroyed（当前 state=%s，队列状态 %s）。ceph orch osd rm "
+            "%d --replace 是异步的，--force 只跳过 drain 等待、不跳过 purge 前的 "
+            "safe-to-destroy 检查；必须等移除队列真正把编号释放掉，OSDSpec 才会复用它。"
+            "现在 zap 新盘只会被当成一块全新的盘、分配一个新编号%s。"
+            % (oid, "/".join(states) if states else "编号不在 osdmap",
+               info["queueState"], oid, extra))
     spec_ok, spec_msg = osdspec_managed(cfg)
     info["specManaged"] = spec_ok
     if not spec_ok:
@@ -2552,15 +2726,24 @@ def _plan_retire(cfg, probe, oid, add):
     purge = probe.caps.get("purge", False)
     cur = osd_upin_state(cfg, oid)
     dead = bool(cur) and not cur.get("up")
+    if orch:
+        add("检查 OSD 是否可安全销毁（purge 前提）",
+            ["ceph", "osd", "safe-to-destroy", str(oid)],
+            "只读诊断：cephadm 每次 purge 前都跑这条。返回 EAGAIN / EBUSY 说明 "
+            "PG 不是 active+clean 或 OSD 没上报 stats，移除队列会停在 "
+            "done, waiting for purge，编号不会自动变 destroyed")
     add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
         "先把 PG 从这块盘迁走；盘已彻底损坏时其他副本通常早已接管，该步幂等。"
         "cephadm 的移除与停 daemon 由 ceph orch osd rm --replace 统一处理")
     if orch:
         # 不要手工 `orch daemon stop`：官方 --replace 流程由编排器自己停 daemon
-        # 并 purge，手工停会让移除队列卡在 "done, waiting for purge"。
+        # 并 purge；手工停会让 OSD 没有 stats，purge 前的 safe-to-destroy 永远
+        # 返回 EAGAIN，队列卡在 "done, waiting for purge"。
         if dead:
             add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace", "--force"],
-                "--replace 保留 osd.%d 编号供新盘复用；--force 跳过回填等待（盘已 down，等下去也没有意义）" % oid)
+                "--replace 保留 osd.%d 编号供新盘复用；--force 只跳过 drain 等待"
+                "（盘已 down 时等回填没有意义），不会跳过 purge 前的 "
+                "osd safe-to-destroy 检查" % oid)
         else:
             add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace"],
                 "--replace 让 osd.%d 这个编号不被回收，cephadm 会等回填完成后再销毁 daemon" % oid)
@@ -2569,7 +2752,9 @@ def _plan_retire(cfg, probe, oid, add):
             "cephadm 只有在新盘匹配 OSDSpec 时，才会用 --replace 保留的原编号自动重建；"
             "spec 不存在或 unmanaged=true 时 zap 之后不会重建，需先配置 spec")
         add("轮询移除进度", ["ceph", "orch", "osd", "rm", "status", "--format=json"],
-            "确认该 OSD 已离开移除队列（destroyed，且编号留作替换）")
+            "确认该 OSD 已离开移除队列（编号 destroyed）。若停在 "
+            "done, waiting for purge，说明 purge 前的 safe-to-destroy 没通过，"
+            "不会自愈，需人工处理后再看 ceph osd dump")
         add("确认原编号已释放为 destroyed（编号复用前提）",
             ["ceph", "osd", "dump", "--format=json"],
             "osds[] 里 osd.%d 的 state 必须含 destroyed；没有就说明 --replace 的"
@@ -2708,7 +2893,10 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         # 必须先停守护进程：只发 osd down 时，进程的心跳会在几秒内把它改回 up，
         # 结果就是「只 out 了、down 没生效」。
         add("停止 OSD 守护进程", osd_daemon_cmd(probe, "stop", oid),
-            "只改 osdmap 标记不够：进程还在跑时心跳会把 down 立刻改回 up，必须先停服务")
+            "只改 osdmap 标记不够：进程还在跑时心跳会把 down 立刻改回 up，必须先停服务。"
+            "但若下一步是「① 换盘前·清退」，不要长期停着 daemon：cephadm 在 purge "
+            "前需要 OSD 上报 stats 才能通过 osd safe-to-destroy，长期停服务会让"
+            "移除队列卡在 done, waiting for purge")
         add("强制标记 OSD DOWN", ["ceph", "osd", "down", str(oid)], DOWN_NOTE)
         add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
             "从 CRUSH 摘出并触发数据回填；不 purge、不清盘，随时可 osd in 恢复")
@@ -2763,6 +2951,7 @@ TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止�
                   "预检设备是否可加入集群", "预检设备是否未被占用",
                   "轮询移除进度", "确认新盘已被编排器识别",
                   "确认 OSD 服务规约（编号复用的前提）",
+                  "检查 OSD 是否可安全销毁（purge 前提）",
                   "确认原编号已释放为 destroyed（编号复用前提）",
                   "复核原编号已释放（换盘前）",
                   "确认 CRUSH 权重（原值非 1.0 时手工恢复）",
@@ -3366,7 +3555,7 @@ class Handler(BaseHTTPRequestHandler):
         if intent == "retire" and allow:
             # ① 清退的硬门禁：OSD 必须确实已经 down。把还在 up 的盘清退掉，
             # 等于自己制造一次故障；这一步不能只靠前端提示。
-            rp = retire_prereq(self.cfg, oid)
+            rp = retire_prereq(self.cfg, oid, self.probe.caps.get("orch", False))
             if rp.get("alreadyDestroyed"):
                 audit("OSD_RETIRE", "osd.%d" % oid, "-", "SKIP",
                       "该编号已是 destroyed，清退已完成，直接执行第 ② 步",
@@ -3386,11 +3575,17 @@ class Handler(BaseHTTPRequestHandler):
                 audit("OSD_RETIRE", "osd.%d" % oid, "-", "BLOCKED",
                       "故障 OSD 未确认 down，拒绝清退：" + "；".join(rp["blockers"]),
                       self._client(), self._user())
+                hint = ("\n顺序：让 osd.%d 真正 down（cephadm 环境建议 "
+                        "ceph osd down %d && ceph osd out %d，或故障盘自然 down），"
+                        "确认 ceph osd tree 里 down 后立刻点「① 换盘前·清退」。"
+                        "不要用「一键踢盘」长期停 daemon 来制造 down：cephadm 的 "
+                        "purge 需要 OSD 上报 stats 才能通过 osd safe-to-destroy。"
+                        % (oid, oid, oid))
+                if rp.get("warnings"):
+                    hint += "\n风险提示：\n" + "\n".join("· " + w for w in rp["warnings"])
                 return self._json({"error":
-                    "已阻止清退：没有确认故障盘真的已经 down。\n"
-                    + "\n".join("· " + b for b in rp["blockers"])
-                    + "\n顺序：先停服务 / 一键踢盘，让 osd.%d 在 ceph osd tree 里确实 down，"
-                      "再点「① 换盘前·清退」。" % oid,
+                    "已阻止清退：前置条件不满足。\n"
+                    + "\n".join("· " + b for b in rp["blockers"]) + hint,
                     "prereq": rp}, 409)
         if intent == "replace" and allow and stage == "auto" and manual is not None:
             return self._json({"error":
@@ -3442,11 +3637,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error":
                         "已阻止 zap：编号复用前提不满足，继续操作会把新盘变成一块新增 OSD。\n"
                         + "\n".join("· " + b for b in pre_ok["blockers"])
-                        + "\n排查：ceph orch osd rm status / ceph osd dump 确认 osd.%d 的 "
-                          "state 已含 destroyed 后，再执行第 ② 步「换盘后·新盘入群」。"
-                          "若队列里有别的 OSD 卡在 draining，先 ceph orch osd rm stop <id> "
-                          "清掉，再重新执行第 ① 步清退（ceph orch osd rm %d --replace --force）。"
-                          % (oid, oid),
+                        + "\n排查：ceph orch osd rm status 看队列状态；若停在 "
+                          "done, waiting for purge，执行 ceph osd safe-to-destroy %d "
+                          "——PG 不是 active+clean 时它永远不通过，等不会自愈。"
+                          "先让 PG 恢复；或确认无不可恢复数据后手工 "
+                          "ceph osd destroy %d --force 保留编号，并 "
+                          "ceph orch osd rm stop %d 清掉队列。若队列里有别的 OSD "
+                          "卡在 draining，先 ceph orch osd rm stop <id>（只取消移除任务，"
+                          "不动数据）。最后用 ceph osd dump 确认 state 含 destroyed，"
+                          "再执行第 ② 步「换盘后·新盘入群」。"
+                          % (oid, oid, oid),
                         "prereq": pre_ok}, 409)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
         prereq = None
@@ -3625,7 +3825,8 @@ class Handler(BaseHTTPRequestHandler):
             # 只读预检：让弹窗在动手之前就把「盘确实 down 了吗」「编号释放了吗」
             # 显示出来。执行时后端会重新核验一遍，这里只是给人看的。
             if intent == "retire":
-                resp["precheck"] = retire_prereq(self.cfg, oid)
+                resp["precheck"] = retire_prereq(
+                    self.cfg, oid, self.probe.caps.get("orch", False))
             elif intent == "deploy" and self.probe.caps.get("orch"):
                 resp["precheck"] = replace_prereq(self.cfg, oid, dev)
             return self._json(resp)

@@ -439,6 +439,8 @@ function quickPaintModal(){
     (pre.ok?'前提已满足':'前提未满足，执行会被拒绝')+'</b><br>'+
     esc(pre.message||'')+
     ((pre.blockers||[]).length?'<br>'+pre.blockers.map(function(x){return '· '+esc(x);}).join('<br>'):'')+
+    ((pre.warnings||[]).length?'<br><b>风险提示（不阻断，但很可能卡住）</b><br>'+
+      pre.warnings.map(function(x){return '· '+esc(x);}).join('<br>'):'')+
     '<br><span class="note">执行时后端会重新核验一次；不满足就拒绝，绝不会误 zap 正在用的盘。</span></div></div>';
   }
   var devOpts=q.devices.map(function(d){
@@ -450,7 +452,7 @@ function quickPaintModal(){
    q.kind==='init'?'把新插入的磁盘初始化并加入集群（会新增一个 OSD 编号）':
    '把 osd.'+q.osdId+' 的坏盘换成新盘，重建后仍是 osd.'+q.osdId;
   var flowText=isRetire?
-    '① 流程：只读确认 osd.'+q.osdId+' <b>确实 down</b>（仍 up 会被后端拒绝）→ OUT 把 PG 迁走 → <b>orch osd rm --replace 保留编号</b> → 等移除队列把编号打成 destroyed → 回读 osd dump 复核。此阶段<b>不 zap、不碰新盘</b>。':
+    '① 流程：只读确认 osd.'+q.osdId+' <b>确实 down</b>（仍 up 会被后端拒绝）→ 检查 osd safe-to-destroy（purge 前提）→ OUT 把 PG 迁走 → <b>orch osd rm --replace 保留编号</b> → 等移除队列把编号打成 destroyed → 回读 osd dump 复核。此阶段<b>不 zap、不碰新盘</b>。':
    isDeploy?
     '② 流程：校验 destroyed / managed OSDSpec / 新盘归属 → 清理新盘残留签名 → OSDSpec 用<b>原编号</b>自动重建 → 回读 up/in 复核 → 健康验证。绝不用 daemon add osd（那会分配新编号）。':
    q.kind==='init'?
@@ -562,7 +564,8 @@ function quickPaintModal(){
      「OSD up 慢」只属于第二种；把第一种也显示成「未完全生效」会误导成等待即可。 */
   var pending=!!(badVerify&&v.pending),hardFail=badVerify&&!pending;
   var stateColor=hardFail?'td':pending?'tw':'t';
-  var headline=hardFail?((q.kind==='replace'||q.kind==='deploy')&&v.newOsd?'未复用原编号':'未完全生效'):
+  var headline=hardFail?((q.kind==='replace'||q.kind==='deploy')&&v.newOsd?'未复用原编号':
+               v&&v.blocked?'清退被阻塞（不会自动完成）':'未完全生效'):
                pending?(q.kind==='retire'?'已清退，等待编号释放':'已提交，等待编排器重建'):'流程已完成';
   b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+stateColor+'">'+
    ic(badVerify?'alert':'check',38)+'</div>'+
@@ -579,8 +582,11 @@ function quickPaintModal(){
     q.kind==='deploy'?(badVerify?'原编号必须仍是 osd.'+q.osdId+'，详见下方复核结论':'新盘已用原编号 osd.'+q.osdId+' 重建并上线，数据开始回填'):
     '命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
    (hardFail?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>'+
-     (q.kind==='retire'?'清退复核未通过':'换盘复核未通过')+
-     (v.newOsd?'：新盘被分配为 osd.'+v.newOsd:'')+'</b><br>'+esc(v.message)+
+     (q.kind==='retire'?(v&&v.blocked?'清退被阻塞，等也不会自动完成':'清退复核未通过'):'换盘复核未通过')+
+     (v.newOsd?'：新盘被分配为 osd.'+v.newOsd:'')+'</b><br>'+
+     esc(v.message).replace(/\n/g,'<br>')+
+     ((v.fix&&v.fix.length)?'<div class="cmdbox" style="margin-top:8px;max-height:190px;overflow:auto">'+
+       v.fix.map(function(x){return '<div>'+esc(x)+'</div>';}).join('')+'</div>':'')+
      (v.newOsd?'<br>一键换盘要求「编号不变」，这次等同于新增磁盘。确认数据无碍后清理多出的 OSD，检查 OSDSpec 再重试。':'')+
      '</div></div>':
     pending?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>'+

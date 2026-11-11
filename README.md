@@ -181,6 +181,8 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 执行后回读 `ceph osd dump` 复核 `up=false / in=false`；不通过（例如权限不足没停掉服务）会显示「未完全生效」并给出手工命令，不假装成功。到此为止：**不执行** `purge` / `crush remove` / `auth del` / `lvm zap`，OSD 身份与盘上数据都保留，之后点 IN 即可加回。
 
+> 若接下来要走「① 换盘前·清退」，不要靠本按钮长期停 daemon 来制造 down：cephadm 的 purge 前需要 OSD 上报 stats 才能通过 `osd safe-to-destroy`，手工停服务会让移除队列卡在 `done, waiting for purge`。见换盘章节。
+
 需要永久下线时走「换盘向导」的 `remove` 意图（完整退役，含 purge 与清盘），那条路径不可逆。
 
 ### 换盘（两步 · OSD 编号不变）
@@ -189,13 +191,15 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 
 | 步骤 | 时机 | 平台做什么 | 完成标志 |
 | --- | --- | --- | --- |
-| **① 换盘前·清退** | 坏盘还在机器上 | 只读确认 OSD 确实 down → `ceph osd out` → `ceph orch osd rm <id> --replace [--force]` 保留编号 → 等移除队列 → 回读 `ceph osd dump` | `osds[]` 里 `osd.<id>` 的 `state` 含 `destroyed` |
+| **① 换盘前·清退** | 坏盘还在机器上 | 只读确认 OSD 确实 down、移除队列干净、`osd safe-to-destroy` 是否通过 → `ceph osd out` → `ceph orch osd rm <id> --replace [--force]` 保留编号 → 等移除队列 → 回读 `ceph osd dump` | `osds[]` 里 `osd.<id>` 的 `state` 含 `destroyed` |
 | — 现场换盘 — | 人工 | 按 SN / 盘位换上同规格新盘，装回原盘位 | — |
 | **② 换盘后·入群** | 新盘已装好 | 校验 destroyed / managed OSDSpec / 新盘归属 → `ceph orch device zap` → OSDSpec 用原编号重建 → 回读 up/in 与健康 | `osd.<id>` up/in，没有多出新编号 |
 
 ① 的弹窗**不需要选新盘**（此时新盘还没装）；② 的下拉只列该服务器上未被其它 OSD 占用的设备，**原盘位路径排第一**，带旧 LVM 签名的盘标「需先清理」。两个按钮的确认短语都是 `osd.<id>`——要保住的是编号。「高级向导」保留完整流程预览（① + 人工 + ②），仅供看命令。
 
-**① 清退的硬门禁**：OSD 必须确实 down。后端在真实执行前回读 `ceph osd dump`，仍是 `up` 就 **409 拒绝**——把健康盘清退掉等于自己制造故障。先停服务 / 用「一键踢盘」让它 down。只读预检结果直接显示在弹窗里；已是 `destroyed` 时幂等跳过，直接进 ②。
+**① 清退的硬门禁**：OSD 必须确实 down，且 `ceph orch osd rm status` 里不能有未完成的移除任务（本 OSD 的重复任务、或其它 OSD 卡了超过 30 分钟的僵尸任务）。后端在真实执行前只读回读，不满足就 **409 拒绝**——把健康盘清退掉等于自己制造故障，在脏队列上再提交只会叠加第二条永远走不完的任务。只读预检结果（含风险提示）直接显示在弹窗里；已是 `destroyed` 时幂等跳过，直接进 ②。
+
+制造 down 的正确方式：真实坏盘本来就 down；模拟环境用 `ceph osd down <id> && ceph osd out <id>` 后立即点清退。**不要用「一键踢盘」长期停 daemon 来制造 down**：cephadm 在 purge 前需要 OSD 上报 stats 才能通过 `osd safe-to-destroy`，手工停服务会让移除队列永远卡在 `done, waiting for purge`。
 
 **② 入群的硬门禁**：点执行时重新只读核验三项，任一不满足就 **409 拒绝 zap**，绝不让新盘变成新增 OSD：
 
@@ -210,8 +214,10 @@ http://<web-server>/?api=http%3A%2F%2F192.168.27.134%3A8780
 ```bash
 # ① 换盘前·清退
 ceph osd tree                              # 人眼确认 up=0
+ceph orch osd rm status                    # 执行前队列必须是空的
+ceph osd safe-to-destroy <id>              # purge 前的硬检查，EAGAIN/EBUSY 就要先处理
 ceph osd out <id>
-ceph orch osd rm <id> --replace [--force]
+ceph orch osd rm <id> --replace [--force]  # --force 只跳过 drain，不跳过 safe-to-destroy
 ceph orch osd rm status                    # 移除队列必须真正走完
 ceph osd dump --format=json                # state 含 destroyed 才算完成
 
@@ -230,13 +236,50 @@ ceph -s
 - 被拒绝时排查：`ceph orch osd rm status` 里若有别的 OSD 卡在 `draining`，先 `ceph orch osd rm stop <id>` 清掉，再重新执行 ①；等 `ceph osd dump` 显示 `destroyed` 后再点 ②。
 - 包安装部署没有编排器：① `osd purge`（或 crush remove + auth del + osd rm）把编号从 osdmap 移除，② `ceph-volume lvm zap <dev> --destroy` → `ceph-volume lvm create --data <dev> --osd-id <id>` 显式复用编号，不依赖 `destroyed`。两步是独立请求，② 读不到 ① 之前的 CRUSH 权重；原权重非 1.0 时手工补 `ceph osd crush reweight osd.<id> <原权重>`。
 
+#### ① 清退卡在 `done, waiting for purge`（不会自愈）
+
+`ceph orch osd rm <id> --replace --force` 只是**预约**，`--force` 仅跳过 drain 等待，**不会跳过 purge 前的 `osd safe-to-destroy` 检查**。cephadm 的 mgr 每隔几秒重跑这条检查并把队列原样写回；PG 不是 `active+clean`、或 OSD 被手工停掉没有上报 stats 时它永远返回 `EAGAIN` / `EBUSY`，编号就永远不会变成 `destroyed`：
+
+```bash
+ceph osd safe-to-destroy <id>
+# Error EAGAIN: OSD(s) <id> have no reported stats, and not all PGs are active+clean;
+# we cannot draw any conclusions.
+ceph orch osd rm status          # <id> done, waiting for purge
+ceph -s                          # 128 pgs inactive / undersized+peered
+```
+
+**单节点双盘 + 2 副本池物理上无法满足这个条件**：`osd out` 之后 PG 必然 undersized，没有第三个 OSD 承接副本。这不是命令写错，也不是「OSD up 慢」，等再久都不会好。1.1.23 起复核会明确判 `blocked`（红色「清退被阻塞，等也不会自动完成」），不再显示「等待中」、不再每 5 秒无意义地自动轮询，弹窗直接列出可复制的处置命令。
+
+处置顺序（**平台不会自动执行，需人工确认数据无碍**）：
+
+```bash
+# 1) 清掉卡住的僵尸任务：rm stop 只取消移除任务，不动 OSD 数据
+ceph orch osd rm status
+ceph orch osd rm stop <卡住的 id>
+
+# 2) 让 PG 回到 active+clean：补齐可用 OSD / 调整副本数，然后等 cephadm 自动 purge
+#    测试环境可临时把池设为单副本（生产不要这么做）
+ceph osd pool ls detail
+ceph osd pool set <pool> size 1 --yes-i-really-mean-it
+ceph osd pool set <pool> min_size 1
+ceph -s                          # 等 active+clean
+
+# 3) 或确认 osd.<id> 上没有不可恢复数据后，手工保留编号释放
+ceph orch osd rm stop <id>
+ceph osd destroy <id> --force    # 标记 destroyed，编号仍可复用
+ceph osd dump --format=json      # state 含 destroyed 才能做 ②
+```
+
+`ceph osd destroy` 会让该 OSD 上的数据被认定丢失；现场若有 degraded object 只存在这一份，先恢复数据再动手。
+
 两个阶段用各自的复核尺子：① 看「编号是否安全释放」，② 看「原编号有没有真的回来」。② 的复核按「新盘现在属于谁 + osdmap 有没有多出新编号」分流：
 
 | 结论 | 页面 | 处理 |
 | --- | --- | --- |
 | 新盘挂回 `osd.<id>` 且 up/in | 绿色「编号不变」 | 完成 |
 | 新盘挂回原编号、守护进程还没 up | 黄色「等待编排器重建」 | 部署延迟，不是失败：每 5 秒只读复核一次（最多 12 次），可手动点「重新复核」 |
-| ① 已 down/out 但队列还没把编号打成 destroyed | 黄色「等待编号释放」 | 异步收尾，不是失败，可手动点「重新复核」 |
+| ① 队列还在正常推进、编号未 destroyed | 黄色「等待编号释放」 | 异步收尾，不是失败：每 5 秒只读复核一次，可手动点「重新复核」 |
+| ① 队列停在 `done, waiting for purge` 且 `safe-to-destroy` 不通过 | 红色「清退被阻塞，等也不会自动完成」 | 不会自愈，停止自动轮询；按弹窗给出的命令清单清队列、恢复 PG 或手工 `ceph osd destroy <id> --force` |
 | 新盘被分到**别的编号**，或 osdmap 出现 `state=new` 的多余编号 | 红色「未复用原编号」 | 真失败：旧 OSD 的 metadata 可能仍把新盘报给原编号，别被误导成「启动慢」；清理多出的 OSD、检查 OSDSpec 与移除队列后重试 |
 
 只读复核接口 `POST /api/osd/verify`（`osd_id` + `dev` + `phase=retire|deploy`），不重跑流程、不下发写命令。若本意是**扩容**，请用下一节的「新增磁盘」入口，它才分配新编号。
@@ -561,10 +604,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.22-20261111'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.1.23-20261111'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.22-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.1.23-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 
@@ -601,14 +644,14 @@ journalctl -u ceph-console -n 50 --no-pager
 
 ### 常见问题
 
-**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.22-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.1.23-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
 
 **换完盘多出一块 OSD，原编号还是 down/out？** 两种成因：
 
 1. **1.1.19 及以前**：换盘用了 `ceph orch daemon add osd`，给新盘分配了新编号，旧编号以 down/out 留在 osdmap；1.1.20 起已删除这条命令。
 2. **1.1.20**：`ceph orch osd rm --replace` 是异步的，移除队列还没走完（常卡在 `done, waiting for purge`）就 zap 了新盘，原编号仍是 `exists` 而不是 `destroyed`，编排器于是把新盘当成全新盘部署。
 
-1.1.21 起 zap 之前有硬门禁，三项前提任一不满足就 409 拒绝；复核也会识别 `state=new` 的多余编号，不再把旧 metadata 误导判成「up 慢」。1.1.22 起进一步把换盘拆成「① 清退 / ② 入群」两个独立按钮（见上一节），① 还要求 OSD 确实 down，从流程上就杜绝「一边还在 up 一边把新盘加进来」。已经多出来的盘按下面顺序收尾（**先确认没有不可恢复的数据**）：
+1.1.21 起 zap 之前有硬门禁，三项前提任一不满足就 409 拒绝；复核也会识别 `state=new` 的多余编号，不再把旧 metadata 误导判成「up 慢」。1.1.22 起进一步把换盘拆成「① 清退 / ② 入群」两个独立按钮（见上一节），① 还要求 OSD 确实 down。1.1.23 起 ① 会先检查移除队列与 `osd safe-to-destroy`，队列卡死时直接判「清退被阻塞、不会自动完成」并列出处置命令，不再无限自动复核。已经多出来的盘按下面顺序收尾（**先确认没有不可恢复的数据**）：
 
 ```bash
 ceph osd tree; ceph osd dump            # 认出多出的编号（如 osd.2）与原编号的 state
@@ -619,6 +662,8 @@ ceph orch osd rm 0 --replace --force    # 重新预约原编号；等 osd dump �
 ```
 
 之后在 OSD 页按两步走：先点 **① 换盘前·清退**（等 `destroyed`），确认队列干净再现场换盘，换好点 **② 换盘后·入群**。两步之间不用保持页面打开。**不要直接 zap 正在被使用的盘**；若只是想扩容，用「新增磁盘」入口即可，不必清理。
+
+**① 清退一直显示等待 / `ceph orch osd rm status` 停在 `done, waiting for purge`？** 不是 OSD 启动慢，也不会自愈：cephadm 在 purge 前反复跑 `osd safe-to-destroy`，PG 不 `active+clean` 时永远不通过。执行 `ceph osd safe-to-destroy <id>` 与 `ceph orch osd rm status` 确认，按「换盘 → ① 清退卡在 done, waiting for purge」一节的命令清单处理；1.1.23 起页面会直接给出这个结论和命令。
 
 **点了一键踢盘，只有 out 没有 down？** `ceph osd down` 只改 osdmap 标记，守护进程还在跑心跳会改回 `up`。1.1.4 起第一步就是停守护进程，执行后回读 `osd dump` 复核。提示「未完全生效」说明停服务失败（多半是后端不是 root，或 orch 未接管），按提示在集群节点手工停一次。
 

@@ -42,12 +42,10 @@ state.isolation=null;
        no-state 时也能把「谁在什么时候清的」一起送到服务端日志。 */
     state.quickLastReset={at:Date.now(),where:where||'unknown',kind:prev.kind||''};
     try{if(typeof qTrace==='function')qTrace(prev,'reset',where||'unknown');}catch(e){}
-    /* 只清那些「正在操作中」的弹窗（有 q-run / 清单 / 输入框），
-       避免误关建池弹窗等别的模态。 */
-    try{
-     var m=document.querySelector('#modal-root .modal');
-     if(m&&m.querySelector('[data-act="q-run"],[data-bind^="quick."]')&&typeof closeModal==='function')closeModal();
-    }catch(e){}
+    /* 这里刻意不关弹窗：主动关闭的路径（q-close / overlay / nav / ...）
+       自己都会 closeModal()，不需要这里代劳；而意外的清空如果立刻关窗，
+       用户刚填的内容就白填了。留着弹窗，点「立即执行」时由 quickRecover
+       从界面读回已填内容继续——这是对用户损失最小的做法。 */
    }
   });
  }catch(e){}
@@ -139,7 +137,8 @@ function doLogin(){
 function doLogout(){
  apiFetch('POST','/api/logout',{}).catch(function(){});
  try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');}catch(e){}
- state.token='';state.quick=null;state.profile=null;state.isolation=null;
+ state.token='';state.quick=null;state.pool=null;state.profile=null;state.isolation=null;
+ closeModal();
  if(state.link){state.link.stateOk=false;state.link.stateError='';state.link.stateHttp=0;
   state.link.stateAt=0;state.link.diag=null;state.link.diagError='';}
  state.auth=authReset();render();renderAuth();toast('已退出登录','ok');
@@ -828,8 +827,35 @@ function quickPaintModal(){
     用户根本不用点就知道点了会不会生效。 */
  var errBar=qStatusBar(q);
  openModal(qHead()+'<div class="modal-b">'+b+'</div>'+errBar+'<div class="modal-f">'+foot+'</div>','lg');
+ /* 给 DOM 留一份「我是谁」的最小身份：万一 state.quick 被清掉，还能靠它
+    把用户已经填好的值读回来继续（见 quickRecover）。 */
+ var __m=document.querySelector('#modal-root .modal');
+ if(__m){__m.setAttribute('data-qkind',q.kind);__m.setAttribute('data-qosd',q.osdId==null?'':String(q.osdId));}
  if(q.inputError)qMarkBad(q.errorField);
  if(q.phase==='running'||q.phase==='paused')quickPaintLogs();
+}
+/* 弹窗还开着、state.quick 却被清空了：从界面上把用户已经填好的值读回来，
+   拼一个最小状态直接继续。与其让用户「关掉重开再填一遍」，不如就用他
+   刚才填的东西把事做完——这也是「第一次点没反应」最直接的止损。 */
+function quickRecover(){
+ var m=document.querySelector('#modal-root .modal');if(!m)return null;
+ var val=function(sel){var el=m.querySelector(sel);return el?(el.value||''):'';};
+ var chk=function(sel){var el=m.querySelector(sel);return !!(el&&el.checked);};
+ var kind=m.getAttribute('data-qkind')||'';
+ if(!kind)return null;
+ var oid=m.getAttribute('data-qosd');
+ var q={kind:kind,osdId:(oid===''||oid==null)?null:Number(oid),
+  host:val('[data-bind="quick.host"]'),dev:val('[data-bind="quick.dev"]'),
+  serial:val('[data-bind="quick.serial"]'),phrase:val('[data-bind="quick.phrase"]'),
+  confirmed:chk('[data-bind="quick.confirmed"]'),
+  devices:[],phase:'confirm',steps:[],logs:[],progress:0,busy:false,error:'',
+  stage:'auto',aborted:false,pending:[],hasManual:false,
+  dryRun:!state.settings.allowWrite,role:state.auth.role||'admin',recovered:true};
+ /* 只有「动新盘」的三类必须知道设备路径；清退只需要 osd.id。 */
+ var needDev=(kind==='init'||kind==='replace'||kind==='deploy');
+ if(needDev&&!q.dev)return null;
+ if(!needDev&&q.osdId==null)return null;
+ return q;
 }
 /* 只读重新复核：zap 后创建 OSD，守护进程起来有延迟。
    不重跑流程、不下发任何写命令，只回读 osd dump / metadata 看新盘归谁、是否 up/in。 */
@@ -1232,14 +1258,22 @@ function quickAction(act,el){
       否则「点了没反应」只能靠猜。qTrace 同时写进 q.trace，
       弹窗底部的状态行会显示最近一次点击的结果。 */
    if(!q){
-    /* 走到这里说明弹窗和状态已经不一致了。与其留一个点不动的弹窗，
-       不如立刻关掉并说清原因，让用户重开一次就能干活。 */
+    /* 走到这里说明弹窗和状态已经不一致了。先自救：弹窗还开着就把界面上
+       用户已经填好的值读回来继续（省掉「关掉重开再填一遍」）；连弹窗都
+       没了才报错。两条路都留埋点。 */
     var zombie=document.querySelector('#modal-root .modal');
     var lr=state.quickLastReset;
-    qTrace(null,'no-state','state.quick 为空'+(zombie?'，但弹窗仍在 DOM 里（僵尸弹窗）':'')+
+    qTrace(null,'no-state','state.quick 为空'+(zombie?'，但弹窗仍在 DOM 里':'')+
      (lr?('；最后一次清空 '+new Date(lr.at).toLocaleTimeString()+' 来自 '+lr.where):'；本次会话没有记录到清空动作'));
-    if(zombie&&typeof closeModal==='function')closeModal();
-    toast('弹窗状态已失效（页面可能刚同步过），已关闭，请重新打开','e');return;}
+    var rec=zombie?quickRecover():null;
+    if(rec){
+     state.quick=rec;q=rec;
+     qTrace(rec,'recover','从弹窗 DOM 读回已填内容继续');
+     toast('弹窗状态被重置过，已按界面上已填的内容继续','w');
+    }else{
+     if(zombie&&typeof closeModal==='function')closeModal();
+     toast('弹窗状态已失效（页面可能刚同步过），已关闭，请重新打开','e');return;}
+   }
    /* 幂等：一次点击可能被重复绑定 / 冒泡触发两次，写操作绝不能跑两遍
       （实测会连发两个 POST /api/quick/init，等于把盘初始化两次）。 */
    if(q.phase==='running'||q.phase==='paused'){

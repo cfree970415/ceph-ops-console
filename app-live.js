@@ -380,6 +380,19 @@ function quickOpen(kind,osdId){
   var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
 /* 新增磁盘：目标是「设备」，不是某个 OSD；走完会多出一个新编号的 OSD */
+/* 前端行为埋点：把「点了按钮之后走到了哪个分支」发到后端日志。
+   后端只记日志、不写审计、不要求写权限，所以安全上没有新增面。
+   目的很实际：「点了没反应」在浏览器里发生，后端访问日志只能证明
+   「没发出请求」，证明不了卡在前端哪一步——有了它，一次复现就能定位。 */
+function qTrace(q,branch,detail){
+ try{
+  if(q){q.trace=q.trace||[];q.trace.push({t:Date.now(),b:branch,d:detail||''});
+   if(q.trace.length>24)q.trace.shift();}
+  if(!(state.mode==='live'&&state.auth.authenticated))return;
+  apiFetch('POST','/api/beacon',{ui:UI_BUILD,kind:(q&&q.kind)||'',branch:branch,
+   detail:(detail||'')+(q?(' phase='+q.phase+' pendingRun='+!!q.pendingRun):'')}).catch(function(){});
+ }catch(e){}
+}
 function quickOpenInit(o){
  state.quick={kind:'init',osdId:o?o.id:null,host:(o&&o.host)||'',
   dev:'',serial:'',devices:[],phase:'loading',steps:[],logs:[],progress:0,phrase:'',confirmed:false,
@@ -387,21 +400,42 @@ function quickOpenInit(o){
   dryRun:!state.settings.allowWrite,role:state.auth.role||'admin'};
  state.wizard=null;
  var mine=state.quick;
+ qTrace(mine,'open','init');
  quickPaintModal();
  loadFreeDevices(mine).then(function(list){
   if(!state.quick||state.quick!==mine)return;
   var q=mine,pick=pickDevices(q,list,q.host);
   q.devices=pick;
-  q.dev=pick.length?pick[0].dev:'';
-  if(!q.dev){q.phase='confirm';quickPaintModal();return;}
-  return replanQuick(q);
+  /* 用户可能在探测还没返回时就手工填了设备名（探测慢的时候很常见）。
+     旧逻辑无条件 q.dev=pick.length?pick[0].dev:''，会把用户填的值清空，
+     用户再点「立即执行」就会被判「没填设备路径」——看起来就是点了没反应。 */
+  if(!q.dev||q.devAuto){
+   q.dev=pick.length?pick[0].dev:'';
+   q.devAuto=!!pick.length;
+  }
+  q.phase='confirm';
+  qTrace(q,'devices','n='+pick.length+' dev='+(q.dev||'-'));
+  /* loading 阶段被点掉的「立即执行」在这里补跑；旧逻辑只在这个分支里
+     直接 return，pendingRun 永远没人消费，第一次点击就这么蒸发了。 */
+  if(q.pendingRun){
+   q.pendingRun=false;
+   var bad=qValidate(q);
+   if(!bad){quickExec((q.kind==='init'||isPhase(q.kind))?'auto':'pre');return;}
+   q.inputError=bad.msg;q.errorField=bad.field;
+   q.status='命令已生成，但还差一项才能开始：'+bad.msg;
+   quickPaintModal();return;
+  }
+  /* 没排队的点击：有设备路径就把预检和命令序列拉出来给用户看；
+     没有就停在表单，等用户填。绝不在这里直接 return 而不重绘。 */
+  if(q.dev){replanQuick(q);return;}
+  quickPaintModal();
  }).catch(function(e){
   if(!state.quick||state.quick!==mine)return;
-  var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
+  var q=mine;q.pendingRun=false;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
 /* 换了新盘 / 改了设备路径 / 改了服务器：重新向后端要命令序列 */
 function replanQuick(q){
- q.phase='loading';q.phrase='';q.inputError='';q.errorField='';quickPaintModal();
+ q.phase='loading';q.phrase='';q.inputError='';q.errorField='';q.status='';quickPaintModal();
  return quickPlan(q.kind,q).then(function(steps){
   if(state.quick!==q)return;
   q.steps=steps;
@@ -459,25 +493,76 @@ function qMarkBad(path){
  try{if(el.classList)el.classList.add('inp-bad');}catch(e){}
  try{el.focus();}catch(e){}
 }
-/* 用户开始补填后就地更新红条（不重绘，避免打断输入）：
+/* 执行前检查清单：「还差几项」常驻在按钮上方，不用点也知道。
+   每项都是 qValidate 同一个判据（同一份真值），不会出现「清单全绿但点不动」。 */
+function qChips(q){
+ if(q.kind==='init'||q.kind==='replace'||q.kind==='deploy'||q.kind==='retire'){
+  var chips=[];
+  if(q.kind!=='retire')chips.push([!!q.dev,'设备路径',q.dev||'未填']);
+  chips.push([!!q.host,'服务器',q.host||'未填']);
+  if(state.settings.confirm){
+   chips.push([!!q.confirmed,'盘位核对',q.confirmed?'已勾选':'未勾选']);
+   var okPhr=q.kind==='retire'?q.phrase==='osd.'+q.osdId:q.phrase===q.dev;
+   chips.push([!!okPhr,'二次确认',okPhr?'已输入':'未输入']);
+  }
+  return chips;
+ }
+ return [];
+}
+function qStatusBar(q){
+ if(q.inputError)return '<div class="modal-err" role="alert">'+ic('alert',15)+
+  '<div><b>还不能执行</b>　<span class="err-msg">'+esc(q.inputError)+'</span></div></div>';
+ var chips=q.phase==='confirm'?qChips(q):[];
+ /* 没有清单可显示时，至少把「上一次点击发生了什么」写在按钮上方，
+    否则 loading 阶段点下去仍然像什么都没发生。 */
+ if(!chips.length)return q.status?'<div class="modal-chk">'+ic('info',14)+
+  '<div class="chk-wrap"><b>'+esc(q.status)+'</b></div></div>':'';
+ var left=chips.filter(function(c){return !c[0];}).length;
+ return '<div class="modal-chk'+(left?'':' ok')+'">'+ic(left?'info':'check',14)+
+  '<div class="chk-wrap"><b>'+(left?'执行前还差 '+left+' 项':'全部就绪，点右侧按钮即开始')+'</b>'+
+  '<div class="chk-row">'+chips.map(function(c){
+    return '<span class="chip'+(c[0]?' on':'')+'">'+(c[0]?'✓':'✗')+' '+esc(c[1])+
+     (c[2]?' <span class="mono">'+esc(c[2])+'</span>':'')+'</span>';}).join('')+'</div>'+
+  (q.status?'<div class="chk-note">'+esc(q.status)+'</div>':'')+
+  '</div></div>';
+}
+/* 就地更新提示条（不重绘整个弹窗，避免打断输入 / 丢失滚动位置）。 */
+function qRefreshBar(){
+ var q=state.quick;if(!q)return;
+ var html=qStatusBar(q);
+ var host=document.querySelector('#modal-root .modal-err, #modal-root .modal-chk');
+ if(!host){
+  if(!html)return;
+  var f=document.querySelector('#modal-root .modal-f');
+  if(!f||!f.parentNode)return;
+  var box=document.createElement('div');box.innerHTML=html;
+  f.parentNode.insertBefore(box.firstChild,f);
+  return;}
+ if(!html){if(host.parentNode)host.parentNode.removeChild(host);return;}
+ var tmp=document.createElement('div');tmp.innerHTML=html;
+ host.parentNode.replaceChild(tmp.firstChild,host);
+}
+/* 用户开始补填后就地更新红条 / 清单（不重绘，避免打断输入）：
    - 原来标红的那栏填上了，就撤掉红框
-   - 还差别的，就把文案换成新的那一条（不抢焦点，别在打字时跳走） */
+   - 还有没满足的，就把文案换成新的那一条（不抢焦点，别在打字时跳走） */
 function qErrRefresh(){
- var q=state.quick;if(!q||!q.inputError)return;
- var cur=document.querySelector('#modal-root [data-bind="'+q.errorField+'"]');
- if(cur&&cur.classList){
-  var filled=cur.type==='checkbox'?!!cur.checked:!!String(cur.value||'').length;
-  if(filled)cur.classList.remove('inp-bad');
+ var q=state.quick;if(!q)return;
+ if(q.errorField){
+  var cur=document.querySelector('#modal-root [data-bind="'+q.errorField+'"]');
+  if(cur&&cur.classList){
+   var filled=cur.type==='checkbox'?!!cur.checked:!!String(cur.value||'').length;
+   if(filled)cur.classList.remove('inp-bad');
+  }
  }
  var v=qValidate(q);
- var bar=document.querySelector('#modal-root .modal-err');
  if(!v){
   q.inputError='';q.errorField='';
-  if(bar&&bar.parentNode)bar.parentNode.removeChild(bar);
+  qRefreshBar();
   return;
  }
- q.inputError=v.msg;q.errorField=v.field;
- if(bar){var t=bar.querySelector('.err-msg');if(t)t.textContent=v.msg;}
+ /* 已经点了执行、正在报错 → 文案跟着变；还没点过 → 只更新清单，不凭空报红。 */
+ if(q.inputError){q.inputError=v.msg;q.errorField=v.field;}
+ qRefreshBar();
 }
 function qHead(){var q=state.quick;
  var tail=q.kind==='init'?' · '+esc(q.dev||'选择新盘'):
@@ -695,9 +780,10 @@ function quickPaintModal(){
    '<button class="btn" data-act="q-alerts">查看告警</button>'+
    '<button class="btn" data-act="q-audit">变更审计</button><button class="btn pri" data-act="q-close">完成</button>';
  }
- /* 校验没过的原因固定贴在这两个位置（body 之外），内容再长也不会被滚出视野。 */
- var errBar=q.inputError?'<div class="modal-err" role="alert">'+ic('alert',15)+
-  '<div><b>还不能执行</b>　<span class="err-msg">'+esc(q.inputError)+'</span></div></div>':'';
+ /* 提示条固定在 body 之外、按钮正上方，内容再长也不会被滚出视野。
+    没有错误时也常驻一条检查清单：「还差几项」写在按钮上方，
+    用户根本不用点就知道点了会不会生效。 */
+ var errBar=qStatusBar(q);
  openModal(qHead()+'<div class="modal-b">'+b+'</div>'+errBar+'<div class="modal-f">'+foot+'</div>','lg');
  if(q.inputError)qMarkBad(q.errorField);
  if(q.phase==='running'||q.phase==='paused')quickPaintLogs();
@@ -1099,21 +1185,36 @@ function quickAction(act,el){
      if(keep.dev)replanQuick(keep);else{keep.steps=[];keep.phase='confirm';quickPaintModal();}
     });}return;
   case 'q-run':
-   if(!q)return;
+   /* 每一层判定都必须留下痕迹（弹窗内红条 + 后端日志），
+      否则「点了没反应」只能靠猜。qTrace 同时写进 q.trace，
+      弹窗底部的状态行会显示最近一次点击的结果。 */
+   if(!q){
+    qTrace(null,'no-state','state.quick 为空（弹窗已被关闭或状态被重置）');
+    toast('弹窗状态已丢失，请关闭后重新打开','e');return;}
    /* 幂等：一次点击可能被重复绑定 / 冒泡触发两次，写操作绝不能跑两遍
       （实测会连发两个 POST /api/quick/init，等于把盘初始化两次）。 */
-   if(q.phase==='running'||q.phase==='paused')return;
+   if(q.phase==='running'||q.phase==='paused'){
+    qTrace(q,'busy','已经在执行中，忽略重复点击');
+    toast('正在执行中，请稍候（进度见日志）','w');return;}
    /* 命令序列还在生成：记住意图，生成完自动开始，而不是把点击吞掉。 */
    if(q.phase==='loading'){
-    q.pendingRun=true;toast('命令序列还在生成，生成完会自动开始','w');return;}
+    qTrace(q,'loading-queue','命令生成中，已排队');
+    q.pendingRun=true;
+    q.status='命令序列还在生成，已记住这次点击——生成完会自动开始，不用再点。';
+    quickPaintModal();toast('命令序列还在生成，生成完会自动开始','w');return;}
    /* 校验失败必须留下痕迹：只弹 toast 太容易被忽略（尤其是弹窗盖住屏幕时），
       同时在弹窗里写一条红字，并记住是哪一步没填。 */
    var bad=qValidate(q);
-   if(bad){q.inputError=bad.msg;q.errorField=bad.field;quickPaintModal();toast(bad.msg,'e');return;}
-   q.inputError='';q.errorField='';
+   if(bad){
+    qTrace(q,'validate-fail',bad.field+' :: '+bad.msg);
+    q.inputError=bad.msg;q.errorField=bad.field;
+    q.status='';quickPaintModal();toast(bad.msg,'e');return;}
+   q.inputError='';q.errorField='';q.status='';
    if(state.mode==='live'&&state.auth.role!=='admin'){
+    qTrace(q,'readonly-user','role='+(state.auth.role||'-'));
     q.inputError='当前是只读账号，后端会拒绝写操作，请用管理员登录';q.errorField='';
     quickPaintModal();toast(q.inputError,'e');return;}
+   qTrace(q,'exec','stage='+((q.kind==='init'||isPhase(q.kind))?'auto':'pre')+' dev='+(q.dev||'-'));
    quickExec((q.kind==='init'||isPhase(q.kind))?'auto':'pre');return;
   case 'q-resume':if(q)quickExec('post');return;
   case 'q-abort':if(q){q.aborted=true;toast('已发送中止请求','w');}return;
@@ -1166,3 +1267,17 @@ if(document.readyState==='loading'){
 }else{
  liveBoot();
 }
+
+/* 页面一加载就报到一次：日志里能直接看到「这个浏览器实际跑的是哪个构建」。
+   排查「改了代码但现象没变」时，这一条比问用户 Ctrl+F5 有用得多。 */
+(function(){
+ var tries=0,t=setInterval(function(){
+  tries++;
+  if(state.mode==='live'&&state.auth&&state.auth.authenticated){
+   clearInterval(t);
+   qTrace(null,'boot','ui='+UI_BUILD+' view='+state.view+' role='+(state.auth.role||'-')+
+    ' allowWrite='+!!state.settings.allowWrite+' confirm='+!!state.settings.confirm);
+   return;}
+  if(tries>90)clearInterval(t);
+ },1000);
+})();

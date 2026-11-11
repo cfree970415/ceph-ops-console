@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.27"
+VERSION = "1.1.28"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
@@ -3847,6 +3847,21 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True, "alert": res})
 
     def api_post(self, path, body):
+        if path == "/api/beacon":
+            # 前端行为埋点：只写日志，不写审计、不需要写权限。
+            # 存在的唯一理由：「点了按钮什么都没发生」这类问题只在浏览器里发生，
+            # 光看后端访问日志只能知道「没发请求」，不知道卡在前端哪一步。
+            # 前端在 q-run 的每个分支都会打一条，服务端原样记下来，
+            # 之后 journalctl -u ceph-console | grep '\[beacon\]' 就能看到完整路径。
+            kind = str(body.get("kind", ""))[:24]
+            branch = str(body.get("branch", ""))[:40]
+            detail = str(body.get("detail", ""))[:400]
+            ui = str(body.get("ui", ""))[:24]
+            sys.stderr.write("[beacon] ui=%s user=%s ip=%s kind=%s branch=%s detail=%s\n"
+                             % (ui or "-", self._user(), self.client_address[0],
+                                kind or "-", branch or "-", detail.replace("\n", " ")))
+            sys.stderr.flush()
+            return self._json({"ok": True})
         if path == "/api/osd/verify":
             # 只读复核：换盘后 OSD 起来有延迟，前端用它重新回读，不必重跑流程。
             # 只看 ceph osd dump / metadata，不执行任何写命令。

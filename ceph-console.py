@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.23"
+VERSION = "1.1.24"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
@@ -1032,97 +1032,78 @@ def device_owner(cfg, dev):
 
 
 def retire_prereq(cfg, oid, cephadm=True):
-    """① 换盘前·清退阶段的硬门禁：OSD 必须真的 down，且移除队列是干净的。
+    """① 换盘前·清退的硬门禁：OSD 必须真的已经 down。
 
-    把一块还在 up 的盘清退掉，等于自己制造一次故障；队列里已有卡住的移除
-    任务时再提交，只会叠加第二条永远走不完的任务。两者都在真实执行前从
-    集群回读确认，不靠前端提示。已经清退过（destroyed）视为幂等成功。
+    1.1.24 起换盘**不保留 OSD 编号**：① 用 mon 侧命令式
+    `ceph osd purge <id> --yes-i-really-mean-it` 把旧编号连同 CRUSH / auth /
+    osdmap 记录一起删掉，② 让新盘以新编号加入。purge 不经过 cephadm 的
+    --replace 队列，也不做 osd safe-to-destroy 检查，因此单节点 / PG 不
+    active+clean 的拓扑不会再卡在 done, waiting for purge。
 
-    warnings 是「不阻断但必须提前知道」的风险，最典型的是 PG 不是
-    active+clean：cephadm 的 purge 前会反复跑 osd safe-to-destroy，永远
-    不通过时队列会停在 done, waiting for purge，等再久也不会 destroyed。
+    结果是不可逆的：旧编号消失、旧盘数据放弃。所以仍 up 时坚决拒绝。
     """
     oid = int(oid)
     flags, err = osd_map_flags(cfg)
     info = {"ok": False, "down": False, "out": False, "exists": False,
-            "alreadyDestroyed": False, "blockers": [], "warnings": [],
-            "queue": [], "safeToDestroy": None, "message": ""}
-    if flags and "destroyed" in (flags.get(oid) or []):
-        info.update({"ok": True, "down": True, "out": True, "exists": True,
-                     "alreadyDestroyed": True})
-        info["message"] = ("osd.%d 已是 destroyed，清退已完成：现场换盘后直接执行"
-                           "第 ② 步「新盘入群」" % oid)
-        return info
+            "alreadyRetired": False, "blockers": [], "warnings": [],
+            "queue": [], "message": ""}
     st = osd_upin_state(cfg, oid)
     info["exists"] = bool(st)
-    info["down"] = bool(st and not st["up"])
-    info["out"] = bool(st and not st["in"])
-    if st is None:
-        info["blockers"].append("读不到 ceph osd dump，无法确认 osd.%d 是否 down：%s"
-                                % (oid, err or "无返回"))
-    elif st["up"]:
+    # purge 之后编号从 osdmap 消失；老版本可能短暂留下 destroyed 标记，都算已清退。
+    if st is None or (flags and "destroyed" in (flags.get(oid) or [])):
+        info.update({"ok": True, "down": True, "out": True,
+                     "alreadyRetired": True})
+        info["message"] = ("osd.%d 已从 osdmap 移除，清退已完成：现场换盘后执行"
+                           "第 ② 步「新盘入群」，新盘会分配一个新的 OSD 编号" % oid)
+        return info
+    info["down"] = not st["up"]
+    info["out"] = not st["in"]
+    if st["up"]:
         info["blockers"].append(
-            "osd.%d 仍是 up：先让它真正下线再清退。cephadm 环境建议 "
-            "ceph osd down %d && ceph osd out %d（或让故障盘自然 down），"
-            "确认 ceph osd tree 里 down 后立刻回来点清退。"
-            "不要为了制造 down 而长期手工停 daemon（orch daemon stop / "
-            "systemctl stop ceph-osd@%d）：cephadm 的 purge 需要 OSD 上报 "
-            "stats 才能通过 osd safe-to-destroy，手工停服务会让移除队列"
-            "卡在 done, waiting for purge" % (oid, oid, oid, oid))
+            "osd.%d 仍是 up：清退会永久删除该 OSD 的编号与身份，健康盘不能这样操作。"
+            "先确认故障盘已下线（ceph osd down %d && ceph osd out %d，或让故障盘"
+            "自然 down），在 ceph osd tree 里看到 down 后再点清退" % (oid, oid, oid))
     if cephadm:
         rows, qerr = osd_rm_queue(cfg)
         info["queue"] = rows or []
-        if rows:
-            mine = [r for r in rows if r["osd_id"] == oid]
-            if mine:
-                info["blockers"].append(
-                    "ceph orch osd rm status 里 osd.%d 已有未完成的移除任务（%s）："
-                    "重复提交只会叠加卡住的任务。先看 ceph orch osd rm status，"
-                    "要重来先 ceph orch osd rm stop %d 清掉队列，再重新清退"
-                    % (oid, queue_state(mine[0]), oid))
-            stale = [r for r in rows if r["osd_id"] != oid
-                     and (r.get("ageMin") or 0) > 30]
-            if stale:
-                info["blockers"].append(
-                    "移除队列里还有别的 OSD 卡了超过 30 分钟（%s）：先用 "
-                    "ceph orch osd rm stop <id> 清掉这些任务（只取消移除，不动 "
-                    "OSD 数据），再重新清退，否则新任务不会被正常调度"
-                    % "、".join("osd.%d/%s" % (r["osd_id"], queue_state(r))
-                                for r in stale))
-        elif rows is None:
-            info["warnings"].append("读不到 ceph orch osd rm status（%s），"
-                                    "无法确认移除队列是否干净" % (qerr or "无返回"))
-        safe = osd_safe_to_destroy(cfg, oid)
-        info["safeToDestroy"] = safe["ok"]
-        if safe["ok"] is False:
+        mine = [r for r in (rows or []) if r["osd_id"] == oid]
+        if mine:
             info["warnings"].append(
-                "ceph osd safe-to-destroy %d 当前返回「%s」：cephadm 每次 purge 前"
-                "都会重跑这条检查，PG 不 active+clean 时它不会放行，--replace "
-                "队列会停在 done, waiting for purge，编号不会自动变成 destroyed。"
-                "建议先让 PG 回到 active+clean；实在不行，确认没有不可恢复的数据"
-                "后再考虑手工 ceph osd destroy %d --force（平台不会自动执行）"
-                % (oid, safe["message"], oid))
+                "ceph orch osd rm status 里 osd.%d 还有未完成的 --replace 任务（%s）："
+                "本步会先用 ceph orch osd rm stop %d 清掉它（只取消移除任务，不动数据），"
+                "再用 mon 命令式 purge 删除编号，不依赖这个队列走完"
+                % (oid, queue_state(mine[0]), oid))
+        elif rows is None:
+            info["warnings"].append("读不到 ceph orch osd rm status（%s）；"
+                                    "不影响 purge，但建议人工看一眼有没有僵尸任务"
+                                    % (qerr or "无返回"))
+        others = [r for r in (rows or []) if r["osd_id"] != oid]
+        if others:
+            info["warnings"].append(
+                "移除队列里还有别的任务 %s（可能是旧版留下的僵尸任务）：purge "
+                "不依赖它们，但建议用 ceph orch osd rm stop <id> 清掉，避免编排器"
+                "一直重跑无效调度"
+                % "、".join("osd.%d/%s" % (r["osd_id"], queue_state(r)) for r in others))
+    info["warnings"].append(
+        "本步不可逆：ceph osd purge %d 会同时删除 CRUSH 条目、认证与 osdmap 记录，"
+        "旧编号 osd.%d 不再保留，旧盘上的数据视为放弃；第 ② 步的新盘由 mon "
+        "分配一个新编号（可能与旧编号相同，也可能不同，平台不做保证）" % (oid, oid))
     if not info["blockers"]:
         info["ok"] = True
-        info["message"] = ("osd.%d 已 down（%s），移除队列干净，可以安全移除并保留编号"
-                           % (oid, "且已 out" if info["out"] else "仍 in，清退流程会先 out"))
-        if info["warnings"]:
-            info["message"] += "；但存在风险提示（见下）"
+        info["message"] = ("osd.%d 已 down（%s），可以清退：删除旧编号，现场换盘后"
+                           "以新编号加入"
+                           % (oid, "且已 out" if info["out"] else "仍 in，流程会先 out"))
     else:
         info["message"] = "；".join(info["blockers"])
     return info
 
 
 def check_retire(cfg, oid, cephadm=True):
-    """① 清退后的复核：编号是否真的释放、以及「等下去有没有用」。
+    """① 清退后的复核：旧编号是否已从 osdmap 彻底删除。
 
-    旧实现只分成功 / 等待两态，把 "done, waiting for purge" 也说成
-    「异步过程，等队列走完」，前端于是每 5 秒自动复核、永远不告诉用户真相。
-    实际上 cephadm 在 purge 前会反复跑 osd safe-to-destroy；PG 不 active+clean
-    或 OSD 被手工停掉没有 stats 时，这个检查永远不通过，编号永远不会 destroyed。
-    所以必须区分：
-      pending = 队列在正常推进，稍后复核有意义
-      blocked = 队列卡死且不会自愈，要人工处理（action=manual，不再自动轮询）
+    purge 是 mon 侧同步操作，执行完就该生效；不再有「等 --replace 队列
+    变成 destroyed」这种异步等待，也不再区分 pending / blocked 的轮询。
+    没删干净就明确报错并给出手工命令，不让前端无限转圈。
     """
     oid = int(oid)
     st = osd_upin_state(cfg, oid)
@@ -1130,205 +1111,128 @@ def check_retire(cfg, oid, cephadm=True):
     destroyed = bool(flags and "destroyed" in (flags.get(oid) or []))
     base = {"ok": False, "down": bool(st and not st["up"]),
             "out": bool(st and not st["in"]), "destroyed": destroyed,
-            "pending": False, "blocked": False, "action": None,
-            "queueState": "unknown", "otherTasks": [], "safeToDestroy": None,
-            "fix": []}
-    if cephadm:
-        if destroyed:
-            base.update({"ok": True, "action": "deploy"})
-            base["message"] = ("osd.%d 已清退为 destroyed，编号已保留；现场换盘后执行"
-                               "第 ② 步「新盘入群」" % oid)
-            return base
-        if flags is None:
-            base["message"] = "读不到 ceph osd dump，无法确认清退结果：%s" % (err or "无返回")
-            return base
-        rows, qerr = osd_rm_queue(cfg)
-        mine = next((r for r in (rows or []) if r["osd_id"] == oid), None)
-        others = [r for r in (rows or []) if r["osd_id"] != oid]
-        qs = queue_state(mine)
-        base["queueState"] = qs
-        base["otherTasks"] = ["osd.%d/%s" % (r["osd_id"], queue_state(r)) for r in others]
-        blockers = []
-        if qs == "done-waiting-for-purge":
-            safe = osd_safe_to_destroy(cfg, oid)
-            base["safeToDestroy"] = safe["ok"]
-            if safe["ok"] is not True:
-                blockers.append(
-                    "osd.%d 的 --replace 队列停在 done, waiting for purge："
-                    "cephadm 每次 purge 前都执行 osd safe-to-destroy %d，"
-                    "当前结果是「%s」。PG 不 active+clean、或 OSD 被手工停掉"
-                    "没有上报 stats 时这一步永远不通过，继续等不会变成 destroyed"
-                    % (oid, oid, safe["message"]))
-        elif qs == "draining" and (mine.get("ageMin") or 0) > 30:
-            blockers.append("osd.%d 的移除任务 draining 已超过 30 分钟："
-                            "PG 排不空，队列不会自己往前走" % oid)
-        if base["otherTasks"]:
-            blockers.append("移除队列里还有别的未完成任务 %s，可能一直占用编排器调度"
-                            % "、".join(base["otherTasks"]))
-        if blockers:
-            base.update({"blocked": True, "action": "manual", "pending": False})
-            base["fix"] = [
-                "ceph orch osd rm status",
-                "ceph osd safe-to-destroy %d" % oid,
-                "ceph orch osd rm stop <卡住的 id>   # 只取消移除任务，不动 OSD 数据",
-                "让 PG 回到 active+clean（补齐可用 OSD / 调整副本数）后等 cephadm 自动 purge",
-                "或确认无不可恢复数据后：ceph osd destroy %d --force；再 ceph orch osd rm stop %d"
-                % (oid, oid),
-                "ceph osd dump --format=json   # 看到 state 含 destroyed 才能做第 ② 步",
-            ]
-            base["message"] = ("清退被阻塞，不会自动完成。\n"
-                               + "\n".join("· " + x for x in blockers)
-                               + "\n\n处理（平台不会自动执行，需人工确认数据无碍）：\n  "
-                               + "\n  ".join(base["fix"]))
-            return base
-        base.update({"pending": True, "action": "recheck"})
-        base["message"] = (
-            "osd.%d 已提交 --replace，移除队列仍在正常推进（%s），编号还没打成 "
-            "destroyed；稍后复核有意义，现在还不能 zap 新盘。若状态长期停在 "
-            "done, waiting for purge，请执行 ceph osd safe-to-destroy %d 检查"
-            % (oid, qs, oid))
-        if rows is None:
-            base["message"] += "；另外本次没读到移除队列（%s），请用 ceph orch osd rm status 人工核对" % (qerr or "无返回")
-        return base
-    if st is None:
+            "pending": False, "blocked": False, "action": None, "fix": []}
+    if st is None or destroyed:
         base.update({"ok": True, "action": "deploy"})
-        base["message"] = ("osd.%d 已从 osdmap 移除；第 ② 步用 ceph-volume "
-                           "lvm create --osd-id %d 复用原编号" % (oid, oid))
-    else:
-        base["message"] = ("osd.%d 仍在 osdmap：清退未完成，第 ② 步会拒绝执行，"
-                           "先确认 purge / crush remove / auth del 是否成功" % oid)
+        base["message"] = ("osd.%d 已从 osdmap 删除，旧编号不再保留。现场换盘后"
+                           "执行第 ② 步「新盘入群」，新盘会分配一个新 OSD 编号" % oid)
+        return base
+    if flags is None:
+        base.update({"blocked": True, "action": "manual"})
+        base["message"] = "读不到 ceph osd dump，无法确认清退结果：%s" % (err or "无返回")
+        base["fix"] = ["ceph osd tree", "ceph osd dump --format=json"]
+        return base
+    base.update({"blocked": True, "action": "manual"})
+    base["fix"] = [
+        "ceph osd tree",
+        "ceph osd out %d" % oid,
+        "ceph osd purge %d --yes-i-really-mean-it" % oid,
+        "ceph orch osd rm stop %d   # 若还有旧的 --replace 僵尸任务" % oid,
+        "ceph osd dump --format=json   # 期望 osd.%d 不再出现在 osds[]" % oid,
+    ]
+    base["message"] = (
+        "osd.%d 仍在 osdmap（state=%s）：清退没删干净，purge 可能失败了。"
+        "这一步不靠等待自愈，不会自动完成，请按上面的命令手工确认 / 重做，"
+        "成功后再现场换盘。"
+        % (oid, "/".join(flags.get(oid) or ["exists"])))
     return base
 
 
 def replace_prereq(cfg, oid, dev=None):
-    """② 换盘后·新盘入群（zap）之前的硬门禁。三项前提缺一不可，否则编号一定会被改成新的。
+    """② 换盘后·新盘入群之前的硬门禁（1.1.24 起换盘不保留编号）。
 
-    1. 原编号已是 destroyed：--replace 的移除队列真正走完，OSDSpec 才会认领它；
-    2. 存在 managed 的 OSDSpec：否则 zap 之后根本没有人来重建；
-    3. 目标盘不属于别的编号，osdmap 里也没有新冒出来、从未上线的编号。
-
-    这里的每一项都能从只读命令回读，不依赖「等一会儿应该就好了」的猜测。
+    只拦真正危险的一件事：**目标盘正被别的 OSD 使用**。zap 会抹掉整块盘，
+    盘位填错时必须拒绝。其余信息（旧编号是否还在、OSDSpec 是否 managed、
+    osdmap 里有没有残留的 state=new 编号）都只是提示：新编号由 mon 分配、
+    创建走命令式 ceph orch daemon add osd，不依赖 destroyed / osd_id_claims。
     """
     oid = int(oid)
     blockers = []
-    info = {"ok": False, "destroyed": False, "specManaged": False,
-            "owner": None, "newOsds": [], "blockers": blockers}
+    info = {"ok": False, "owner": None, "newOsds": [], "warnings": [],
+            "blockers": blockers, "oldOsdRetired": False}
     flags, err = osd_map_flags(cfg)
     if flags is None:
-        blockers.append("读不到 ceph osd dump，无法确认原编号状态：" + err)
+        blockers.append("读不到 ceph osd dump，无法确认设备归属：" + (err or "无返回"))
         return info
-    states = flags.get(oid) or []
-    info["destroyed"] = "destroyed" in states
-    rows, _ = osd_rm_queue(cfg)
-    mine = next((r for r in (rows or []) if r["osd_id"] == oid), None)
-    info["queueState"] = queue_state(mine)
-    if not info["destroyed"]:
-        extra = ""
-        if info["queueState"] == "done-waiting-for-purge":
-            safe = osd_safe_to_destroy(cfg, oid)
-            info["safeToDestroy"] = safe["ok"]
-            extra = ("；移除队列停在 done, waiting for purge，osd safe-to-destroy %d "
-                     "返回「%s」——PG 不 active+clean 时它不会自动放行，"
-                     "先让 PG 恢复或确认数据无碍后手工 ceph osd destroy %d --force"
-                     % (oid, safe["message"], oid))
-        blockers.append(
-            "osd.%d 还不是 destroyed（当前 state=%s，队列状态 %s）。ceph orch osd rm "
-            "%d --replace 是异步的，--force 只跳过 drain 等待、不跳过 purge 前的 "
-            "safe-to-destroy 检查；必须等移除队列真正把编号释放掉，OSDSpec 才会复用它。"
-            "现在 zap 新盘只会被当成一块全新的盘、分配一个新编号%s。"
-            % (oid, "/".join(states) if states else "编号不在 osdmap",
-               info["queueState"], oid, extra))
-    spec_ok, spec_msg = osdspec_managed(cfg)
-    info["specManaged"] = spec_ok
-    if not spec_ok:
-        blockers.append(spec_msg)
+    info["oldOsdRetired"] = oid not in flags or "destroyed" in (flags.get(oid) or [])
+    if not info["oldOsdRetired"]:
+        info["warnings"].append(
+            "osd.%d 仍在 osdmap（state=%s）：① 清退可能没做或没成功。本步仍可继续，"
+            "但旧编号不会被复用，新盘会拿到一个新编号；建议先确认 ① 已完成"
+            % (oid, "/".join(flags.get(oid) or ["exists"])))
     owner = device_owner(cfg, dev)
     info["owner"] = owner
-    if owner is not None and owner != oid:
-        blockers.append("%s 当前属于 osd.%d（不是 osd.%d），zap 会抹掉别的 OSD 的盘"
-                        % (dev or "<新盘>", owner, oid))
-    new_ids = sorted(i for i, st in flags.items() if i != oid and "new" in st)
+    if owner is not None:
+        # 只拦「正被一个 up/in 的健康 OSD 使用」的盘。旧版误操作留下的
+        # down/out、state=new 记录或盘上的旧 LVM 标签（osd_id 还指向旧编号）
+        # 恰恰是 zap 要清掉的东西，拦掉它们会让新盘永远加不进来。
+        st_owner = osd_upin_state(cfg, owner)
+        if st_owner and st_owner.get("up") and st_owner.get("in"):
+            blockers.append("%s 当前属于 osd.%d，该 OSD 是 up/in，zap 会抹掉"
+                            "一块正在服务的数据盘；请核对设备路径"
+                            % (dev or "<新盘>", owner))
+        else:
+            info["warnings"].append(
+                "%s 的旧签名 / metadata 仍指向 osd.%d（该 OSD 当前不是 up/in，"
+                "多半是旧版残留记录或换盘前的旧标签）：本步 zap 正是要清掉它，"
+                "不阻断；执行前请用 lsblk -o NAME,FSTYPE,LABEL 与盘位 / SN 再核对一次"
+                % (dev or "<新盘>", owner))
+    new_ids = sorted(i for i, f in flags.items() if i != oid and "new" in f)
     info["newOsds"] = new_ids
     if new_ids:
-        blockers.append("osdmap 里已经有从未上线的新编号 %s：说明之前的操作已经把"
-                        "换盘变成了「新增磁盘」，请先清理这些多余记录再继续"
-                        % "、".join("osd.%d" % i for i in new_ids))
+        info["warnings"].append(
+            "osdmap 里存在从未上线的编号 %s（旧版误操作残留）：不影响本次入群，"
+            "但建议换盘完成后用 ceph osd tree / ceph orch ps 核对并清理"
+            % "、".join("osd.%d" % i for i in new_ids))
+    # managed OSDSpec 不再是门禁：创建走命令式 ceph orch daemon add osd，
+    # 有没有 spec 都能完成（有 spec 时编排器可能抢先自动部署，那条命令
+    # 失败会被 TOLERANT_STEPS 放行）。保留字段只为兼容前端展示。
+    info["specManaged"] = None
+    info["warnings"].append(
+        "本步会不可逆地清理 %s 上的旧签名并创建 OSD；新编号由 mon 分配，"
+        "可能与 osd.%d 不同" % (dev or "<新盘>", oid))
     info["ok"] = not blockers
     return info
 
 
 def check_replace(cfg, oid, dev=None):
-    """换盘后复核：新盘到底挂在哪个编号上、原编号有没有真的回来。
+    """② 入群后复核：新盘是否被一个 up/in 的 OSD 接管。
 
-    只盯 `osd.<old_id>` 的 up/in 会误判最常见的一种真实情况：cephadm 的
-    `daemon add osd` 给新盘分了新编号，旧编号仍以 down/out 留在 osdmap 里。
-    这时旧编号永远等不到 up，报「守护进程没起来」是错的，加长等待也没用。
-    所以先看「新盘现在属于谁」，再分三种结论：
-      新盘挂在别的编号 -> 编号没复用（等价于新增磁盘），需人工处理旧记录
-      新盘挂在原编号但还没 up -> 部署中，稍后重新复核即可
-      新盘还没被任何 OSD 认领 -> 部署中 / 采集不到，稍后重新复核
+    1.1.24 起换盘不保证编号不变，所以复核**完全与编号解耦**：不看
+    osd.<old_id> 是否 up，只看「这块新盘现在归谁、那个 OSD 是否 up/in」。
+    旧编号可能恰好被 mon 重新分配，也可能变成别的号，两者都算成功。
     """
-    st = osd_upin_state(cfg, oid)
     owner = device_owner(cfg, dev)
-    base = {"ok": False, "up": (st or {}).get("up"), "in": (st or {}).get("in"),
-            "reused": False, "pending": False, "newOsd": None, "action": None}
-    if owner is not None and owner != oid:
-        base.update({"newOsd": owner, "action": "cleanup"})
-        base["message"] = (
-            "新盘 %s 已作为 osd.%d 加入集群，但原编号 osd.%d 没有被复用"
-            "（当前 %s）。这不是「OSD 启动慢」：等再久 osd.%d 也不会 up。"
-            "若本意是扩容，请用「新增磁盘」入口；若要 1:1 换盘，需检查 cephadm "
-            "--replace 是否保留了原编号。旧记录 osd.%d 请在确认数据无碍后清理。"
-            % (dev, owner, oid,
-               ("down/out" if st and not st["up"] and not st["in"] else "仍在 osdmap"),
-               oid, oid))
-        return base
-    # 旧 OSD 的 metadata 可能还在把新盘报给原编号，于是 owner 看起来「没变」，
-    # 但 osdmap 里其实已经多了一个从未上线的新 OSD（state 含 new）。这种现场
-    # 不能当成「启动慢」——等再久原编号也不会自己回来，必须明确报编号没复用。
-    flags, _ = osd_map_flags(cfg)
-    orphans = sorted(i for i, st in (flags or {}).items()
-                     if i != int(oid) and "new" in st)
-    reused = bool(st and st["up"] and st["in"])
-    if orphans and not reused:
-        base.update({"newOsd": orphans[0], "newOsds": orphans,
-                     "action": "cleanup"})
-        base["message"] = (
-            "集群里出现了从未上线的新编号 %s，而 osd.%d 并没有用原编号回来："
-            "这次换盘实际变成了「新增磁盘」。这不是 OSD 启动慢，等再久 osd.%d "
-            "也不会自己 up。请用 ceph osd tree / ceph orch ps 核对，清理多出的 OSD "
-            "记录、确认 --replace 的移除队列已把原编号标记为 destroyed 后再重试。"
-            % ("、".join("osd.%d" % i for i in orphans), oid, oid))
-        return base
-    if st is None:
+    base = {"ok": False, "up": None, "in": None, "deployed": False,
+            "pending": False, "newOsd": owner, "action": None}
+    if owner is not None:
+        st = osd_upin_state(cfg, owner)
+        base["up"] = (st or {}).get("up")
+        base["in"] = (st or {}).get("in")
+        if st and st["up"] and st["in"]:
+            base.update({"ok": True, "deployed": True})
+            base["message"] = (
+                "新盘 %s 已由 osd.%d 接管并 up/in，换盘完成。"
+                "编号由 mon 分配（原编号 osd.%d 已在 ① 清退时删除），"
+                "数据开始回填；ceph -s 观察 PG 回到 active+clean"
+                % (dev or "<新盘>", owner, oid))
+            return base
         base.update({"pending": True, "action": "recheck"})
-        base["message"] = ("osd.%d 已不在 osd dump，且新盘 %s 还没被任何 OSD 认领："
-                           "OSD 可能仍在部署 / 设备信息还没采到，稍后点「重新复核」"
-                           % (oid, dev or "<新盘>"))
+        base["message"] = (
+            "新盘 %s 已登记到 osd.%d，但守护进程还没 up/in（%s）："
+            "cephadm 拉起容器常需几十秒，稍后点「重新复核」即可"
+            % (dev or "<新盘>", owner,
+               "down" if not base["up"] else ("out" if not base["in"] else "采集中")))
         return base
-    if st["up"] and st["in"]:
-        base.update({"ok": True, "reused": True})
-        base["message"] = "osd.%d 已用原编号重新上线（up/in），数据开始回填" % oid
-        return base
-    reasons, pending = [], False
-    if not st["up"]:
-        if owner == oid:
-            reasons.append("新盘已挂到原编号 osd.%d，但守护进程还没 up（cephadm 拉起容器常需几十秒）" % oid)
-            pending = True
-        elif owner is None:
-            reasons.append("仍为 down：无法确认新盘归属（设备信息未采到），看 ceph orch ps 或 ceph osd tree")
-            pending = True
-        else:
-            reasons.append("仍为 down：新盘上的 OSD 守护进程没起来（看 ceph orch ps 或 systemctl status ceph-osd@%d）" % oid)
-    if not st["in"]:
-        reasons.append("仍为 out：执行 ceph osd in %d（或点 OSD 列表里的「IN」）" % oid)
-    base.update({"reused": True, "pending": pending,
-                 "action": "recheck" if pending else "in"})
-    if pending:
-        base["message"] = ("osd.%d 仍在上线中：%s。这是部署延迟，不是失败，"
-                           "稍后点「重新复核」即可" % (oid, "；".join(reasons)))
-    else:
-        base["message"] = "osd.%d 已用原编号重建，但%s" % (oid, "；".join(reasons))
+    flags, _ = osd_map_flags(cfg)
+    fresh = sorted(i for i, f in (flags or {}).items() if i != oid and "new" in f)
+    base.update({"pending": True, "action": "recheck",
+                 "newOsd": fresh[0] if fresh else None})
+    base["message"] = (
+        "新盘 %s 还没被任何 OSD 认领（设备信息可能还没采到，或编排器仍在部署）："
+        "%s稍后点「重新复核」，或看 ceph orch ps --daemon-type osd / ceph osd tree"
+        % (dev or "<新盘>",
+           ("osdmap 已出现新编号 %s。" % "、".join("osd.%d" % i for i in fresh)) if fresh else ""))
     return base
 
 
@@ -2717,101 +2621,81 @@ def validate_target(osd_id, host, dev):
 
 
 def _plan_retire(cfg, probe, oid, add):
-    """① 换盘前·清退：确认 down（执行前由 retire_prereq 硬校验）→ 安全移除并保留编号。
+    """① 换盘前·清退：确认 down → 从集群彻底删除旧编号（不保留）。
 
-    只到 destroyed 为止，绝不碰新盘、绝不 zap。现场换盘是独立的物理动作，
-    两个阶段之间可能隔几个小时甚至几天，不能绑在一次请求里。
+    直接用 mon 侧命令式 ceph osd purge，绕过 cephadm 的 --replace 队列：
+    那个队列在 purge 前会反复跑 osd safe-to-destroy，单节点 / PG 不
+    active+clean 时永远不通过，是之前「清退卡住」的根因。
+    绝不 zap、绝不碰新盘 —— 现场换盘是之后独立的人工动作。
     """
     orch = probe.caps.get("orch", False)
     purge = probe.caps.get("purge", False)
-    cur = osd_upin_state(cfg, oid)
-    dead = bool(cur) and not cur.get("up")
     if orch:
-        add("检查 OSD 是否可安全销毁（purge 前提）",
-            ["ceph", "osd", "safe-to-destroy", str(oid)],
-            "只读诊断：cephadm 每次 purge 前都跑这条。返回 EAGAIN / EBUSY 说明 "
-            "PG 不是 active+clean 或 OSD 没上报 stats，移除队列会停在 "
-            "done, waiting for purge，编号不会自动变 destroyed")
+        add("清掉旧版的僵尸移除任务",
+            ["ceph", "orch", "osd", "rm", "stop", str(oid)],
+            "只取消 cephadm 的 osd rm / --replace 排队任务，不动 OSD 数据。"
+            "队列里没有该任务时会报错，属正常，流程会继续；这一步同时放弃"
+            "旧版 --replace 留下的 osd_id_claims（本方案不保留编号）")
     add("标记 OSD OUT", ["ceph", "osd", "out", str(oid)],
-        "先把 PG 从这块盘迁走；盘已彻底损坏时其他副本通常早已接管，该步幂等。"
-        "cephadm 的移除与停 daemon 由 ceph orch osd rm --replace 统一处理")
-    if orch:
-        # 不要手工 `orch daemon stop`：官方 --replace 流程由编排器自己停 daemon
-        # 并 purge；手工停会让 OSD 没有 stats，purge 前的 safe-to-destroy 永远
-        # 返回 EAGAIN，队列卡在 "done, waiting for purge"。
-        if dead:
-            add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace", "--force"],
-                "--replace 保留 osd.%d 编号供新盘复用；--force 只跳过 drain 等待"
-                "（盘已 down 时等回填没有意义），不会跳过 purge 前的 "
-                "osd safe-to-destroy 检查" % oid)
-        else:
-            add("移除 OSD 并保留编号", ["ceph", "orch", "osd", "rm", str(oid), "--replace"],
-                "--replace 让 osd.%d 这个编号不被回收，cephadm 会等回填完成后再销毁 daemon" % oid)
-        add("确认 OSD 服务规约（编号复用的前提）",
-            ["ceph", "orch", "ls", "--service-type", "osd", "--format=json"],
-            "cephadm 只有在新盘匹配 OSDSpec 时，才会用 --replace 保留的原编号自动重建；"
-            "spec 不存在或 unmanaged=true 时 zap 之后不会重建，需先配置 spec")
-        add("轮询移除进度", ["ceph", "orch", "osd", "rm", "status", "--format=json"],
-            "确认该 OSD 已离开移除队列（编号 destroyed）。若停在 "
-            "done, waiting for purge，说明 purge 前的 safe-to-destroy 没通过，"
-            "不会自愈，需人工处理后再看 ceph osd dump")
-        add("确认原编号已释放为 destroyed（编号复用前提）",
-            ["ceph", "osd", "dump", "--format=json"],
-            "osds[] 里 osd.%d 的 state 必须含 destroyed；没有就说明 --replace 的"
-            "移除队列还没走完。第 ② 步执行前平台会再次核验，未释放直接拒绝 zap" % oid)
+        "把 PG 从故障盘迁走；盘已损坏时其他副本通常早已接管，该步幂等")
+    if purge:
+        add("永久删除故障 OSD（编号不保留）",
+            ["ceph", "osd", "purge", str(oid), "--yes-i-really-mean-it"],
+            "mon 侧命令式：一次删掉 CRUSH 条目 / 认证 / osdmap 记录并标记 destroyed。"
+            "不经过 cephadm 的 --replace 队列，也不做 osd safe-to-destroy 检查，"
+            "因此不会卡在 done, waiting for purge。不可逆：旧编号 osd.%d 不再保留，"
+            "旧盘数据视为放弃；第 ② 步新盘由 mon 分配新编号" % oid)
     else:
-        # 包安装部署没有编排器：先停进程再摘盘，编号由下一步 --osd-id 显式复用。
-        add("停止故障 OSD 守护进程", osd_daemon_cmd(probe, "stop", oid),
-            "包安装部署：先停进程，否则心跳会把 down 立刻改回 up")
-        if purge:
-            add("移除 OSD 但留作替换（purge）", ["ceph", "osd", "purge", str(oid), "--yes-i-really-mean-it"],
-                "清掉 CRUSH 条目 / 认证 / osdmap 记录；编号 osd.%d 由第 ② 步 --osd-id 强制复用" % oid)
-        else:
-            add("从 CRUSH 移除", ["ceph", "osd", "crush", "remove", "osd.%d" % oid])
-            add("删除认证", ["ceph", "auth", "del", "osd.%d" % oid])
-            add("删除 OSD", ["ceph", "osd", "rm", str(oid)])
+        add("从 CRUSH 移除", ["ceph", "osd", "crush", "remove", "osd.%d" % oid],
+            "老版本没有 ceph osd purge，分三步删除编号（不保留）")
+        add("删除认证", ["ceph", "auth", "del", "osd.%d" % oid])
+        add("删除 OSD", ["ceph", "osd", "rm", str(oid)])
+    if orch:
+        add("确认旧 daemon 已退出",
+            ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
+            "只读：若仍残留 stopped 的 osd.%d，可手工 ceph orch daemon rm osd.%d --force；"
+            "不自动执行，避免编排器把还没换下的旧盘重新纳管" % (oid, oid))
+    add("复核旧编号已从 osdmap 删除", ["ceph", "osd", "dump", "--format=json"],
+        "只读复核：osds[] 里不应再有 osd.%d。成功后才能现场换盘" % oid)
 
 
 def _plan_deploy(cfg, probe, oid, host, dev, add):
-    """② 换盘后·新盘入群：清理新盘签名 → 用原编号重建 → 回读复核。
+    """② 换盘后·新盘入群：清签名 → 创建 OSD（mon 分配新编号）→ 回读复核。
 
-    cephadm 靠 destroyed + managed OSDSpec 自动认领原编号；包安装靠
-    ceph-volume lvm create --osd-id 显式指定。绝不调用 daemon add osd。
+    cephadm 用 zap + 命令式 daemon add osd；包安装用 ceph-volume lvm create
+    不带 --osd-id。都不传原编号，也不依赖 destroyed / osd_id_claims。
     """
     orch = probe.caps.get("orch", False)
-    weight = (osd_upin_state(cfg, oid) or {}).get("weight") or 0.0
     if orch:
         add("确认新盘已被编排器识别",
             ["ceph", "orch", "device", "ls", str(host), "--format=json"],
-            "新盘应出现在 %s 的设备列表里（available 可能为 false，因为还带着旧签名）" % host)
-        add("清理新盘残留签名（触发按原编号自动重建）",
+            "新盘应出现在 %s 的设备列表（available 可能为 false，还带着旧签名）" % host)
+        add("清理新盘残留签名",
             ["ceph", "orch", "device", "zap", str(host), str(dev), "--force"],
-            "只作用于 %s；执行前平台会确认 osd.%d 已是 destroyed、存在 managed "
-            "OSDSpec、且这块盘不属于别的编号，任一不满足就拒绝 zap。zap 后由 "
-            "OSDSpec 自动用 destroyed 的原编号 osd.%d 重建；绝不能改用 "
-            "ceph orch daemon add osd：那是命令式添加，会分配新编号" % (dev, oid, oid))
-        add("等待编排器用原编号重建 OSD",
+            "只作用于 %s：抹掉旧 LVM / 分区表签名（旧盘位上可能还留着 osd.%d 的标签）。"
+            "执行前平台会确认这块盘不属于别的 OSD" % (dev, oid))
+        add("创建并部署新 OSD（分配新编号）",
+            ["ceph", "orch", "daemon", "add", "osd", "%s:%s" % (host, dev)],
+            "命令式创建，由 mon 分配一个新 OSD 编号；不传 --osd-id、不认领旧编号。"
+            "若已 apply osd 自动纳管，这条可能提示已被管理而失败（属正常，"
+            "编排器会自己部署），流程继续")
+        add("等待新 OSD 上线",
             ["ceph", "orch", "ps", "--daemon-type", "osd", "--format=json"],
-            "只读查看；cephadm 拉起容器常需几十秒，daemon 必须是 osd.%d 而不是新编号" % oid)
+            "只读：新 OSD 应为 running；编号可能与 osd.%d 不同，属正常" % oid)
     else:
         if probe.major >= 13:
             add("清理新盘元数据", ["ceph-volume", "lvm", "zap", str(dev), "--destroy"],
                 "清掉旧签名；只作用于 %s，执行前请核对盘位与 SN" % dev)
-            add("用原编号重建 OSD（--osd-id 强制复用）",
-                ["ceph-volume", "lvm", "create", "--data", str(dev), "--osd-id", str(oid)],
-                "不指定 --osd-id 就会分配一个新编号；这里强制沿用原编号 osd.%d" % oid)
+            add("创建 OSD（不指定编号，由 mon 分配）",
+                ["ceph-volume", "lvm", "create", "--data", str(dev)],
+                "不带 --osd-id：mon 分配一个新编号，旧编号 osd.%d 不再保留" % oid)
         else:
             add("准备新盘（12.x）", ["ceph-disk", "prepare", str(dev)])
             add("激活 OSD（12.x）", ["ceph-disk", "activate", str(dev)])
-        if weight > 0.001 and abs(weight - 1.0) > 0.001:
-            add("恢复原 CRUSH 权重", ["ceph", "osd", "crush", "reweight", "osd.%d" % oid,
-                                      "%.4f" % weight],
-                "新建 OSD 默认权重是 1.0，原权重是 %.4f；不恢复会导致这块盘承载的数据偏少" % weight)
-        else:
-            add("确认 CRUSH 权重（原值非 1.0 时手工恢复）",
-                ["ceph", "osd", "crush", "tree", "--format=json"],
-                "第 ② 步是独立请求，清退后读不到原权重；若原来是自定义权重，"
-                "请手工执行 ceph osd crush reweight osd.%d <原权重>" % oid)
+        add("确认新 OSD 的 CRUSH 权重",
+            ["ceph", "osd", "crush", "tree", "--format=json"],
+            "只读：新 OSD 默认权重 1.0。若原盘是自定义权重，按新编号手工 "
+            "ceph osd crush reweight osd.<新编号> <原权重>")
 
 
 def build_plan(cfg, probe, intent, osd_id, host, dev):
@@ -2820,7 +2704,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     if intent not in ("remove", "replace", "retire", "deploy", "in", "downout", "init"):
         raise ValueError("unknown intent: %s" % intent)
     # 新增磁盘（init）针对的是「额外插进来的一块盘」，没有 OSD id，只认 host + 设备路径。
-    # 注意它与「一键换盘（replace）」不是一回事：replace 是坏盘 1:1 换新盘、沿用原编号。
+    # 注意它与「换盘」不是一回事：init 不删任何旧 OSD，是纯扩容；换盘先删旧编号再加新盘。
     if intent == "init":
         oid = None
         if not dev:
@@ -2845,12 +2729,14 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
     DOWN_NOTE = "先停服务再摘盘：避免故障盘抖动产生 slow ops；已 down 时该命令幂等"
 
     if intent in ("replace", "retire", "deploy"):
-        # 换盘拆成两个互不依赖的动作（现场物理换盘可能隔几小时甚至几天）：
-        #   ① retire：确认故障盘已 down → 安全移除并保留编号（destroyed）
+        # 换盘（1.1.24 起不保留 OSD 编号）拆成两个互不依赖的动作：
+        #   ① retire：确认故障盘已 down → mon 命令式 purge 彻底删除旧编号
         #   --- 人工：按盘位 / SN 换上同规格新盘 ---
-        #   ② deploy：新盘入群，复用原编号 → 回读复核 up/in
-        # 与「退役 remove」的区别：不放弃编号、不永久摘除身份。
-        # 与「新增磁盘 init」的区别：init 是容量扩容，会拿到一个新编号。
+        #   ② deploy：清签名 → 创建 OSD，由 mon 分配新编号 → 回读复核 up/in
+        # 不依赖 destroyed / osd_id_claims / OSDSpec 自动认领，也就不受
+        # cephadm 的 osd safe-to-destroy 卡死影响。
+        # 与「退役 remove」的区别：remove 是永久减容量，换盘只是换硬件。
+        # 与「新增磁盘 init」的区别：init 不删旧 OSD、纯扩容。
         # replace 仅保留给「高级向导」做完整流程预览 = ① + 人工 + ②。
         if intent in ("replace", "deploy"):
             if not dev:
@@ -2861,15 +2747,13 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
             _plan_retire(cfg, probe, oid, add)
         if intent == "replace":
             add("物理更换故障盘", None,
-                "现场操作：按盘位 / SN 换上同规格新盘；不要换盘位、不要改主机，否则编号无法沿用")
-        if intent == "retire":
-            add("复核原编号已释放（换盘前）", ["ceph", "osd", "dump", "--format=json"],
-                "只读复核：osds[] 里 osd.%d 的 state 必须含 destroyed；"
-                "这一步的结论决定能不能开始第 ② 步" % oid)
+                "现场操作：按盘位 / SN 换上同规格新盘，装回原盘位、原主机。"
+                "新盘会以一个新 OSD 编号加入，旧编号已在 ① 删除")
         if intent in ("replace", "deploy"):
             _plan_deploy(cfg, probe, oid, host, dev, add)
-            add("确认 osd.%d 用原编号重新上线" % oid, ["ceph", "osd", "dump", "--format=json"],
-                "osds[] 中应重新出现 osd.%d，且 up=true / in=true（编号必须与原来一致）" % oid)
+            add("确认新盘已被新 OSD 接管", ["ceph", "osd", "dump", "--format=json"],
+                "只读复核：新盘应被某个 up=true / in=true 的 OSD 占用；编号由 mon "
+                "分配，不要求等于 osd.%d" % oid)
             add("集群健康验证", ["ceph", "-s", "--format=json"],
                 "新 OSD 上线后数据开始回填，观察 PG 回到 active+clean")
     elif intent == "remove":
@@ -2914,7 +2798,7 @@ def build_plan(cfg, probe, intent, osd_id, host, dev):
         add("集群健康验证", ["ceph", "-s", "--format=json"], "观察 PG 回到 active+clean")
     elif intent == "init":
         # 新增磁盘 = 扩容：预检 -> 清元数据 -> 创建 OSD（新编号）-> 等上线。
-        # 不是「换盘」：换盘走 replace，要保住原编号。
+        # 不是「换盘」：init 保留所有旧 OSD，只是多插一块盘扩容。
         if orch:
             add("预检设备是否可加入集群", ["ceph", "orch", "device", "ls", "--format=json"],
                 "确认 %s 的 available 为 true，且没有被其它 OSD 占用" % dev)
@@ -2950,12 +2834,12 @@ def plan_strings(plan):
 TOLERANT_STEPS = ("停止 OSD 守护进程", "启动 OSD 守护进程", "停止故障 OSD 守护进程",
                   "预检设备是否可加入集群", "预检设备是否未被占用",
                   "轮询移除进度", "确认新盘已被编排器识别",
-                  "确认 OSD 服务规约（编号复用的前提）",
-                  "检查 OSD 是否可安全销毁（purge 前提）",
-                  "确认原编号已释放为 destroyed（编号复用前提）",
-                  "复核原编号已释放（换盘前）",
-                  "确认 CRUSH 权重（原值非 1.0 时手工恢复）",
-                  "等待编排器用原编号重建 OSD",
+                  # ① 清退：队列里没有任务时 orch osd rm stop 会报错，属正常；
+                  # ② 入群：已有 managed OSDSpec 时 daemon add 会提示已被管理，属正常。
+                  "清掉旧版的僵尸移除任务", "确认旧 daemon 已退出",
+                  "复核旧编号已从 osdmap 删除",
+                  "创建并部署新 OSD（分配新编号）", "等待新 OSD 上线",
+                  "确认新盘已被新 OSD 接管", "确认新 OSD 的 CRUSH 权重",
                   # 建池：预检 / autoscale / 复核失败都不应中断（池可能已经建好）
                   "检查池名是否已被占用", "启用 PG 自动扩缩", "复核池配置")
 
@@ -3545,24 +3429,29 @@ class Handler(BaseHTTPRequestHandler):
             if dev in used:
                 return self._json({"error": "%s 已被现有 OSD 使用，拒绝初始化；请确认新盘设备路径" % dev}, 400)
         if intent in ("replace", "deploy") and allow:
-            # 同一把锁：换盘同样要 zap 新盘，绝不能把别的 OSD 正在用的盘当「新盘」抹掉。
+            # 只拦「目标盘正被一个 up/in 的健康 OSD 使用」。旧版残留编号 /
+            # 盘上的旧 LVM 标签会让它看起来属于某个 down 的 OSD，那正是
+            # ② 要 zap 掉的东西，不能拦。
             dev_by_id = osd_used_devices(self.cfg)[0]
-            owners = [i for i, d in dev_by_id.items() if d and d == dev]
-            if owners and oid not in owners:
-                others = "、".join("osd.%d" % i for i in owners)
-                return self._json({"error": "%s 当前被 %s 使用，不能当作新盘重建；"
-                                            "请核对设备路径" % (dev, others)}, 400)
+            for i, d in dev_by_id.items():
+                if not d or d != dev or i == oid:
+                    continue
+                st_i = osd_upin_state(self.cfg, i)
+                if st_i and st_i.get("up") and st_i.get("in"):
+                    return self._json({"error":
+                        "%s 当前被 up/in 的 osd.%d 使用，zap 会抹掉正在服务的数据盘；"
+                        "请核对设备路径" % (dev, i)}, 400)
         if intent == "retire" and allow:
             # ① 清退的硬门禁：OSD 必须确实已经 down。把还在 up 的盘清退掉，
             # 等于自己制造一次故障；这一步不能只靠前端提示。
             rp = retire_prereq(self.cfg, oid, self.probe.caps.get("orch", False))
-            if rp.get("alreadyDestroyed"):
+            if rp.get("alreadyRetired"):
                 audit("OSD_RETIRE", "osd.%d" % oid, "-", "SKIP",
-                      "该编号已是 destroyed，清退已完成，直接执行第 ② 步",
+                      "旧编号已从 osdmap 删除，清退已完成，直接执行第 ② 步",
                       self._client(), self._user())
                 return self._json({"ok": True, "commands": [],
-                                   "results": ["skip: osd.%d 已是 destroyed，无需重复清退；"
-                                               "现场换盘后执行第 ② 步「新盘入群」" % oid],
+                                   "results": ["skip: osd.%d 已从 osdmap 删除，无需重复清退；"
+                                               "现场换盘后执行第 ② 步「新盘入群」（新编号）" % oid],
                                    "target": "osd.%d" % oid,
                                    "verify": check_retire(self.cfg, oid,
                                                           self.probe.caps.get("orch", False)),
@@ -3575,11 +3464,11 @@ class Handler(BaseHTTPRequestHandler):
                 audit("OSD_RETIRE", "osd.%d" % oid, "-", "BLOCKED",
                       "故障 OSD 未确认 down，拒绝清退：" + "；".join(rp["blockers"]),
                       self._client(), self._user())
-                hint = ("\n顺序：让 osd.%d 真正 down（cephadm 环境建议 "
-                        "ceph osd down %d && ceph osd out %d，或故障盘自然 down），"
-                        "确认 ceph osd tree 里 down 后立刻点「① 换盘前·清退」。"
-                        "不要用「一键踢盘」长期停 daemon 来制造 down：cephadm 的 "
-                        "purge 需要 OSD 上报 stats 才能通过 osd safe-to-destroy。"
+                hint = ("\n顺序：让 osd.%d 真正 down（ceph osd down %d && "
+                        "ceph osd out %d，或故障盘自然 down），确认 ceph osd tree "
+                        "里 down 后再点「① 换盘前·清退」。本步用 mon 命令式 purge，"
+                        "不经过 cephadm 的 --replace 队列，不检查 osd "
+                        "safe-to-destroy，不会卡在 waiting for purge。"
                         % (oid, oid, oid))
                 if rp.get("warnings"):
                     hint += "\n风险提示：\n" + "\n".join("· " + w for w in rp["warnings"])
@@ -3589,75 +3478,53 @@ class Handler(BaseHTTPRequestHandler):
                     "prereq": rp}, 409)
         if intent == "replace" and allow and stage == "auto" and manual is not None:
             return self._json({"error":
-                "一键换盘必须按 pre / post 两阶段执行：先提交 --replace 并等原编号"
-                "释放为 destroyed，现场换好盘后再继续 zap。一次请求跳过人工步骤"
-                "必然把新盘变成新增 OSD，已拒绝"}, 409)
+                "完整换盘预览必须按 pre / post 两阶段执行：先清退旧 OSD（删除编号），"
+                "现场换好盘后再把新盘加入集群。一次请求跳过人工换盘步骤会被拒绝；"
+                "日常操作请直接用「① 清退」「② 入群」两个按钮"}, 409)
         if intent in ("replace", "deploy") and allow and (stage == "post" or intent == "deploy"):
-            # cephadm 的 --replace 会在新盘出现后由 OSDSpec 自动重建：这时再 zap
-            # 会把刚建好的 OSD 抹掉。但「原编号 up/in」不足以证明重建完成——
-            # 旧 OSD 还在移除队列里时它也是 up/in。必须确认新盘已挂到原编号。
-            st0 = osd_upin_state(self.cfg, oid)
-            if (st0 and st0.get("up") and st0.get("in")
-                    and device_owner(self.cfg, dev) == oid):
-                verify = check_replace(self.cfg, oid, dev)
-                _STATE_CACHE["data"] = None
-                _STATE_CACHE["ts"] = 0
-                audit("OSD_REPLACE", "osd.%d" % oid, "-", "SKIP",
-                      "OSDSpec 已用原编号在新盘上自动重建并上线，跳过重复 zap",
-                      self._client(), self._user())
-                return self._json({"ok": True, "commands": [],
-                                   "results": ["skip: OSDSpec 已用原编号 osd.%d 在新盘上自动重建，"
-                                               "无需再 zap" % oid],
-                                   "target": "osd.%d" % oid, "verify": verify,
-                                   "dry_run": False, "version": self.probe.version,
-                                   "orchestrator": self.probe.orchestrator,
-                                   "stage": stage, "pause": False, "pending_commands": [],
-                                   "manual_step": None})
-            elif st0 and st0.get("up") and st0.get("in"):
-                # 旧 OSD 可能还在 --replace 的移除队列里（此时它也是 up/in），
-                # 也可能已经在新盘上重建完成但设备信息还没采到。两种情况都
-                # 不能盲目 zap：宁可停下来让人确认，也不能抹掉正在用的盘。
-                return self._json({"error":
-                    "osd.%d 仍为 up/in，且无法确认新盘 %s 是否已挂到该编号；"
-                    "为避免误 zap 正在使用的盘，post 阶段已暂停。"
-                    "请执行 ceph orch osd rm status 与 ceph osd metadata %d 确认后重试"
-                    % (oid, dev or "<新盘>", oid)}, 409)
-            # 编号复用的硬门禁：--replace 只是「预约」，真正能被 OSDSpec 认领的
-            # 前提是 osd.<id> 已被打成 destroyed。现场实测：移除队列卡在
-            # "done, waiting for purge" 时原编号仍是 exists，此时 zap 新盘，
-            # cephadm 就会分配一个新编号 —— 这正是用户看到的「新增 OSD」。
-            # 只对 cephadm 生效：包安装部署靠 ceph-volume --osd-id 显式复用编号，
-            # 不需要 destroyed 标记，也没有 OSDSpec 这个概念。
-            if self.probe.caps.get("orch"):
-                pre_ok = replace_prereq(self.cfg, oid, dev)
-                if not pre_ok["ok"]:
-                    audit("OSD_REPLACE", "osd.%d" % oid, "-", "BLOCKED",
-                          "编号复用前提不满足，拒绝 zap：" + "；".join(pre_ok["blockers"]),
+            # ② 入群前只判断「这块新盘是不是已经有一个 up/in 的 OSD 接管了」，
+            # 是就跳过 zap，避免把刚部署好的盘抹掉。编号不参与判断：
+            # 旧编号可能恰好被 mon 重新分配，也可能换成别的号。
+            owner = device_owner(self.cfg, dev)
+            if owner is not None:
+                st_owner = osd_upin_state(self.cfg, owner)
+                if st_owner and st_owner.get("up") and st_owner.get("in"):
+                    verify = check_replace(self.cfg, oid, dev)
+                    _STATE_CACHE["data"] = None
+                    _STATE_CACHE["ts"] = 0
+                    audit("OSD_REPLACE", "osd.%d" % oid, dev or "-", "SKIP",
+                          "新盘已有 osd.%d 接管并 up/in，跳过重复 zap" % owner,
                           self._client(), self._user())
-                    return self._json({"error":
-                        "已阻止 zap：编号复用前提不满足，继续操作会把新盘变成一块新增 OSD。\n"
-                        + "\n".join("· " + b for b in pre_ok["blockers"])
-                        + "\n排查：ceph orch osd rm status 看队列状态；若停在 "
-                          "done, waiting for purge，执行 ceph osd safe-to-destroy %d "
-                          "——PG 不是 active+clean 时它永远不通过，等不会自愈。"
-                          "先让 PG 恢复；或确认无不可恢复数据后手工 "
-                          "ceph osd destroy %d --force 保留编号，并 "
-                          "ceph orch osd rm stop %d 清掉队列。若队列里有别的 OSD "
-                          "卡在 draining，先 ceph orch osd rm stop <id>（只取消移除任务，"
-                          "不动数据）。最后用 ceph osd dump 确认 state 含 destroyed，"
-                          "再执行第 ② 步「换盘后·新盘入群」。"
-                          % (oid, oid, oid),
-                        "prereq": pre_ok}, 409)
+                    return self._json({"ok": True, "commands": [],
+                                       "results": ["skip: %s 已被 osd.%d 接管并 up/in，"
+                                                   "无需再 zap（新编号，旧编号已在 ① 删除）"
+                                                   % (dev, owner)],
+                                       "target": "osd.%d" % oid, "verify": verify,
+                                       "dry_run": False, "version": self.probe.version,
+                                       "orchestrator": self.probe.orchestrator,
+                                       "stage": stage, "pause": False,
+                                       "pending_commands": [], "manual_step": None})
+                # 盘上的旧签名 / 残留编号仍指向一个非 up/in 的 OSD：继续 zap，
+                # 不暂停 —— 那正是本步要清掉的东西。
+            # ② 的硬门禁只剩「别抹掉别人的盘」；不再要求 destroyed /
+            # osd_id_claims / managed OSDSpec，新编号由 mon 分配。
+            pre_ok = replace_prereq(self.cfg, oid, dev)
+            if not pre_ok["ok"]:
+                audit("OSD_REPLACE", "osd.%d" % oid, dev or "-", "BLOCKED",
+                      "新盘归属校验失败，拒绝 zap：" + "；".join(pre_ok["blockers"]),
+                      self._client(), self._user())
+                return self._json({"error":
+                    "已阻止 zap：目标盘归属有问题，继续会抹掉别的 OSD 正在用的盘。\n"
+                    + "\n".join("· " + b for b in pre_ok["blockers"])
+                    + "\n核对：ceph orch device ls / ceph osd metadata <id> / "
+                      "lsblk -o NAME,FSTYPE,LABEL，确认设备路径确实是换上的新盘。"
+                      "本方案不保留编号，不需要等 destroyed 或 osd_id_claims。",
+                    "prereq": pre_ok}, 409)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
         prereq = None
-        if intent == "replace" and not dry and self.probe.caps.get("orch"):
-            if stage == "pre":
-                # --replace 是异步的：给编排器一点时间把原编号打成 destroyed。
-                # 这里不判死（可能只是慢），post 阶段 zap 之前会重新核验。
-                for _ in range(REPLACE_DESTROY_TRIES):
-                    if osd_destroyed(self.cfg, oid):
-                        break
-                    time.sleep(REPLACE_DESTROY_INTERVAL)
+        if intent == "replace" and not dry and stage == "pre":
+            # 完整预览的 pre 阶段：附上 ② 的只读预检，暂停界面好提前显示。
+            # 不再轮询 destroyed —— 编号不保留，purge 是 mon 侧同步操作。
             prereq = replace_prereq(self.cfg, oid, dev)
         verify = None
         if intent == "downout" and not dry:
@@ -3667,14 +3534,14 @@ class Handler(BaseHTTPRequestHandler):
             if verify["message"]:
                 results.append("verify: " + verify["message"])
         if intent == "retire" and not dry:
-            # ① 阶段的结论是「编号安全释放了吗」，不是「OSD 上线了吗」。
+            # ① 阶段的结论是「旧编号是不是真的删掉了」，不是「OSD 上线了没」。
             # 拿 check_replace 复核清退会必然报失败，那是拿错了尺子。
             verify = check_retire(self.cfg, oid, self.probe.caps.get("orch", False))
             if verify["message"]:
                 results.append("verify: " + verify["message"])
         if intent in ("replace", "deploy") and not dry and stage != "pre":
-            # ② 阶段的核心承诺是「编号不变 + 真的回来了」，只能靠回读 osd dump 证明。
-            # stage=pre 时 OSD 刚被移除、新盘还没换，此刻复核必然失败，不能当成结论。
+            # ② 只看「新盘有没有被一个 up/in 的 OSD 接管」，编号不参与判定。
+            # stage=pre 时新盘还没换，此刻复核必然失败，不能当成结论。
             verify = check_replace(self.cfg, oid, dev)
             if verify["message"]:
                 results.append("verify: " + verify["message"])
@@ -3693,7 +3560,7 @@ class Handler(BaseHTTPRequestHandler):
               self._client(), self._user())
         manual_note = (manual[2] or "") if manual else ""
         if manual and prereq and not prereq["ok"]:
-            manual_note += ("｜编号复用前提未满足，现场换盘后点「继续执行」会被拒绝："
+            manual_note += ("｜新盘归属校验未满足，现场换盘后点「继续执行」会被拒绝："
                             + "；".join(prereq["blockers"]))
         return self._json({"ok": True, "commands": commands, "results": results,
                            "target": target, "verify": verify, "prereq": prereq,
@@ -3782,8 +3649,8 @@ class Handler(BaseHTTPRequestHandler):
             if ".." in dev or (dev and not DEV_RE.match(dev)):
                 raise ValueError("invalid device path")
             st = osd_upin_state(self.cfg, oid)
-            # ① 清退阶段复核的是「编号是否已释放」，② 入群阶段复核的是
-            # 「原编号有没有真的回来」，两把尺子不能混用。
+            # ① 清退阶段复核的是「旧编号是否已删除」，② 入群阶段复核的是
+            # 「新盘有没有被一个 up/in 的 OSD 接管」，两把尺子不能混用。
             phase = str(body.get("phase", "deploy"))
             verify = (check_retire(self.cfg, oid, self.probe.caps.get("orch", False))
                       if phase == "retire" else check_replace(self.cfg, oid, dev))
@@ -3822,12 +3689,12 @@ class Handler(BaseHTTPRequestHandler):
                     "orchestrator": self.probe.orchestrator,
                     "allow_write": self._write_allowed() and self._can_write(),
                     "read_only": self.cfg.read_only}
-            # 只读预检：让弹窗在动手之前就把「盘确实 down 了吗」「编号释放了吗」
-            # 显示出来。执行时后端会重新核验一遍，这里只是给人看的。
+            # 只读预检：让弹窗在动手之前就显示「盘确实 down 了吗」
+            # 「新盘是不是被别的 OSD 占着」。执行时后端会重新核验一遍。
             if intent == "retire":
                 resp["precheck"] = retire_prereq(
                     self.cfg, oid, self.probe.caps.get("orch", False))
-            elif intent == "deploy" and self.probe.caps.get("orch"):
+            elif intent in ("deploy", "replace"):
                 resp["precheck"] = replace_prereq(self.cfg, oid, dev)
             return self._json(resp)
         if path in ("/api/quick/kick", "/api/quick/replace", "/api/quick/retire",

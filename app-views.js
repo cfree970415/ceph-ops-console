@@ -58,7 +58,7 @@ function alertAdvice(a){
    'ceph health detail',
    'ceph -s',
    'ceph orch ps --daemon-type osd   # cephadm；传统部署用 systemctl status ceph-osd@'+id];
-  note='osd tree 里 up=0 才是真 down；只是进程掉了就先拉起服务。\n# 判定硬件故障、评估过数据迁移后，才到「OSD / 磁盘」页走换盘流程（① 清退 → 现场换盘 → ② 入群，编号不变）。';
+  note='osd tree 里 up=0 才是真 down；只是进程掉了就先拉起服务。\n# 判定硬件故障、评估过数据迁移后，才到「OSD / 磁盘」页走换盘流程（① 清退删除旧编号 → 现场换盘 → ② 入群分配新编号）。';
  }else if(/(^PG_|PG_DEGRADED|PG_AVAILABILITY|OBJECT_UNFOUND|PG_DAMAGED|TOO_FEW_PGS|TOO_MANY_PGS|OSD_SCRUB_ERRORS)/.test(c)||pgLike){
   head='# 副本不足 / PG 未 active+clean：先定位原因';
   cmds=['ceph health detail','ceph pg stat','ceph osd tree','ceph -s'];
@@ -148,8 +148,8 @@ function osdRow(o){var s=osdStatus(o),hasCap=o.size>0,p=pct(o.used,o.size),pc=p>
  '<td><div class="btn-row" style="flex-wrap:nowrap;gap:5px"><button class="btn sm" data-act="osd-detail" data-id="'+o.id+'">详情</button>'+
  (o.inn?'<button class="btn sm" data-act="osd-out" data-id="'+o.id+'">OUT</button>':'<button class="btn sm" data-act="osd-in" data-id="'+o.id+'">IN</button>')+
  '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',12)+'一键踢盘</button>'+
- '<button class="qbtn" data-act="q-open" data-kind="retire" title="① 换盘前：确认故障盘已 down，安全清退并保留 OSD 编号" data-id="'+o.id+'">'+ic('wrench',12)+'① 清退</button>'+
- '<button class="qbtn" data-act="q-open" data-kind="deploy" title="② 换盘后：把新盘接回集群，复用原 OSD 编号" data-id="'+o.id+'">'+ic('zap',12)+'② 入群</button></div></td></tr>';}
+ '<button class="qbtn" data-act="q-open" data-kind="retire" title="① 换盘前：确认故障盘已 down，purge 删除旧 OSD 编号（不保留）" data-id="'+o.id+'">'+ic('wrench',12)+'① 清退</button>'+
+ '<button class="qbtn" data-act="q-open" data-kind="deploy" title="② 换盘后：把新盘接回集群，由 mon 分配新 OSD 编号" data-id="'+o.id+'">'+ic('zap',12)+'② 入群</button></div></td></tr>';}
 function osdTable(){var f=state.filters,list=state.osds.filter(function(o){
   if(f.osdStatus==='down'&&o.up)return false;if(f.osdStatus==='out'&&o.inn)return false;if(f.osdStatus==='nearfull'&&pct(o.used,o.size)<85)return false;
   if(f.osdStatus==='smart'&&o.smart!=='FAIL'&&o.smart!=='WARN')return false;if(f.osdQ&&(('osd.'+o.id)+o.host+o.dev+o.type+o.serial+hostIp(o.host)).toLowerCase().indexOf(f.osdQ.toLowerCase())<0)return false;return true;});
@@ -164,16 +164,16 @@ function vOsds(){var f=state.filters,down=state.osds.filter(function(o){return !
   '<div><div class="tiny">检测到待处置磁盘</div><div style="font-size:14px;font-weight:650" class="mono">osd.'+fO.id+' · '+esc(fO.host||'—')+' · '+esc(fO.dev||'—')+'</div>'+
   '<div class="tiny">'+(fO.smart==='FAIL'?'SMART FAIL':fO.smart==='WARN'?'SMART WARN':'磁盘状态异常（'+(fO.up?'up':'down')+' / '+(fO.inn?'in':'out')+'）')+' · SN '+esc(fO.serial||'未采集')+'</div></div><div class="sp"></div>'+
   '<button class="qbtn kick lg" data-act="q-open" data-kind="kick" data-id="'+fO.id+'">'+ic('trash',14)+'一键踢盘</button>'+
-  '<button class="qbtn lg" data-act="q-open" data-kind="retire" title="① 换盘前：确认 down → 安全清退 → 保留编号" data-id="'+fO.id+'">'+ic('wrench',14)+'① 换盘前·清退</button>'+
-  '<button class="qbtn lg" data-act="q-open" data-kind="deploy" title="② 换盘后：现场换好盘再点，新盘复用原编号" data-id="'+fO.id+'">'+ic('zap',14)+'② 换盘后·入群</button>'+
+  '<button class="qbtn lg" data-act="q-open" data-kind="retire" title="① 换盘前：确认 down → purge 删除旧编号" data-id="'+fO.id+'">'+ic('wrench',14)+'① 换盘前·清退</button>'+
+  '<button class="qbtn lg" data-act="q-open" data-kind="deploy" title="② 换盘后：现场换好盘再点，新盘分配新编号" data-id="'+fO.id+'">'+ic('zap',14)+'② 换盘后·入群</button>'+
   '<button class="btn" data-act="wizard" data-id="'+fO.id+'" data-intent="replace">'+ic('wrench',14)+' 高级向导</button></div></div>':'';
- return pageH('OSD / 磁盘管理','换盘分两步：① 清退（确认 down → 保留编号）→ 现场换盘 → ② 新盘入群（复用原编号）；另有踢盘 / 新增磁盘')+quickBar+filter+
+ return pageH('OSD / 磁盘管理','换盘分两步：① 清退（确认 down → purge 删除旧编号）→ 现场换盘 → ② 新盘入群（mon 分配新编号）；另有踢盘 / 新增磁盘')+quickBar+filter+
   card('OSD 列表','<div id="osd-table-wrap">'+osdTable()+'</div>','<span class="tag info">共 '+state.osds.length+' 台</span>',false)+
   '<div style="margin-top:14px">'+card('版本命令适配','<div class="grid g2" style="gap:0 34px">'+
    '<div class="stat-line"><span>编排器</span><b class="mono tp">'+esc(p.orchestrator)+'</b></div>'+
    '<div class="stat-line"><span>osd purge</span><b class="mono '+(p.caps.purge?'t':'td')+'">'+(p.caps.purge?'可用':'不可用 → 三步式移除')+'</b></div>'+
    '<div class="stat-line"><span>ok-to-stop</span><b class="mono '+(p.caps.ok_to_stop?'t':'tw')+'">'+(p.caps.ok_to_stop?'可用':'降级为 PG 冗余检查')+'</b></div>'+
-   '<div class="stat-line"><span>orch osd rm --replace</span><b class="mono '+(p.caps.orch?'t':'td')+'">'+(p.caps.orch?'可用':'不可用 → ceph-volume')+'</b></div></div>')+'</div>';}
+   '<div class="stat-line"><span>orch daemon add osd</span><b class="mono '+(p.caps.orch?'t':'td')+'">'+(p.caps.orch?'可用':'不可用 → ceph-volume')+'</b></div></div>')+'</div>';}
 
 /* ---- pools / hosts / audit ---- */
 function sizeRange(key,onlyType){

@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.23-20261111';
+var UI_BUILD='1.1.24-20261111';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -45,11 +45,11 @@ var CEPH_VERSIONS=[
  {v:'12.x',name:'Luminous',osd:'ceph-disk',purge:false,orch:false,replace:'ceph-disk zap / prepare / activate',note:'mgr dashboard 需手动启用；REST 通道只读'},
  {v:'13.x',name:'Mimic',osd:'ceph-volume lvm',purge:false,orch:false,replace:'ceph-volume lvm create --osd-id',note:'支持 ceph device ls / osd perf'},
  {v:'14.x',name:'Nautilus',osd:'ceph-volume lvm',purge:true,orch:false,replace:'osd purge + ceph-volume lvm create',note:'支持 osd purge / ok-to-stop / safe-to-destroy'},
- {v:'15.x',name:'Octopus',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph orch osd rm <id> --replace',note:'首个 cephadm 正式版，支持 orch device zap'},
- {v:'16.x',name:'Pacific',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph orch osd rm <id> --replace',note:'Dashboard REST 结构变化，已做字段归一化'},
- {v:'17.x',name:'Quincy',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph orch osd rm <id> --replace',note:'全功能支持'},
- {v:'18.x',name:'Reef',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph orch osd rm <id> --replace',note:'全功能支持'},
- {v:'19.x',name:'Squid',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph orch osd rm <id> --replace',note:'全功能支持，已适配新字段'}];
+ {v:'15.x',name:'Octopus',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph osd purge <id>',note:'首个 cephadm 正式版，支持 orch device zap'},
+ {v:'16.x',name:'Pacific',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph osd purge <id>',note:'Dashboard REST 结构变化，已做字段归一化'},
+ {v:'17.x',name:'Quincy',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph osd purge <id>',note:'全功能支持'},
+ {v:'18.x',name:'Reef',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph osd purge <id>',note:'全功能支持'},
+ {v:'19.x',name:'Squid',osd:'cephadm + ceph-volume',purge:true,orch:true,replace:'ceph osd purge <id>',note:'全功能支持，已适配新字段'}];
 var DISTROS=[
  ['RHEL / CentOS 7','Python 3.6（EPEL / SCL）','systemd 219','firewalld','需装 python3；后端按 3.6 语法约束'],
  ['RHEL / Rocky / Alma 8-9','Python 3.6 / 3.9 / 3.11','systemd','firewalld','platform-python 亦可'],

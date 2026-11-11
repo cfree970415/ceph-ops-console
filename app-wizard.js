@@ -21,8 +21,8 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
  openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host||'—')+' · '+esc(o.dev||'—'))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
-  '<button class="qbtn" data-act="q-open" data-kind="retire" title="① 换盘前：确认 down → 清退并保留编号" data-id="'+o.id+'">'+ic('wrench',13)+'① 清退</button>'+
-  '<button class="qbtn" data-act="q-open" data-kind="deploy" title="② 换盘后：新盘接回集群，复用原编号" data-id="'+o.id+'">'+ic('zap',13)+'② 入群</button></div>','md');}
+  '<button class="qbtn" data-act="q-open" data-kind="retire" title="① 换盘前：确认 down → purge 删除旧编号" data-id="'+o.id+'">'+ic('wrench',13)+'① 清退</button>'+
+  '<button class="qbtn" data-act="q-open" data-kind="deploy" title="② 换盘后：新盘接回集群，分配新编号" data-id="'+o.id+'">'+ic('zap',13)+'② 入群</button></div>','md');}
 /* 告警确认 / 静音 / 重新激活：处置状态存后端，刷新页面、换浏览器都保持；
    离线（demo）模式没有后端可写，只改本地状态，不假装调用成功。 */
 /* 处置后如果详情弹窗还开着，就地刷新，否则按钮状态和列表对不上。 */
@@ -67,27 +67,26 @@ function alertDetail(id){var a=state.alerts.filter(function(x){return x.id===id;
 /* ---------- command plan / preflight ---------- */
 function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cephadm'&&p.caps.orch,rep=w.intent==='replace',s=[];
  if(rep&&orch){s=[
-  {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'先把 PG 迁走；不手工 stop daemon，停进程与移除统一交给 ceph orch osd rm --replace，手工停会让移除队列卡在 done, waiting for purge'},
-  {n:'移除 OSD 并保留编号',c:'ceph orch osd rm '+id+' --replace'+(((state.osds.filter(function(x){return x.id===id;})[0]||{}).up)?'':' --force'),d:'--replace 把 osd.'+id+' 标记为 destroyed 供新盘复用；盘已 down 时加 --force 跳过回填等待'},
-  {n:'确认 OSD 服务规约（编号复用的前提）',c:'ceph orch ls --service-type osd --format=json',d:'必须存在 managed 的 OSDSpec（unmanaged=true 不行）；否则 zap 后没有任何服务会来重建'},
-  {n:'轮询移除进度',c:'ceph orch osd rm status --format=json',d:'确认该 OSD 已离开移除队列（编号留作替换）'},
-  {n:'确认原编号已释放为 destroyed（编号复用前提）',c:'ceph osd dump --format=json',d:'osds[] 里 osd.'+id+' 的 state 必须含 destroyed；第 ② 步执行时平台会再次核验，未释放直接拒绝 zap。这是完整流程预览，日常请用两个独立按钮'},
+  {n:'清掉旧版僵尸移除任务',c:'ceph orch osd rm stop '+id,d:'只取消 --replace 排队任务，不动数据；队列里没有该任务会报错，属正常'},
+  {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'先把 PG 迁走；盘已彻底损坏时其他副本通常早已接管'},
+  {n:'永久删除故障 OSD（编号不保留）',c:'ceph osd purge '+id+' --yes-i-really-mean-it',d:'mon 命令式：一次删掉 CRUSH / auth / osdmap 记录。不走 cephadm --replace 队列、不检查 osd safe-to-destroy，因此单节点 / PG 不 clean 也不会卡在 waiting for purge。不可逆：旧编号不再保留'},
+  {n:'复核旧编号已从 osdmap 删除',c:'ceph osd dump --format=json',d:'osds[] 里不应再有 osd.'+id+'；成功后才能现场换盘'},
   {n:'物理更换故障盘',c:'# 现场操作：按盘位 / SN 换上同规格新盘，装回原盘位',d:'需人工确认，平台在此暂停等待'},
   {n:'确认新盘已被编排器识别',c:'ceph orch device ls '+w.host+' --format=json',d:'新盘应出现在设备列表（available 可能为 false，还带着旧签名）'},
-  {n:'清理新盘残留签名（触发按原编号自动重建）',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',d:'执行前平台会校验 destroyed / managed OSDSpec / 新盘归属，任一不满足就拒绝；zap 后由 OSDSpec 用 destroyed 的原编号 osd.'+id+' 重建，绝不能用 ceph orch daemon add osd（那会分配新编号）'},
-  {n:'等待编排器用原编号重建 OSD',c:'ceph orch ps --daemon-type osd --format=json',d:'只读查看；cephadm 拉起容器常需几十秒，daemon 必须是 osd.'+id+' 而不是新编号'},
-  {n:'确认 osd.'+id+' 重新上线',c:'ceph osd dump --format=json',d:'up=true / in=true，且编号必须仍是 osd.'+id},
+  {n:'清理新盘残留签名',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',d:'执行前平台只核验这块盘不属于 up/in 的健康 OSD；旧编号 / 残留编号的旧签名正是要清掉的'},
+  {n:'创建并部署新 OSD（新编号）',c:'ceph orch daemon add osd '+w.host+':'+w.dev,d:'命令式创建，不传 --osd-id，由 mon 分配一个新编号；若已有 managed OSDSpec 抢先部署，这条会提示已被管理，属正常'},
+  {n:'等待新 OSD 上线',c:'ceph orch ps --daemon-type osd --format=json',d:'只读查看；cephadm 拉起容器常需几十秒，编号不要求等于 osd.'+id},
+  {n:'确认新盘已被新 OSD 接管',c:'ceph osd dump --format=json',d:'新盘应被某个 up/in 的 OSD 占用；编号由 mon 分配，不要求与原编号一致'},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待所有 PG active+clean，HEALTH_OK'}];
- }else if(rep){var _ow=(state.osds.filter(function(x){return x.id===id;})[0]||{}).weight;
-  s=[
+ }else if(rep){s=[
   {n:'停止故障 OSD 守护进程',c:'systemctl stop ceph-osd@'+id,d:'盘已坏时可能直接失败；还在跑必须先停'},
   {n:'标记 OSD OUT',c:'ceph osd out '+id,d:'先把 PG 迁走，再动盘'},
-  {n:(p.caps.purge?'移除 OSD 但留作替换（purge）':'三步式移除 OSD'),c:p.caps.purge?'ceph osd purge '+id+' --yes-i-really-mean-it':'ceph osd crush remove osd.'+id+' && ceph auth del osd.'+id+' && ceph osd rm '+id,d:'编号 osd.'+id+' 由下一步 --osd-id 强制复用'},
+  {n:(p.caps.purge?'永久删除故障 OSD（编号不保留）':'三步式删除旧 OSD'),c:p.caps.purge?'ceph osd purge '+id+' --yes-i-really-mean-it':'ceph osd crush remove osd.'+id+' && ceph auth del osd.'+id+' && ceph osd rm '+id,d:'CRUSH / auth / osdmap 一起删，旧编号不再保留；新盘会拿到 mon 分配的新编号'},
   {n:'物理更换故障盘',c:'# 现场操作：按盘位 / SN 换上同规格新盘，装回原盘位',d:'需人工确认，平台在此暂停等待'},
   {n:'清理新盘元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',d:'只作用于新盘；12.x 无 ceph-volume 时回退 ceph-disk zap'},
-  {n:'用原编号重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+id,d:'不指定 --osd-id 就会分配一个新编号'},
-  {n:'恢复原 CRUSH 权重',c:'ceph osd crush reweight osd.'+id+' '+(_ow||1),d:'新建 OSD 默认权重 1.0，按原值恢复以免容量分布失衡'},
-  {n:'确认 osd.'+id+' 重新上线',c:'ceph osd dump --format=json',d:'up=true / in=true，且编号必须仍是 osd.'+id},
+  {n:'创建 OSD（新编号）',c:'ceph-volume lvm create --data '+w.dev,d:'不带 --osd-id，由 mon 分配一个新编号'},
+  {n:'确认新 OSD 的 CRUSH 权重',c:'ceph osd crush tree --format=json',d:'只读：新 OSD 默认权重 1.0；若原盘是自定义权重，按新编号手工执行 ceph osd crush reweight'},
+  {n:'确认新盘已被新 OSD 接管',c:'ceph osd dump --format=json',d:'新盘应被某个 up/in 的 OSD 占用；编号不要求等于 osd.'+id},
   {n:'集群健康验证',c:'ceph -s --format=json',d:'等待 all PGs active+clean'}];
  }else if(w.intent==='downout'){s=[
   {n:'强制标记 OSD DOWN',c:'ceph osd down '+id,d:'先停服务再摘盘，避免故障盘抖动产生 slow ops'},

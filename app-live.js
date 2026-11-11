@@ -227,9 +227,9 @@ renderTop=function(){
 /* ---------- one-click kick / replace one disk / add a disk / in ---------- */
 function quickTitle(k){
  return k==='kick'?'一键踢盘（DOWN + OUT）':k==='in'?'一键 IN 盘（恢复上线）':
-  k==='retire'?'① 换盘前·清退（确认 down → 保留编号）':
-  k==='deploy'?'② 换盘后·新盘入群（复用原编号）':
-  k==='replace'?'一键换盘（坏盘换新盘 · OSD 编号不变）':
+  k==='retire'?'① 换盘前·清退（确认 down → 删除旧编号）':
+  k==='deploy'?'② 换盘后·新盘入群（分配新编号）':
+  k==='replace'?'完整换盘预览（删旧编号 + 新盘入群）':
   k==='init'?'新增磁盘（初始化新盘 · 新编号）':'一键换盘';}
 function quickIntent(k){return k==='kick'?'downout':k==='in'?'in':k==='init'?'init':
   k==='retire'?'retire':k==='deploy'?'deploy':'replace';}
@@ -242,7 +242,7 @@ function quickPlan(k,w){
    .then(function(r){
     var steps=(r.steps||[]).map(function(s){
      return {n:s.name,c:s.command||('# '+s.name+'：'+s.note),note:s.note||'',manual:!!s.manual};});
-    /* 只读预检（清退前是否 down / 入群前编号是否 destroyed）挂在数组上，
+    /* 只读预检（清退前是否 down / 入群前新盘归属）挂在数组上，
        不改变步骤结构，原有调用方不用改。 */
     steps.precheck=r.precheck||null;
     return steps;});
@@ -254,22 +254,24 @@ function quickPlan(k,w){
   {n:'健康验证',c:'ceph -s --format=json',note:'观察 PG 回到 active+clean'}]);
  if(k==='retire')return Promise.resolve([
   {n:'确认故障 OSD 确实 down',c:'ceph osd dump --format=json',note:'后端执行前硬校验：仍为 up 直接拒绝清退'},
+  {n:'清掉旧版僵尸移除任务',c:'ceph orch osd rm stop '+w.osdId,note:'只取消 --replace 排队任务，不动数据'},
   {n:'标记 OSD OUT',c:'ceph osd out '+w.osdId,note:'把 PG 迁走'},
-  {n:'移除 OSD 并保留编号',c:'ceph orch osd rm '+w.osdId+' --replace --force',note:'--replace 保留编号，等 destroyed'},
-  {n:'复核原编号已释放',c:'ceph osd dump --format=json',note:'state 必须含 destroyed，之后才可现场换盘'}]);
+  {n:'永久删除故障 OSD（编号不保留）',c:'ceph osd purge '+w.osdId+' --yes-i-really-mean-it',note:'mon 命令式：删 CRUSH / auth / osdmap，不走 cephadm 队列，不查 safe-to-destroy'},
+  {n:'复核旧编号已删除',c:'ceph osd dump --format=json',note:'osds[] 里不应再有 osd.'+w.osdId+'，之后才可现场换盘'}]);
  if(k==='deploy')return Promise.resolve([
   {n:'确认新盘已被识别',c:'ceph orch device ls '+w.host+' --format=json',note:'新盘要出现在原主机上'},
-  {n:'校验编号复用前提',c:'# destroyed + managed OSDSpec + 新盘无主',note:'任一不满足后端拒绝 zap'},
-  {n:'清理新盘残留签名',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',note:'触发 OSDSpec 用原编号重建'},
-  {n:'确认 osd.'+w.osdId+' 重新上线',c:'ceph osd dump --format=json',note:'up/in 且编号不变'},
+  {n:'校验新盘归属',c:'# 只拦正被 up/in 的健康 OSD 使用的盘',note:'旧签名 / 残留编号不阻断'},
+  {n:'清理新盘残留签名',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',note:'抹掉旧 LVM / 分区表签名'},
+  {n:'创建并部署新 OSD',c:'ceph orch daemon add osd '+w.host+':'+w.dev,note:'命令式创建，mon 分配新编号'},
+  {n:'确认新 OSD 上线',c:'ceph osd dump --format=json',note:'新盘被某个 up/in 的 OSD 接管即可，编号不要求相同'},
   {n:'集群健康验证',c:'ceph -s --format=json',note:'等 PG active+clean'}]);
  if(k==='replace')return Promise.resolve([
-  {n:'停止故障 OSD 守护进程',c:'# 先停服务：否则心跳会把 down 改回 up',note:'盘已坏时可能直接失败',manual:true},
-  {n:'标记 OSD OUT',c:'ceph osd out '+w.osdId,note:'把数据迁走'},
-  {n:'物理更换故障盘',c:'# 现场按盘位 / SN 换上同规格新盘',note:'不要换盘位',manual:true},
+  {n:'确认故障 OSD 确实 down',c:'# 后端硬校验：仍为 up 拒绝',note:'先让盘真下线',manual:true},
+  {n:'清退旧 OSD（删除编号）',c:'ceph osd purge '+w.osdId+' --yes-i-really-mean-it',note:'不可逆：CRUSH / auth / osdmap 一起删'},
+  {n:'物理更换故障盘',c:'# 现场按盘位 / SN 换上同规格新盘',note:'装回原盘位',manual:true},
   {n:'清理新盘元数据',c:'ceph-volume lvm zap '+w.dev+' --destroy',note:'只作用于新盘'},
-  {n:'用原编号重建 OSD',c:'ceph-volume lvm create --data '+w.dev+' --osd-id '+w.osdId,note:'强制复用原编号'},
-  {n:'复核',c:'ceph osd dump --format=json',note:'确认 osd.'+w.osdId+' up/in'}]);
+  {n:'创建 OSD（新编号）',c:'ceph-volume lvm create --data '+w.dev,note:'不带 --osd-id，由 mon 分配新编号'},
+  {n:'复核',c:'ceph osd dump --format=json',note:'确认新盘已被某个 up/in 的 OSD 接管'}]);
  return Promise.resolve(wizardPlan({osdId:w.osdId,host:w.host,dev:w.dev,intent:quickIntent(k)}));
 }
 /* 设备列表：新增磁盘只列真正空闲的盘；换盘还要允许「带着旧 LVM 签名的新盘」
@@ -283,7 +285,14 @@ function pickDevices(q,list,host){
   seen[d.dev]=1;
   /* 任何别的 OSD 正在用的盘都不列——zap 是不可逆的，不能给误选的机会。
      注意 osd.0 的 id 是 0（falsy），必须显式判断 undefined，不能只写 truthy。 */
-  if(usedBy[d.dev]!==undefined&&usedBy[d.dev]!==q.osdId)return;
+  /* 换盘时，旧编号 / 残留编号指向的那块盘正是要换掉的：允许列出（标「需先清理」）。
+     只有「正被 up/in 的健康 OSD 使用」的盘、以及新增磁盘入口，才严格排除。 */
+  if(usedBy[d.dev]!==undefined&&usedBy[d.dev]!==q.osdId){
+   var ownerUp=false;
+   (state.osds||[]).forEach(function(x){if(x&&x.dev===d.dev&&x.up&&x.inn)ownerUp=true;});
+   if(q.kind==='init'||ownerUp)return;
+   soft.push(d);return;
+  }
   /* 换盘时新盘通常出现在原盘位、也就是原设备路径上（/dev/nvme0n2 拔掉换新，
      路径还是它）。这种情况要排在最前，而不是被过滤掉。 */
   if((q.kind==='replace'||q.kind==='deploy')&&q.oldDev&&d.dev===q.oldDev){same.push(d);return;}
@@ -293,8 +302,8 @@ function pickDevices(q,list,host){
  return same.concat(ok,soft);
 }
 /* 换盘拆成两个互不依赖的按钮：
-   ① retire —— 此时新盘还没装，不需要选设备，只确认旧 OSD 确实 down 并安全清退；
-   ② deploy —— 现场换完盘之后才点，需要挑那块新盘，并复用第 ① 步保留的编号。 */
+   ① retire —— 此时新盘还没装，不需要选设备，确认旧 OSD 确实 down 后删除旧编号；
+   ② deploy —— 现场换完盘之后才点，挑那块新盘，由 mon 分配一个新编号入群。 */
 function quickOpenPhase(o,kind){
  if(!o||o.id==null){toast('请先选择一个要更换的 OSD','e');return;}
  state.quick={kind:kind,osdId:o.id,host:o.host||'',dev:o.dev||'',oldDev:o.dev||'',serial:o.serial||'',
@@ -318,7 +327,7 @@ function quickOpenPhase(o,kind){
   if(state.quick!==mine)return;
   var q=mine;q.phase='error';q.error=e.message||'命令预览失败';quickPaintModal();});
 }
-/* 换盘：目标是「某个坏掉的 OSD」，新盘是它的替代品，重建后编号必须还是原来那个 */
+/* 高级向导的完整换盘预览：删掉旧编号，现场换盘，再用新编号把新盘加回集群 */
 function quickOpenReplace(o){
  if(!o||o.id==null){toast('请先选择一个要更换的 OSD','e');return;}
  state.quick={kind:'replace',osdId:o.id,host:o.host||'',dev:'',oldDev:o.dev||'',serial:o.serial||'',
@@ -426,10 +435,10 @@ function quickPaintModal(){
   foot='<div class="sp"></div><button class="btn" data-act="q-close">关闭</button><button class="btn" data-act="q-retry">重试</button>';
  }else if(q.phase==='confirm'&&(q.kind==='init'||q.kind==='replace'||isPhase(q.kind))){
   /* 三个「动盘」入口共用一块表单，语义完全不同：
-     - retire：① 换盘前，确认故障盘已 down，安全清退并保留编号（不碰新盘）
-     - deploy：② 换盘后，把新盘接回集群，沿用第 ① 步保留的编号
+     - retire：① 换盘前，确认故障盘已 down，purge 彻底删除旧编号（不碰新盘）
+     - deploy：② 换盘后，把新盘接回集群，mon 分配一个新编号
      - replace：高级向导的完整流程预览（① + 人工换盘 + ②）
-     - init：额外加一块盘扩容，会分配一个新编号 */
+     - init：额外加一块盘扩容，也会分配一个新编号，但不删任何旧 OSD */
   var isRetire=q.kind==='retire',isDeploy=q.kind==='deploy';
   var isRep=q.kind==='replace'||isRetire||isDeploy;
   var pre=q.precheck||null,preBox='';
@@ -439,32 +448,32 @@ function quickPaintModal(){
     (pre.ok?'前提已满足':'前提未满足，执行会被拒绝')+'</b><br>'+
     esc(pre.message||'')+
     ((pre.blockers||[]).length?'<br>'+pre.blockers.map(function(x){return '· '+esc(x);}).join('<br>'):'')+
-    ((pre.warnings||[]).length?'<br><b>风险提示（不阻断，但很可能卡住）</b><br>'+
+    ((pre.warnings||[]).length?'<br><b>风险提示（不阻断，请务必看清）</b><br>'+
       pre.warnings.map(function(x){return '· '+esc(x);}).join('<br>'):'')+
-    '<br><span class="note">执行时后端会重新核验一次；不满足就拒绝，绝不会误 zap 正在用的盘。</span></div></div>';
+    '<br><span class="note">执行时后端会重新核验一次；只有「目标盘正被健康 OSD 使用」会拒绝，绝不会误 zap 正在用的盘。</span></div></div>';
   }
   var devOpts=q.devices.map(function(d){
    return '<option value="'+esc(d.dev)+'"'+(d.dev===q.dev?' selected':'')+'>'+esc(d.dev)+' · '+bytes(d.size||0)+
     ' · '+esc(d.host||'本机')+(isRep&&d.dev===q.oldDev?' · 原盘位':'')+
     (d.available?'':' · 需先清理')+(d.note?' · '+esc(d.note):'')+'</option>';}).join('');
-  var flowTitle=isRetire?'把 osd.'+q.osdId+' 安全清退出集群（保留编号，现场再换盘）':
-   isDeploy?'把换好的新盘接回集群，沿用原编号 osd.'+q.osdId:
+  var flowTitle=isRetire?'把 osd.'+q.osdId+' 从集群彻底删除（编号不保留，现场再换盘）':
+   isDeploy?'把换好的新盘接回集群，由 mon 分配一个新 OSD 编号':
    q.kind==='init'?'把新插入的磁盘初始化并加入集群（会新增一个 OSD 编号）':
-   '把 osd.'+q.osdId+' 的坏盘换成新盘，重建后仍是 osd.'+q.osdId;
+   '完整换盘预览：删掉 osd.'+q.osdId+' 的旧编号，再用新盘以新编号入群';
   var flowText=isRetire?
-    '① 流程：只读确认 osd.'+q.osdId+' <b>确实 down</b>（仍 up 会被后端拒绝）→ 检查 osd safe-to-destroy（purge 前提）→ OUT 把 PG 迁走 → <b>orch osd rm --replace 保留编号</b> → 等移除队列把编号打成 destroyed → 回读 osd dump 复核。此阶段<b>不 zap、不碰新盘</b>。':
+    '① 流程：只读确认 osd.'+q.osdId+' <b>确实 down</b>（仍 up 会被后端拒绝）→ 清掉旧版 <b>--replace</b> 僵尸队列 → OUT 把 PG 迁走 → <b>mon 命令式 ceph osd purge 删除旧编号</b>（CRUSH / auth / osdmap 一并删除）→ 回读 osd dump 复核。purge <b>不经过 cephadm 队列、不检查 osd safe-to-destroy</b>，不会再卡在 waiting for purge。此阶段<b>不 zap、不碰新盘</b>。':
    isDeploy?
-    '② 流程：校验 destroyed / managed OSDSpec / 新盘归属 → 清理新盘残留签名 → OSDSpec 用<b>原编号</b>自动重建 → 回读 up/in 复核 → 健康验证。绝不用 daemon add osd（那会分配新编号）。':
+    '② 流程：校验目标盘没被健康 OSD 占用 → 清理新盘残留签名 → <b>ceph orch daemon add osd 命令式创建</b>（不传 --osd-id，mon 分配新编号）→ 回读新盘归属 / up/in 复核 → 健康验证。不依赖 destroyed / OSDSpec / osd_id_claims。':
    q.kind==='init'?
     '流程：预检设备（是否空闲 / 可加入）→ 清理旧元数据（分区表 / LVM / 文件系统签名）→ 创建 OSD → 等待上线 → 健康验证。':
-    '流程：① 清退（确认 down → OUT → 保留编号）→ <b>现场换盘（人工）</b> → ② 新盘入群（清理签名 → 用原编号重建 → 回读 osd dump 复核）。';
+    '流程：① 清退（确认 down → OUT → purge 删除旧编号）→ <b>现场换盘（人工）</b> → ② 新盘入群（清理签名 → 以新编号创建 → 回读 osd dump 复核）。';
   var flowNote=isRetire?
-    '做完这一步再现场按 SN / 盘位换盘；换好回来点「② 换盘后·新盘入群」。两个按钮互不依赖，中间关掉页面、隔几天再操作都没关系。':
+    '⚠️ 这一步<b>不可逆</b>：旧编号消失、旧盘数据放弃。做完再现场按 SN / 盘位换盘，回来点「② 换盘后·新盘入群」。两个按钮互不依赖，中间关掉页面、隔几天再操作都没关系。':
    isDeploy?
-    '前提：第 ① 步清退已完成、原编号是 destroyed。没清退就点这里会被后端直接拒绝，不会把新盘变成一块新增 OSD。':
+    '前提：新盘已装回原盘位、① 的旧编号已删除。新编号由 mon 分配，<b>不保证等于 osd.'+q.osdId+'</b>；历史告警 / 监控里引用旧编号的地方会断。':
    q.kind==='init'?
     '不改动任何已有 OSD 的数据，也不做退役。':
-    '适用于「盘坏了、硬件层已经换成新盘」的 1:1 替换；要扩容加盘请用「新增磁盘」。';
+    '适用于「盘坏了、硬件层已经换成新盘」的硬件替换；要扩容加盘请用「新增磁盘」。';
   b='<div class="warnbox" style="margin-bottom:14px">'+ic(isRep?'disk':'zap')+
    '<div><b>'+flowTitle+'</b><br>'+flowText+
    '<br>'+flowNote+
@@ -475,9 +484,9 @@ function quickPaintModal(){
      '<div class="stat-line"><span>服务器</span><b class="mono">'+esc(q.host||'未采集')+'</b></div>'+
      '<div class="stat-line"><span>原序列号</span><b class="mono">'+esc(q.serial||'未采集')+'</b></div></div></div>':'')+
    (isRetire
-    ?'<div class="warnbox" style="margin-bottom:12px">'+ic('disk')+'<div>清退阶段<b>不需要选新盘</b>：故障盘还在机器上，新盘要等本步完成后现场更换。目标主机 <span class="mono">'+esc(q.host||'—')+'</span>，原设备 <span class="mono">'+esc(q.oldDev||'未采集')+'</span>。<br>做完这一步、确认原编号已是 <span class="mono">destroyed</span>，再按 SN / 盘位换盘并点第 ② 个按钮。</div></div>'
+    ?'<div class="warnbox" style="margin-bottom:12px">'+ic('disk')+'<div>清退阶段<b>不需要选新盘</b>：故障盘还在机器上，新盘要等本步完成后现场更换。目标主机 <span class="mono">'+esc(q.host||'—')+'</span>，原设备 <span class="mono">'+esc(q.oldDev||'未采集')+'</span>。<br>做完这一步、确认 <span class="mono">ceph osd tree</span> 里已没有 osd.'+q.osdId+'，再按 SN / 盘位换盘并点第 ② 个按钮。</div></div>'
     :'<div class="fgrp" style="margin-bottom:12px"><label class="fld">'+
-    (isRep?'新盘所在服务器（编号不变的前提：仍装回原服务器的原盘位）':'目标服务器')+'</label>'+
+    (isRep?'新盘所在服务器（装回原盘位，便于按 SN 核对）':'目标服务器')+'</label>'+
     '<input class="inp mono" data-bind="quick.host" value="'+esc(q.host)+'" placeholder="ceph-single" autocomplete="off"></div>'+
    '<div class="fgrp" style="margin-bottom:8px"><label class="fld">'+(isRep?'换上来的新盘设备':'新盘设备')+'</label>'+
    (q.devices.length
@@ -497,12 +506,12 @@ function quickPaintModal(){
   if(state.settings.confirm){
    b+=isRep
     ?'<div class="hr"></div><div class="fgrp"><label class="fld">输入 <span class="mono" style="color:var(--accent2)">osd.'+q.osdId+'</span> '+
-     (isRetire?'确认要清退的编号':isDeploy?'确认要复用的编号':'确认要重建的编号')+'</label>'+
+     (isRetire?'确认要删除的旧编号':isDeploy?'确认要替换的旧编号':'确认要替换的旧编号')+'</label>'+
      '<input class="inp" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="osd.'+q.osdId+'" autocomplete="off"></div>'+
      '<label class="chk"><input type="checkbox" data-bind="quick.confirmed"'+(q.confirmed?' checked':'')+'><span>'+
-     (isRetire?'我已确认 osd.'+q.osdId+' 确实 down（ceph osd tree 里 up=0），本步只清退、保留编号 osd.'+q.osdId:
-      isDeploy?'我已现场换好新盘 <span class="mono">'+esc(q.dev||'-')+'</span>，且编号保持 osd.'+q.osdId:
-      '我已确认 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 已换成新盘 <span class="mono">'+esc(q.dev||'-')+'</span>，且编号保持 osd.'+q.osdId)+
+     (isRetire?'我已确认 osd.'+q.osdId+' 确实 down（ceph osd tree 里 up=0），并接受<b>永久删除旧编号且不可恢复</b>':
+      isDeploy?'我已现场换好新盘 <span class="mono">'+esc(q.dev||'-')+'</span>，并接受新 OSD 使用 <b>mon 分配的新编号</b>':
+      '我已确认 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 已换成新盘 <span class="mono">'+esc(q.dev||'-')+'</span>，并接受新 OSD 使用新编号')+
      '</span></label>'
     :'<div class="hr"></div><div class="fgrp"><label class="fld">输入设备路径 <span class="mono" style="color:var(--accent2)">'+esc(q.dev||'/dev/sdb')+'</span> 确认</label>'+
      '<input class="inp mono" data-bind="quick.phrase" value="'+esc(q.phrase)+'" placeholder="'+esc(q.dev)+'" autocomplete="off"></div>'+
@@ -511,7 +520,7 @@ function quickPaintModal(){
   if(state.mode==='live'&&state.auth.role!=='admin')b+='<div class="dangerbox" style="margin-top:12px">'+ic('lock')+'<div>当前为只读账号，后端会拒绝写操作。请用管理员账号登录。</div></div>';
   foot='<button class="btn" data-act="q-close">取消</button><div class="sp"></div>'+
    '<button class="btn pri" data-act="q-run">'+ic(isRep?'wrench':'zap',14)+' '+
-   (isRetire?'立即执行清退（保留编号）':isDeploy?'立即执行新盘入群（复用 osd.'+q.osdId+'）':
+   (isRetire?'立即执行清退（删除旧编号）':isDeploy?'立即执行新盘入群（新编号）':
     '立即执行'+(isRep?'换盘':'初始化'))+'</button>';
  }else if(q.phase==='confirm'){
   var used=o.size?pct(o.used,o.size):0,isKick=q.kind==='kick',isIn=q.kind==='in';
@@ -546,27 +555,26 @@ function quickPaintModal(){
    '<div class="prog"><i id="q-prog" style="width:'+q.progress+'%"></i></div>'+
    '<div class="term" id="q-term" style="height:230px"></div>';
   if(q.phase==='paused'){
-   b+='<div class="warnbox" style="margin-top:12px">'+ic('wrench')+'<div><b>请现场更换磁盘</b>：按 SN <span class="mono">'+esc(q.serial||'-')+'</span> 与盘位把 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 换成新盘（新盘装回<b>原盘位</b>，编号才能沿用）。'+
-    '平台已暂停，后续 '+q.pending.length+' 条命令（清理新盘签名 / 用原编号重建 / 复核 up·in）将在确认后继续下发。</div></div>';
+   b+='<div class="warnbox" style="margin-top:12px">'+ic('wrench')+'<div><b>请现场更换磁盘</b>：按 SN <span class="mono">'+esc(q.serial||'-')+'</span> 与盘位把 <span class="mono">'+esc(q.oldDev||'原盘')+'</span> 换成新盘，装回<b>原盘位</b>。'+
+    '平台已暂停，后续 '+q.pending.length+' 条命令（清理新盘签名 / 以新编号创建 / 复核 up·in）将在确认后继续下发。</div></div>';
    if(q.prereq&&q.prereq.ok===false){
-    b+='<div class="dangerbox" style="margin-top:10px">'+ic('alert')+'<div><b>编号复用前提尚未满足，先别急着继续</b><br>'+
+    b+='<div class="dangerbox" style="margin-top:10px">'+ic('alert')+'<div><b>新盘归属校验未通过，先别急着继续</b><br>'+
      (q.prereq.blockers||[]).map(function(x){return '· '+esc(x);}).join('<br>')+
-     '<br>点「继续执行」时平台会重新只读核验：原编号仍不是 <span class="mono">destroyed</span> 就拒绝 zap，'+
-     '否则新盘会被分配成新的 OSD 编号。先用 <span class="mono">ceph orch osd rm status</span> / '+
-     '<span class="mono">ceph osd dump</span> 确认移除队列走完再继续。</div></div>';
+     '<br>点「继续执行」时平台会重新只读核验：目标盘仍被 <b>up/in 的健康 OSD</b> 使用就拒绝 zap。'+
+     '请用 <span class="mono">lsblk -o NAME,FSTYPE,LABEL</span> / '+
+     '<span class="mono">ceph orch device ls</span> 核对盘位与设备名。</div></div>';
    }
    foot='<div class="sp"></div><button class="btn" data-act="q-abort">中止流程</button>'+
     '<button class="btn pri" data-act="q-resume">'+ic('check',14)+' 磁盘已换好，继续执行</button>';
   }else foot='<div class="sp"></div><button class="btn dan" data-act="q-abort">中止</button>';
  }else if(q.phase==='done'){
   var v=q.verify||null,badVerify=(q.kind==='kick'||q.kind==='replace'||isPhase(q.kind))&&v&&v.ok===false;
-  /* 复核结论分三种：没复用编号（真失败，等也没用）、编排器还在部署（可自动复核）、成功。
-     「OSD up 慢」只属于第二种；把第一种也显示成「未完全生效」会误导成等待即可。 */
+  /* 复核结论分三种：明确失败（等也没用）、新 OSD 还在部署（可自动复核）、成功。
+     1.1.24 起不再校验编号是否复用，只看新盘有没有被 up/in 的 OSD 接管。 */
   var pending=!!(badVerify&&v.pending),hardFail=badVerify&&!pending;
   var stateColor=hardFail?'td':pending?'tw':'t';
-  var headline=hardFail?((q.kind==='replace'||q.kind==='deploy')&&v.newOsd?'未复用原编号':
-               v&&v.blocked?'清退被阻塞（不会自动完成）':'未完全生效'):
-               pending?(q.kind==='retire'?'已清退，等待编号释放':'已提交，等待编排器重建'):'流程已完成';
+  var headline=hardFail?(v&&v.blocked?'清退未完成（不会自动完成）':'未完全生效'):
+               pending?(q.kind==='retire'?'等待旧编号从 osdmap 消失':'已提交，等待新 OSD 上线'):'流程已完成';
   b='<div style="text-align:center;padding:12px 0 18px"><div style="font-size:38px" class="'+stateColor+'">'+
    ic(badVerify?'alert':'check',38)+'</div>'+
    '<div style="font-size:16px;font-weight:700;margin-top:8px">'+
@@ -577,30 +585,30 @@ function quickPaintModal(){
    (q.dryRun?'DRY-RUN：命令仅生成并写入审计，未下发集群':
     q.kind==='init'?'已初始化并加入集群，数据开始回填；新 OSD 会在 OSD 列表出现':
     q.kind==='kick'?(badVerify?'复核结论见下方':'已停服务并标记 DOWN + OUT，数据回填中；需要恢复时点「IN」即可重新加入集群'):
-    q.kind==='replace'?(badVerify?'原编号必须仍是 osd.'+q.osdId+'，详见下方复核结论':'新盘已用原编号 osd.'+q.osdId+' 重建并上线，数据开始回填'):
-    q.kind==='retire'?(badVerify?'清退未完成，详见下方复核结论':'编号已保留为 destroyed，可以现场换盘了'):
-    q.kind==='deploy'?(badVerify?'原编号必须仍是 osd.'+q.osdId+'，详见下方复核结论':'新盘已用原编号 osd.'+q.osdId+' 重建并上线，数据开始回填'):
+    q.kind==='replace'?(badVerify?'新盘入群未完成，详见下方复核结论':'旧编号已删除，新盘以新编号上线，数据开始回填'):
+    q.kind==='retire'?(badVerify?'清退未完成，详见下方复核结论':'osd.'+q.osdId+' 已从 osdmap 删除，可以现场换盘了'):
+    q.kind==='deploy'?(badVerify?'新盘入群未完成，详见下方复核结论':'新盘已由 osd.'+((v&&v.newOsd!=null)?v.newOsd:'?')+' 接管并上线，数据开始回填'):
     '命令已下发，请在概览确认 HEALTH_OK 与 PG active+clean')+'</div></div>'+
    (hardFail?'<div class="dangerbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>'+
      (q.kind==='retire'?(v&&v.blocked?'清退被阻塞，等也不会自动完成':'清退复核未通过'):'换盘复核未通过')+
-     (v.newOsd?'：新盘被分配为 osd.'+v.newOsd:'')+'</b><br>'+
+     (v.newOsd?'：新盘当前归属 osd.'+v.newOsd:'')+'</b><br>'+
      esc(v.message).replace(/\n/g,'<br>')+
      ((v.fix&&v.fix.length)?'<div class="cmdbox" style="margin-top:8px;max-height:190px;overflow:auto">'+
        v.fix.map(function(x){return '<div>'+esc(x)+'</div>';}).join('')+'</div>':'')+
-     (v.newOsd?'<br>一键换盘要求「编号不变」，这次等同于新增磁盘。确认数据无碍后清理多出的 OSD，检查 OSDSpec 再重试。':'')+
+     (v.newOsd?'<br>新编号由 mon 分配，与旧编号不同属正常；若复核失败请按下方结论处理。':'')+
      '</div></div>':
     pending?'<div class="warnbox" style="margin-bottom:12px">'+ic('alert')+'<div><b>'+
-     (q.kind==='retire'?'移除队列仍在收尾，不是失败':'编排器仍在部署，不是失败')+'</b><br>'+esc(v.message)+
+     (q.kind==='retire'?'等待回读 osd dump，不是失败':'新 OSD 仍在部署 / 设备信息未采到，不是失败')+'</b><br>'+esc(v.message)+
      '<br>每 5 秒自动复核一次'+(q.recheckLeft?'（已复核 '+q.recheckLeft+' 次）':'')+
      (q.recheckDone?'，自动复核已结束，可手动点「重新复核」。':'。')+'</div></div>':'')+
    '<div class="grid g2"><div><div class="stat-line"><span>执行步骤</span><b class="mono">'+q.steps.length+'</b></div>'+
    '<div class="stat-line"><span>集群版本</span><b class="mono">'+esc(liveProfile().version||'-')+'</b></div></div>'+
-   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'编号复核')+'</span><b class="'+
+   '<div><div class="stat-line"><span>'+(q.kind==='init'?'新 OSD':'入群复核')+'</span><b class="'+
    (hardFail?'td':pending?'tw':'t')+'">'+
    (q.kind==='init'?'待同步（列表刷新后可见）':
-    (q.kind==='replace'||q.kind==='deploy')?(v&&v.ok?'osd.'+q.osdId+' 已 up/in（编号不变）':
-     hardFail&&v.newOsd?'未复用：新盘成了 osd.'+v.newOsd:pending?'等待 osd.'+q.osdId+' 上线':'待复核'):
-    q.kind==='retire'?(v&&v.ok?'已 destroyed（编号已保留）':pending?'等待编号释放':'待复核'):
+    (q.kind==='replace'||q.kind==='deploy')?(v&&v.ok?'新盘由 osd.'+((v.newOsd!=null)?v.newOsd:'?')+' 接管（up/in）':
+     pending?'等待新 OSD 上线':'待复核'):
+    q.kind==='retire'?(v&&v.ok?'osd.'+q.osdId+' 已删除':pending?'等待回读':'待复核'):
     q.kind==='kick'?'待复核（后端已回读 osd dump）':'已自动恢复')+'</b></div>'+
    '<div class="stat-line"><span>审计记录</span><b class="t">已写入</b></div></div></div>'+
    '<div class="warnbox" style="margin-top:12px">'+ic('shield')+'<div>真实环境请回到「告警中心」确认告警已清除，并在「变更审计」复核完整命令序列与返回码。</div></div>';
@@ -613,8 +621,8 @@ function quickPaintModal(){
  openModal(qHead()+'<div class="modal-b">'+b+'</div><div class="modal-f">'+foot+'</div>','lg');
  if(q.phase==='running'||q.phase==='paused')quickPaintLogs();
 }
-/* 只读重新复核：zap 后由 OSDSpec 异步重建，OSD 起来有延迟。
-   不重跑流程、不下发任何写命令，只回读 osd dump / metadata 看编号有没有复用。 */
+/* 只读重新复核：zap 后创建 OSD，守护进程起来有延迟。
+   不重跑流程、不下发任何写命令，只回读 osd dump / metadata 看新盘归谁、是否 up/in。 */
 function qRecheck(q,cb){
  if(!state.quick||state.quick!==q)return;
  if(state.mode!=='live'||!state.auth.authenticated){toast('演示模式没有后端可复核','w');if(cb)cb();return;}
@@ -663,9 +671,9 @@ function quickApply(){
   if(!q.verify||q.verify.ok!==false){if(o){o.up=false;o.inn=false;}
    state.cluster.osdsIn=Math.max(0,(state.cluster.osdsIn||0)-1);}}
  else if(q.kind==='replace'||q.kind==='deploy'){
-  /* 新盘入群：编号不变，只看后端复核结论改 up/in；新盘的 SMART / 用量只有刷新才知道，
-     不能在这里编一个「已恢复」的假象。① 清退阶段不改 up/in：OSD 此时就该是 down/out。 */
-  if(!q.verify||q.verify.ok!==false){if(o){o.up=true;o.inn=true;}}}
+  /* 新盘入群：编号由 mon 重新分配，本地列表里的旧行不该被写成 up/in
+     （它已被 purge 删除，新 OSD 是另一个编号）；真实状态由随后强制刷新回读覆盖。
+     ① 清退阶段同样不改本地状态。 */ }
  else if(isIn){if(o){o.inn=true;o.up=true;}
   state.cluster.osdsIn=Math.min(state.cluster.osds,(state.cluster.osdsIn||0)+1);}
  state.alerts.forEach(function(a){if(a.osd!==q.osdId||a.status==='resolved')return;
@@ -729,7 +737,7 @@ function quickExec(stage){
     quickApply();q.phase='done';quickPaintModal();
     if(r.verify&&!r.verify.ok){
      if(r.verify.pending)toast('流程已提交，等待编排器用原编号重建（自动复核中）','w');
-     else toast(r.verify.newOsd?'换盘未复用原编号：新盘成了 osd.'+r.verify.newOsd:'复核未通过：'+r.verify.message,'e');
+     else toast('复核未通过：'+(r.verify.message||'新盘还没被 OSD 接管'),'e');
     }else toast(quickTitle(q.kind)+' 流程完成','ok');
     if(r.verify&&r.verify.pending&&state.mode==='live'&&state.auth.authenticated)qAutoRecheck(q,12);
     if(state.mode==='live'&&state.auth.authenticated)setTimeout(function(){syncState(true);},1500);
@@ -992,7 +1000,7 @@ function quickAction(act,el){
    }else if(q.kind==='replace'||q.kind==='deploy'){
     if(!q.dev){toast('请先选择或填写换上新盘的设备路径','e');return;}
     if(!q.host){toast('请填写新盘所在的服务器','e');return;}
-    if(state.settings.confirm&&(q.phrase!=='osd.'+q.osdId||!q.confirmed)){toast('请输入 osd.'+q.osdId+' 确认编号不变，并勾选换盘确认','e');return;}
+    if(state.settings.confirm&&(q.phrase!=='osd.'+q.osdId||!q.confirmed)){toast('请输入 osd.'+q.osdId+' 并勾选确认（删除旧编号 / 新盘分配新编号）','e');return;}
    }else if(q.kind==='retire'){
     /* ① 清退不需要选新盘；down 与否由后端执行前硬校验，这里只收确认短语。 */
     if(state.settings.confirm&&(q.phrase!=='osd.'+q.osdId||!q.confirmed)){toast('请输入 osd.'+q.osdId+' 并勾选清退确认','e');return;}

@@ -21,7 +21,8 @@ function osdDetail(id){var o=state.osds.filter(function(x){return x.id===Number(
  openModal(modalHead('OSD.'+o.id+' 详情',esc(o.host||'—')+' · '+esc(o.dev||'—'))+'<div class="modal-b">'+body+'</div><div class="modal-f"><div class="sp"></div>'+
   '<button class="btn" data-act="modal-close">关闭</button>'+(o.inn?'<button class="btn" data-act="osd-out" data-id="'+o.id+'">标记 OUT</button>':'<button class="btn" data-act="osd-in" data-id="'+o.id+'">标记 IN</button>')+
   '<button class="qbtn kick" data-act="q-open" data-kind="kick" data-id="'+o.id+'">'+ic('trash',13)+'一键踢盘</button>'+
-  '<button class="qbtn" data-act="q-open" data-kind="replace" title="坏盘换新盘：新盘装回原盘位，重建后 OSD 编号不变" data-id="'+o.id+'">'+ic('zap',13)+'一键换盘</button></div>','md');}
+  '<button class="qbtn" data-act="q-open" data-kind="retire" title="① 换盘前：确认 down → 清退并保留编号" data-id="'+o.id+'">'+ic('wrench',13)+'① 清退</button>'+
+  '<button class="qbtn" data-act="q-open" data-kind="deploy" title="② 换盘后：新盘接回集群，复用原编号" data-id="'+o.id+'">'+ic('zap',13)+'② 入群</button></div>','md');}
 /* 告警确认 / 静音 / 重新激活：处置状态存后端，刷新页面、换浏览器都保持；
    离线（demo）模式没有后端可写，只改本地状态，不假装调用成功。 */
 /* 处置后如果详情弹窗还开着，就地刷新，否则按钮状态和列表对不上。 */
@@ -70,7 +71,7 @@ function wizardPlan(w){var id=w.osdId,p=liveProfile(),orch=p.orchestrator==='cep
   {n:'移除 OSD 并保留编号',c:'ceph orch osd rm '+id+' --replace'+(((state.osds.filter(function(x){return x.id===id;})[0]||{}).up)?'':' --force'),d:'--replace 把 osd.'+id+' 标记为 destroyed 供新盘复用；盘已 down 时加 --force 跳过回填等待'},
   {n:'确认 OSD 服务规约（编号复用的前提）',c:'ceph orch ls --service-type osd --format=json',d:'必须存在 managed 的 OSDSpec（unmanaged=true 不行）；否则 zap 后没有任何服务会来重建'},
   {n:'轮询移除进度',c:'ceph orch osd rm status --format=json',d:'确认该 OSD 已离开移除队列（编号留作替换）'},
-  {n:'确认原编号已释放为 destroyed（编号复用前提）',c:'ceph osd dump --format=json',d:'osds[] 里 osd.'+id+' 的 state 必须含 destroyed；点「继续执行」时平台会再次核验，未释放直接拒绝 zap'},
+  {n:'确认原编号已释放为 destroyed（编号复用前提）',c:'ceph osd dump --format=json',d:'osds[] 里 osd.'+id+' 的 state 必须含 destroyed；第 ② 步执行时平台会再次核验，未释放直接拒绝 zap。这是完整流程预览，日常请用两个独立按钮'},
   {n:'物理更换故障盘',c:'# 现场操作：按盘位 / SN 换上同规格新盘，装回原盘位',d:'需人工确认，平台在此暂停等待'},
   {n:'确认新盘已被编排器识别',c:'ceph orch device ls '+w.host+' --format=json',d:'新盘应出现在设备列表（available 可能为 false，还带着旧签名）'},
   {n:'清理新盘残留签名（触发按原编号自动重建）',c:'ceph orch device zap '+w.host+' '+w.dev+' --force',d:'执行前平台会校验 destroyed / managed OSDSpec / 新盘归属，任一不满足就拒绝；zap 后由 OSDSpec 用 destroyed 的原编号 osd.'+id+' 重建，绝不能用 ceph orch daemon add osd（那会分配新编号）'},

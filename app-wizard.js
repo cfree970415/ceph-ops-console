@@ -336,13 +336,19 @@ function exportAudit(){var lines=state.audit.map(function(a){return JSON.stringi
 /* ---------- bindings ---------- */
 var NUMKEYS={nearfull:1,full:1,downMin:1,pgDegraded:1,slowOps:1,'wizard.osdId':1,
              'pool.size':1,'pool.minSize':1,'pool.pg':1,'pool.pgp':1};
-function setBind(path,val,el){var ks=path.split('.'),o=state;
+function setBind(path,val,el){
+ /* 弹窗还开着、state.quick 却被清过（重启后首次登录偶发）：先把界面上
+    已填的内容恢复成会话，再写这一格。以前这里直接 return，用户勾了框、
+    填了短语，清单永远是灰的，只有右侧一串「弹窗状态已失效」。 */
+ if(path.indexOf('quick.')===0&&!state.quick&&typeof quickLive==='function')quickLive();
+ var ks=path.split('.'),o=state;
  for(var i=0;i<ks.length-1;i++){o=o[ks[i]];
   if(!o||typeof o!=='object'){
    /* 父级对象不存在：最典型的就是弹窗状态刚被清空、DOM 还留在页面上。
       以前这里直接抛 TypeError（输入框的事件回调里没人接），表现为
       「明明输入/勾选了，清单还是灰的」。宁可报一句，也不要静默丢输入。 */
-   if(ks[0]==='quick'&&typeof toast==='function')toast('弹窗状态已失效，请关闭后重新打开','e');
+   if(ks[0]==='quick'&&typeof toast==='function')
+    toast('这一格没写进状态（弹窗状态异常），请关闭弹窗重新打开','e');
    return;}}
  var k=ks[ks.length-1];
  if(el&&el.type==='checkbox')o[k]=el.checked;

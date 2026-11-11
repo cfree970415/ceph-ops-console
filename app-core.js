@@ -1,6 +1,6 @@
 /* Ceph Ops Console - core: utils / state / api / shell / overview */
 'use strict';
-var UI_BUILD='1.1.30-20261111';
+var UI_BUILD='1.1.31-20261111';
 var P={grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
  bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
  disk:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
@@ -38,7 +38,15 @@ function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
 function uid(){return Math.random().toString(36).slice(2,9);}
 function pct(a,b){return b?Math.round(a/b*100):0;}
 function copy(t){try{if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t);}else{var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);}toast('已复制到剪贴板','ok');}catch(e){toast('复制失败，请手动选择','e');}}
-function toast(m,t){var r=document.getElementById('toast-root'),d=document.createElement('div');d.className='toast '+(t||'');d.innerHTML='<div style="font-weight:600">'+esc(m)+'</div>';r.appendChild(d);setTimeout(function(){d.style.opacity='0';d.style.transition='.3s';setTimeout(function(){d.remove();},320);},3200);}
+function toast(m,t){
+ var r=document.getElementById('toast-root');if(!r)return;
+ /* 同一句话不叠罗汉：连续触发（例如每个按键都报一次）只留一条，
+    否则右下角会被完全相同的提示堆满，把真正的信息盖住。 */
+ var last=r.lastElementChild;
+ if(last&&last.getAttribute('data-m')===String(m))return;
+ var d=document.createElement('div');d.className='toast '+(t||'');d.setAttribute('data-m',String(m));
+ d.innerHTML='<div style="font-weight:600">'+esc(m)+'</div>';r.appendChild(d);
+ setTimeout(function(){d.style.opacity='0';d.style.transition='.3s';setTimeout(function(){d.remove();},320);},3200);}
 
 /* ---- compatibility matrices ---- */
 var CEPH_VERSIONS=[

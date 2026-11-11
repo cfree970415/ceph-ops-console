@@ -12,13 +12,16 @@ state.isolation=null;
 
 /* ---------- state.quick 的唯一真相 ----------
    现场事故（138，服务器重启后首次登录）：弹窗还开着、复选框也勾上了，
-   点「立即执行」却报「弹窗状态已丢失」——某个分支把 state.quick 静默清成
-   null，DOM 却留在页面上，用户对着一个僵尸弹窗填表、勾选，全部落空。
-   这类问题只靠读代码查不动，所以在这里做两件事：
-   1) 每次「有 -> 无」都在服务端日志留一条 reset（带调用栈行号），
-      下次再出现直接看日志就知道是谁清的；
-   2) 清空的同时把残留弹窗关掉，保证「状态没了，UI 也跟着没了」，
-      用户不会再对着点不动的弹窗浪费时间。 */
+   清单却还是灰的、右侧一直冒「弹窗状态已失效」——某个分支把 state.quick
+   清成了 null，DOM 却留在页面上，用户对着一个僵尸弹窗填表、勾选，全部落空。
+   这类问题只靠读代码查不动，所以这里做三层防护：
+   1) 意外清空直接拒绝：弹窗还在 DOM 里，就不允许把会话清掉（qc() 例外，
+      它是主动关闭的正规出口）——从根上消灭「有 UI 没状态」；
+   2) 真被清了也能自愈：quickLive() 在每次输入/勾选前从界面把已填内容
+      读回来（quickRecover），用户不用关掉重开；
+   3) 每次「有 -> 无」都在服务端日志留一条 reset（带调用栈行号），
+      下次再出现直接看日志就知道是谁清的。 */
+var __qClearing=false;
 (function(){
  var q0=state.quick;
  try{
@@ -26,7 +29,30 @@ state.isolation=null;
    configurable:true,
    get:function(){return q0;},
    set:function(v){
-    var prev=q0;q0=v;
+    var prev=q0;
+    if(prev&&!v&&!__qClearing){
+     var liveM=null;
+     try{liveM=document.querySelector('#modal-root .modal');}catch(e){}
+     if(liveM){
+      /* 弹窗还开着却被清状态 = 用户接下来填的每一格都会丢。
+         这里直接拒绝这次清空（会话保住），只留证据。 */
+      var where0='';
+      try{
+       var ls=String((new Error()).stack||'').split('\n');
+       for(var j=1;j<ls.length;j++){
+        var s0=ls[j];
+        if(s0.indexOf('set (')>=0||s0.indexOf('defineProperty')>=0)continue;
+        where0=s0.replace(/^\s*at\s*/,'').replace(/https?:\/\/[^/]+\//,'').replace(/\?v=[\d.]+/,'').slice(0,120);
+        break;}
+      }catch(e){}
+      state.quickBlocked=state.quickBlocked||[];
+      state.quickBlocked.push({at:Date.now(),where:where0||'unknown'});
+      if(state.quickBlocked.length>8)state.quickBlocked.shift();
+      try{if(typeof qTrace==='function')qTrace(prev,'blocked-clear',where0||'unknown');}catch(e){}
+      return;
+     }
+    }
+    q0=v;
     if(!prev||v)return;
     var where='';
     try{
@@ -50,6 +76,14 @@ state.isolation=null;
   });
  }catch(e){}
 })();
+
+/* 主动关闭弹窗时的正规清空出口。只有它（和「弹窗本来就不在了」）能真的
+   把会话清掉；其它任何地方误写 state.quick=null 都会被上面的 setter 拒绝，
+   否则就会出现「UI 还在、状态没了」的僵尸弹窗。 */
+function qc(){
+ __qClearing=true;
+ try{state.quick=null;}finally{__qClearing=false;}
+}
 
 function authReset(){return {required:state.auth.required,authenticated:false,user:'',role:'viewer',
  allowWrite:false,readOnly:false,backend:'cli',session:'',tab:'password',error:'',busy:false};}
@@ -137,7 +171,7 @@ function doLogin(){
 function doLogout(){
  apiFetch('POST','/api/logout',{}).catch(function(){});
  try{sessionStorage.removeItem('cc_session');sessionStorage.removeItem('cc_token');}catch(e){}
- state.token='';state.quick=null;state.pool=null;state.profile=null;state.isolation=null;
+ state.token='';qc();state.pool=null;state.profile=null;state.isolation=null;
  closeModal();
  if(state.link){state.link.stateOk=false;state.link.stateError='';state.link.stateHttp=0;
   state.link.stateAt=0;state.link.diag=null;state.link.diagError='';}
@@ -851,11 +885,28 @@ function quickRecover(){
   devices:[],phase:'confirm',steps:[],logs:[],progress:0,busy:false,error:'',
   stage:'auto',aborted:false,pending:[],hasManual:false,
   dryRun:!state.settings.allowWrite,role:state.auth.role||'admin',recovered:true};
- /* 只有「动新盘」的三类必须知道设备路径；清退只需要 osd.id。 */
- var needDev=(kind==='init'||kind==='replace'||kind==='deploy');
- if(needDev&&!q.dev)return null;
- if(!needDev&&q.osdId==null)return null;
+ /* 只有「清退」这类不涉及新盘的动作必须知道 osd.id；设备路径留空也照样恢复
+    ——空着只是让 qValidate 给出「请先填写设备路径」，而不是把整个会话判死。 */
+ var needOid=(kind==='retire'||kind==='kick'||kind==='in');
+ if(needOid&&q.osdId==null)return null;
  return q;
+}
+/* 每次动弹窗里的控件之前先要一个活会话：state.quick 没了、但弹窗还在，
+   就从界面上把用户已经填好的内容读回来继续。这样「重启后第一次登录」
+   那种偶发的状态丢失，用户填的东西一格都不会丢，也不用关掉重开。
+   返回 null 表示确实没有弹窗（调用方该报错就报错）。 */
+function quickLive(){
+ if(state.quick)return state.quick;
+ var m=null;
+ try{m=document.querySelector('#modal-root .modal[data-qkind]');}catch(e){}
+ if(!m)return null;
+ var rec=quickRecover();
+ if(!rec)return null;
+ state.quick=rec;
+ var lr=state.quickLastReset||null;
+ try{if(typeof qTrace==='function')qTrace(rec,'recover-bind',
+  lr?('lastReset='+lr.where+' @'+new Date(lr.at).toLocaleTimeString()):'no-reset-record');}catch(e){}
+ return rec;
 }
 /* 只读重新复核：zap 后创建 OSD，守护进程起来有延迟。
    不重跑流程、不下发任何写命令，只回读 osd dump / metadata 看新盘归谁、是否 up/in。 */
@@ -1050,7 +1101,7 @@ function poolOpen(){
   app:'rbd',autoscale:true,opts:null,loading:live,phase:'form',steps:[],spec:null,
   phrase:'',confirmed:false,busy:false,error:'',dryRun:!state.settings.allowWrite,
   logs:[],verify:null,exists:false,results:[]};
- state.quick=null;
+ qc();
  poolPaint();
  if(!live){state.pool.loading=false;poolPaint();return;}
  apiFetch('GET','/api/pool/options').then(function(r){
@@ -1235,10 +1286,10 @@ function quickAction(act,el){
  var q=state.quick;
  switch(act){
   case 'q-open':quickOpen(el.getAttribute('data-kind')||'replace',el.getAttribute('data-id'));return;
-  case 'q-close':state.quick=null;closeModal();render();return;
+  case 'q-close':qc();closeModal();render();return;
   case 'q-retry':if(q)quickOpen(q.kind,q.osdId);return;
   case 'q-wizard':if(q){if(q.kind==='in'){toast('IN 盘只涉及 osd in 与回填观察，直接执行即可','w');return;}
-   var k=q.kind,id=q.osdId;state.quick=null;closeModal();startWizard(id,k==='kick'?'remove':'replace');}return;
+   var k=q.kind,id=q.osdId;qc();closeModal();startWizard(id,k==='kick'?'remove':'replace');}return;
   case 'q-dev':/* 选了另一块新盘：重新生成命令序列 */
    if(q&&(q.kind==='init'||q.kind==='replace'||q.kind==='deploy')){q.dev=el.value||q.dev;replanQuick(q);}return;
   case 'q-replan':
@@ -1265,11 +1316,9 @@ function quickAction(act,el){
     var lr=state.quickLastReset;
     qTrace(null,'no-state','state.quick 为空'+(zombie?'，但弹窗仍在 DOM 里':'')+
      (lr?('；最后一次清空 '+new Date(lr.at).toLocaleTimeString()+' 来自 '+lr.where):'；本次会话没有记录到清空动作'));
-    var rec=zombie?quickRecover():null;
-    if(rec){
-     state.quick=rec;q=rec;
-     qTrace(rec,'recover','从弹窗 DOM 读回已填内容继续');
-     toast('弹窗状态被重置过，已按界面上已填的内容继续','w');
+    q=quickLive();
+    if(q){
+     qTrace(q,'recover','从弹窗 DOM 读回已填内容继续');
     }else{
      if(zombie&&typeof closeModal==='function')closeModal();
      toast('弹窗状态已失效（页面可能刚同步过），已关闭，请重新打开','e');return;}
@@ -1305,8 +1354,8 @@ function quickAction(act,el){
   /* 修复 daemon：编号复用后 cephadm 的 unit.run 还指向上一次的 --osd-uuid，
      OSD 起来就 error/down。redeploy 只重建 unit 与容器，不 zap、不删数据。 */
   case 'q-fix':if(q)qFixDaemon(q);return;
-  case 'q-alerts':state.quick=null;closeModal();state.view='alerts';render();return;
-  case 'q-audit':state.quick=null;closeModal();state.view='audit';render();return;
+  case 'q-alerts':qc();closeModal();state.view='alerts';render();return;
+  case 'q-audit':qc();closeModal();state.view='audit';render();return;
   default:return;
  }
 }
@@ -1335,11 +1384,11 @@ onAct=function(act,el){
   if(state.quick&&(state.quick.phase==='running'||state.quick.phase==='paused')){
    toast('操作进行中，请先完成或中止','w');return;}
   if(state.pool&&state.pool.busy){toast('建池命令正在下发，请稍候','w');return;}
-  state.quick=null;state.pool=null;return __baseOnAct(act,el);}
+  qc();state.pool=null;return __baseOnAct(act,el);}
  if(act==='modal-close'&&(state.quick||state.pool)){
   if(state.pool&&state.pool.busy){toast('建池命令正在下发，请稍候','w');return;}
-  state.quick=null;state.pool=null;return __baseOnAct(act,el);}
- if(act==='nav'&&(state.quick||state.pool)){state.quick=null;state.pool=null;}
+  qc();state.pool=null;return __baseOnAct(act,el);}
+ if(act==='nav'&&(state.quick||state.pool)){qc();state.pool=null;}
  return __baseOnAct(act,el);
 };
 

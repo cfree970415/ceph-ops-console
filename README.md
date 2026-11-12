@@ -373,7 +373,7 @@ cephadm 集群里 `ceph orch daemon stop osd.3` 由 mon 转发，控制台装在
 | 新盘入群 | `orch device zap` + `daemon add osd` | `ceph-volume lvm zap/create` | `ceph-disk prepare/activate` |
 | 设备清单 | `orch device ls`（全集群） | 逐台 `lsblk`（**需 ssh**） | 逐台 `lsblk`（**需 ssh**） |
 
-`systemctl` 和 `ceph-volume` 只能在**盘所在的那台主机**上执行，所以 1.2.0 加了一层远程执行：
+`systemctl` 和 `ceph-volume` 只能在**盘所在的那台主机**上执行，所以 1.2.0 加了一层远程执行（1.2.1 起默认免密即可，不用额外配置）：
 
 ```mermaid
 flowchart LR
@@ -390,14 +390,20 @@ flowchart LR
 
 ### 配置远程执行
 
-三种方式，任选一种，效果一样（优先级：命令行 > 环境变量 > `config.json`）。
+**默认什么都不用配**：前提就是「集群各节点已经能免密 ssh（一般 root 直连）」。满足这一点，
+平台直接用，页面上的 SSH 用户默认 `root`、端口 `22`，不需要填私钥、不需要配 sudo。
 
-**① 页面上配（推荐）**：`系统设置 → 远程执行 · 二进制 / 包安装集群`，填 SSH 用户 / 端口 / 私钥，点「保存配置」，再点「测试连通性」逐台确认。保存后立即生效，不用重启。
+启动时会在后台把每台主机探一遍（只跑 `hostname`），页面第一次打开就能看到逐台的
+「可达 / 不可达 + 原因」，不用先点「测试连通性」。
+
+需要改的话有三种方式（优先级：命令行 > 环境变量 > `config.json`）：
+
+**① 页面上配**：`系统设置 → 远程执行 · 二进制 / 包安装集群`，改用户 / 端口 / 私钥，保存后立即生效，不用重启。
 
 **② 命令行 / 环境变量**：
 
 ```bash
---ssh-user root --ssh-port 22 --ssh-key /root/.ssh/id_rsa   # --no-ssh-sudo 关闭 sudo
+--ssh-user root --ssh-port 22 --ssh-key /root/.ssh/id_rsa   # 默认 root + 22 + 默认密钥
 CEPH_CONSOLE_SSH_USER / _SSH_PORT / _SSH_KEY / _SSH_NOSUDO  # 同名环境变量
 --no-ssh                                                    # 彻底关掉远程执行
 ```
@@ -405,15 +411,20 @@ CEPH_CONSOLE_SSH_USER / _SSH_PORT / _SSH_KEY / _SSH_NOSUDO  # 同名环境变量
 **③ 部署时写死**（`deploy.sh`，写进 0600 的 env 文件，不进进程参数）：
 
 ```bash
-sudo bash deploy.sh --install --local --host 192.168.27.134 \
-  --ssh-user root --ssh-key /root/.ssh/id_rsa --allow-write
+sudo bash deploy.sh --install --local --host 192.168.27.134 --allow-write
+# 需要指定用户/私钥时再补 --ssh-user / --ssh-key
 ```
 
-前置条件：
+前置条件只有一条：**控制台主机能 `ssh <user>@<node>` 免密登录每台 OSD 主机**，
+且目标机能执行 `ceph-volume` / `systemctl`、读得到 `/etc/ceph/ceph.conf`。
 
-1. 控制台主机能 `ssh root@<node>` 免密登录每台 OSD 主机（`ssh-keygen` + `ssh-copy-id`）；
-2. 目标机 `sudo` 配 NOPASSWD（走 root 直连可忽略）：`echo 'root ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/ceph-console`；
-3. 目标机能执行 `ceph-volume` / `systemctl`，并能读 `/etc/ceph/ceph.conf`。
+> **root 直连不会加 sudo**。SSH 用户是 `root` 时，远端命令就是裸命令（root 本来有权限），
+> 少一层是为了不依赖目标机是否装了 `sudo` 包 —— 精简系统上 `sudo: command not found`
+> 会把本来能做的事拦住。只有 SSH 用户是普通账号时才套 `sudo -n`，那时目标机需要 NOPASSWD：
+> `echo 'cephadmin ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/ceph-console`。
+>
+> 免密没生效时不会只甩一行 `Permission denied`：错误里会补一句该做什么
+> （`ssh-copy-id`、`ssh-keyscan`、查 22 端口、装 `ceph-volume`）。
 
 > 页面上的「部署方式覆盖」用于纠偏：某些包安装集群仍装着 cephadm 包，`orch` 命令能跑但没接管，自动探测会误判成 cephadm。此时选 `ceph-volume / 传统` 即可强制按传统方式生成命令。
 
@@ -733,10 +744,10 @@ sudo cp /var/www/ceph-console/ceph-dashboard.html /var/www/ceph-console/index.ht
 确认是否真更新了：
 
 ```bash
-curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.2.0-20261111'
+curl -s http://127.0.0.1:8780/app-core.js | grep -c '1.2.1-20261112'
 ```
 
-页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.2.0-20261111`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
+页面里看更直观：**系统设置 → 关于 → 前端构建**，最新为 `1.2.1-20261112`，登录页底部同号。仍是旧号说明浏览器或 nginx 缓存了旧文件，Ctrl+F5。
 
 > 从 1.1.15 起，旧 `config.json` 没有 `allow_write` 时按「关闭」处理：升级后真实写操作会回到 DRY-RUN，需 admin 到设置页输密码重新打开。这是有意的默认值收紧，不是升级失败。
 
@@ -773,7 +784,7 @@ journalctl -u ceph-console -n 50 --no-pager
 
 ### 常见问题
 
-**只读模式下点踢盘 / 换盘，怎么没有提示框？** 1.1.25 的提示框挂错了位置（挂在 `onAct` 的后半段，而 `q-*` / `pool-*` 在前面就被分流了），所以点了直接进流程。1.1.26 已修，8 个写入口（踢盘 / ① 清退 / ② 入群 / 新增磁盘 / 向导 / IN / OUT / 建池）全部弹提示。升级后 Ctrl+F5 强制刷新，构建号要是 `1.2.0-20261111`。
+**只读模式下点踢盘 / 换盘，怎么没有提示框？** 1.1.25 的提示框挂错了位置（挂在 `onAct` 的后半段，而 `q-*` / `pool-*` 在前面就被分流了），所以点了直接进流程。1.1.26 已修，8 个写入口（踢盘 / ① 清退 / ② 入群 / 新增磁盘 / 向导 / IN / OUT / 建池）全部弹提示。升级后 Ctrl+F5 强制刷新，构建号要是 `1.2.1-20261112`。
 
 **第一次点「立即执行初始化」没反应？** 现在有两条固定线索，不用猜：
 
@@ -792,7 +803,7 @@ journalctl -u ceph-console -n 50 --no-pager
 
 **包安装集群里「新增磁盘」下拉是空的 / 只有控制台本机的盘？** 说明该主机的磁盘没采到。
 1.2.0 起设备清单是**逐台主机** `lsblk` 采的，弹窗里会直接点名哪台失败、原因是什么：
-- `控制台未启用远程执行（SSH）` → 去「系统设置 → 远程执行」填用户 / 端口 / 私钥并保存；
+- `控制台未启用远程执行（SSH）` → 默认本就该可用；先确认控制台能 `ssh root@<该主机>` 免密登录（`ssh-copy-id`），不需要填任何配置；
 - `Permission denied (publickey)` → 控制台到该主机没配免密，`ssh-copy-id root@<node>`；
 - `No route to host` / 超时 → 网络或防火墙（8780 之外，**22 端口也要通**）；
 - 命令里出现 `sudo: a password is required` → 目标机 `sudo` 没配 NOPASSWD。
@@ -802,7 +813,7 @@ journalctl -u ceph-console -n 50 --no-pager
 
 **包安装集群点「立即执行」报 409「缺少远程执行能力」？** 这是**故意的**：计划里有命令要在别的主机上执行，而控制台 ssh 不过去。后端拒绝退化成在本机执行——那会把 `ceph-volume zap` 打到控制台自己的盘上。配好 ssh 或改用 DRY-RUN 拿命令手工执行。
 
-**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.2.0-20261111` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
+**页面还是旧数据 / 空白？** 先看构建号（设置 → 关于，或登录页底部），不是 `1.2.1-20261112` 就是运行目录还是旧文件；号对但页面空则属于上一条，点自检看真实报错。
 
 **清退后这块盘从列表里消失了，只能「新增磁盘」加回来？** 正常。① 清退执行的是 `ceph osd purge <id>`，mon 侧编号被删掉，`osd dump` 里没有它了，列表自然不显示——数据本来就要跟着盘一起走。新盘装好后走 ② 换盘后·新盘入群（或独立用「新增磁盘」扩容），会拿到一个**新编号**。若加回来一直 down，见下一条。
 

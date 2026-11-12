@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - Python 2 is not supported
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 AUDIT_PATH = "/var/log/ceph-console/audit.jsonl"
 # 「一键换盘」硬门禁：cephadm 的 --replace 是异步的，只有原编号被打上
 # destroyed 之后 OSDSpec 才会复用它。pre 阶段提交移除后最多等这么久，
@@ -807,19 +807,52 @@ def host_is_local(host):
 
 
 def _sudo_wrap(cfg, argv, sudo, local=False):
-    """需要提权时前置 sudo -n（-n = 不提示输入密码，失败就报错，绝不挂住）。"""
+    """需要提权时前置 sudo -n（-n = 不提示输入密码，失败就报错，绝不挂住）。
+
+    默认假设集群已经做完 ssh 免密（通常是 root 直连）。这种情况下远端**不加 sudo**：
+    root 本来就有权限，多一层 sudo 只会在精简系统（没装 sudo 包）上变成
+    `sudo: command not found` —— 明明能做的事被自己拦住。
+    只有 ssh 用户是普通账号时才需要 sudo -n（且目标机要配 NOPASSWD）。
+    """
     st = ssh_settings(cfg)
     use = st["sudo"] if sudo is None else bool(sudo)
     if not use:
         return list(argv)
-    try:
-        if os.geteuid() == 0:
-            return list(argv)     # 本地已经是 root，再加 sudo 反而多一层
-    except AttributeError:
-        # 非 Linux（开发机 / 测试）：谈不上 sudo，原样执行
-        if local:
+    if local:
+        try:
+            if os.geteuid() == 0:
+                return list(argv)     # 本地已经是 root，再加 sudo 反而多一层
+        except AttributeError:
+            # 非 Linux（开发机 / 测试）：谈不上 sudo，原样执行
             return list(argv)
+    elif st["user"].strip().lower() in ("root", "0"):
+        return list(argv)             # 远端就是 root 免密，不需要 sudo
     return ["sudo", "-n"] + list(argv)
+
+
+def _ssh_hint(dest, err):
+    """给 ssh 失败补一句人话。
+
+    默认前提是集群已做完免密，所以这里覆盖的正是「前提没满足」的几种典型形态：
+    不补一句，页面上只有一行 Permission denied，运维还得自己回想是哪台、哪个用户。
+    """
+    text = (err or "").strip()
+    low = text.lower()
+    hint = ""
+    if "permission denied" in low:
+        hint = ("控制台到 %s 的免密没生效：在控制台主机上执行 "
+                "`ssh-copy-id %s`（或用同一个私钥），然后用「测试连通性」确认。" % (dest, dest))
+    elif "host key verification failed" in low:
+        hint = ("%s 的主机指纹不在 known_hosts：`ssh-keyscan %s >> ~/.ssh/known_hosts`。" % (dest, dest))
+    elif "no route to host" in low or "connection timed out" in low or "timed out" in low:
+        hint = ("连不上 %s：检查网络 / 22 端口 / 防火墙（云主机安全组常只放行控制台端口）。" % dest)
+    elif "connection refused" in low:
+        hint = "%s 上没有跑 sshd（或被限制来源），确认 22 端口在监听。" % dest
+    elif "command not found" in low or "not found" in low:
+        hint = ("%s 上找不到该命令：目标机可能没装对应工具（ceph-volume / systemctl / sudo）。" % dest)
+    if not hint:
+        return text
+    return text + ("\n[hint] " + hint if text else "[hint] " + hint)
 
 
 def host_run(cfg, host, argv, timeout=60, sudo=None):
@@ -858,7 +891,7 @@ def host_run(cfg, host, argv, timeout=60, sudo=None):
             if i == 0 and re.search(r"Bad configuration option|Unsupported option|"
                                     r"command-line: line 0", err or ""):
                 continue
-            return rc, out, err, "ssh"
+            return rc, out, _ssh_hint(dest, err or ""), "ssh"
         return 127, "", "ssh 不可用", "ssh"
     return run(_sudo_wrap(cfg, argv, sudo, local=True), timeout) + (via,)
 
@@ -887,6 +920,12 @@ def ssh_probe(cfg, host, timeout=6, force=False):
     return res
 
 
+def ssh_cached(host):
+    """读探活缓存（不发起连接）。启动时 ssh_warm 已预热过，页面首屏直接用。"""
+    with _SSH_LOCK:
+        return dict(SSH_PROBE_CACHE.get(str(host or "")) or {}) or None
+
+
 def ssh_summary(cfg, hosts=None, probe=False):
     """给页面用的远程执行概况：配置 + 可选逐主机连通性。"""
     st = ssh_settings(cfg)
@@ -899,9 +938,68 @@ def ssh_summary(cfg, hosts=None, probe=False):
         out["reason"] = ("远程执行已关闭" if not st["enabled"]
                          else "控制台主机上没有 ssh 客户端（openssh-clients）")
     for h in (hosts or []):
-        out["hosts"].append(ssh_probe(cfg, h) if probe
-                            else {"host": h, "local": host_is_local(h), "ok": None, "err": ""})
+        if probe:
+            out["hosts"].append(ssh_probe(cfg, h))
+            continue
+        # 不探活时也把缓存里的真实结果带上：默认免密的集群启动就预热过了，
+        # 首屏应显示「可达 / Permission denied」而不是一排「未测试」。
+        item = {"host": h, "local": host_is_local(h), "ok": None, "out": "", "err": ""}
+        if item["local"]:
+            item.update({"ok": True, "out": (local_usage().get("host") or socket.gethostname())})
+        else:
+            c = ssh_cached(h)
+            if c:
+                item.update({"ok": bool(c.get("ok")), "out": c.get("out", ""),
+                             "err": c.get("err", ""), "cached": True})
+        out["hosts"].append(item)
     return out
+
+
+def ssh_warm(cfg):
+    """后台把每台主机的 ssh 可达性探一遍（只跑 hostname，只读）。
+
+    前提：集群已经做完免密登录（通常是 root 直连），所以这里不做任何
+    配置引导 —— 只是让页面第一次打开就能看到「可达 / 不可达 + 原因」，
+    而不是一排「未测试」。探不到不影响任何功能，也不会阻塞请求。
+    """
+    if not ssh_ready(cfg):
+        return 0
+    try:
+        hosts = cluster_hosts(cfg)
+    except Exception:
+        hosts = []
+    if not hosts:
+        return 0
+    timeout = ssh_settings(cfg)["connect_timeout"]
+
+    def work(h):
+        try:
+            ssh_probe(cfg, h, timeout=timeout, force=True)
+        except Exception:
+            pass
+
+    n = 0
+    for h in hosts:
+        t = threading.Thread(target=work, args=(h,))
+        t.daemon = True
+        t.start()
+        n += 1
+    return n
+
+
+def ssh_warm_async(cfg, delay=3):
+    """延后几秒预热，避开启动时探测（ceph osd tree）的忙期。"""
+    def boot():
+        time.sleep(delay)
+        try:
+            ssh_warm(cfg)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=boot)
+    t.daemon = True
+    t.start()
+    return t
 
 
 def apply_remote_settings(cfg, settings):
@@ -3129,11 +3227,14 @@ def read_state(cfg, probe, settings):
         alerts_ok = bool(_ALERT_LAST["ok"])
         alerts_err = _ALERT_LAST["err"]
         alerts_at = int(_ALERT_LAST["ts"] or 0)
+    # 主机清单只读一次：既给主机页，也给远程执行的逐台可达性（走缓存，不再 ssh）。
+    hosts = read_hosts(cfg, cluster)
+    host_names = [h.get("name") for h in (hosts or []) if h.get("name")]
     return {"cluster": cluster, "osds": osds,
             "alerts": alerts,
             "alertsOk": alerts_ok, "alertsErr": alerts_err, "alertsAt": alerts_at,
             "pools": pools,
-            "hosts": read_hosts(cfg, cluster), "profile": probe.as_dict(),
+            "hosts": hosts, "profile": probe.as_dict(),
             # 阈值来自后端配置文件，前端不再用自己的演示默认值 85/95。
             # 安全策略随状态下发：页面开关只显示真实值，默认 DRY-RUN + 二次确认开。
             "settings": {"nearfull": settings.get("nearfull"),
@@ -3141,9 +3242,10 @@ def read_state(cfg, probe, settings):
                          "downMin": settings.get("downMin"),
                          "allow_write": settings.get("allow_write") is True,
                          "confirm": settings.get("confirm", True) is not False,
-                         # 二进制 / 包安装集群：动盘要走 ssh。这里给的是配置概况
-                         # （不探活），逐主机连通性由 /api/remote?probe=1 现查。
-                         "ssh": ssh_summary(cfg),
+                         # 二进制 / 包安装集群：动盘要走 ssh。默认前提是免密已配好，
+                         # 所以这里带上启动预热缓存的可达性（不发起新连接），
+                         # 需要现场重测用 /api/remote?probe=1。
+                         "ssh": ssh_summary(cfg, host_names),
                          "deploy_mode": getattr(probe, "deploy_mode", "unknown")}}
 
 
@@ -4356,9 +4458,10 @@ class Handler(BaseHTTPRequestHandler):
                     "已阻止执行：这些命令必须在目标主机上运行，但控制台现在连不过去。\n"
                     + "· 目标主机：" + "、".join(remote_hosts) + "\n"
                     + "· 原因：" + reason + "\n"
-                    + "请在「系统设置 → 远程执行」里配置 SSH（用户 / 端口 / 私钥），"
-                      "并用「测试连通性」确认每台主机都是可达的。\n"
-                      "也可以先用 DRY-RUN 只生成命令，拿到目标主机上手工执行。",
+                    + "默认前提是各节点已配好 ssh 免密（一般 root 直连）：在控制台主机上先执行 "
+                      "`ssh <user>@<host> hostname` 确认能直接登进去。\n"
+                      + "需要换用户 / 端口 / 私钥时，到「系统设置 → 远程执行」改完保存即可；\n"
+                      + "也可以先用 DRY-RUN 只生成命令，拿到目标主机上手工执行。",
                     "remote_hosts": remote_hosts,
                     "ssh": ssh_summary(self.cfg, remote_hosts)}, 409)
         commands, results, dry = execute_plan(self.cfg, self.probe, plan, allow)
@@ -4862,9 +4965,12 @@ def main(argv):
     print("  Deploy    : %s (orchestrator=%s, override=%s)" %
           (probe.deploy_mode, probe.orchestrator, cfg.deploy_override))
     _st = ssh_settings(cfg)
+    # 远端 root 免密时不会加 sudo（见 _sudo_wrap），这里如实打印实际会用到的形式。
+    _sudo = "off (root direct)" if _st["user"].strip().lower() in ("root", "0") else \
+        ("sudo -n" if _st["sudo"] else "off")
     print("  Remote    : %s (%s@<host>:%d, sudo=%s, key=%s)" %
-          ("ssh ready" if ssh_ready(cfg) else "unavailable",
-           _st["user"], _st["port"], _st["sudo"], _st["key"] or "agent/default"))
+          ("ssh ready (assume passwordless keys)" if ssh_ready(cfg) else "unavailable",
+           _st["user"], _st["port"], _sudo, _st["key"] or "agent/default"))
     print("  CORS      : %s" % cfg.cors_origin)
     print("  URL       : http://%s:%d/  (sign in with deploy.sh credentials)" % (public, cfg.port))
     print("  Token     : service token stored in the 0600 env file (not logged here)")
@@ -4877,6 +4983,9 @@ def main(argv):
                                args=(cfg, probe, settings, HISTORY_STEP))
     sampler.daemon = True
     sampler.start()
+    # 默认前提是集群已配好 ssh 免密：启动后在后台探一轮可达性，
+    # 页面第一次打开就能看到真实结果，不需要人工点「测试连通性」。
+    ssh_warm_async(cfg)
     try:
         srv = ThreadedHTTPServer((cfg.bind, cfg.port), Handler)
         srv.serve_forever()

@@ -697,8 +697,9 @@ function qRemoteHosts(q){
 function qRemoteWarn(q){
  var hosts=qRemoteHosts(q);if(!hosts.length)return '';
  var ssh=state.settings.ssh||{},far=hosts;
+ var nCmd=(q.steps||[]).filter(function(s){return s.host&&s.remote;}).length;
+ var dest=(ssh.user||'root')+'@'+far[0];
  if(ssh.ready!==false){
-  var nCmd=(q.steps||[]).filter(function(s){return s.host&&s.remote;}).length;
   return '<div class="warnbox" style="margin-bottom:10px">'+ic('link')+
    '<div>这 '+nCmd+' 条命令要在 '+far.length+' 台目标主机上执行（ssh）：<b class="mono">'+esc(far.join('、'))+'</b>'+
    '<br><span class="note">执行时后端会 ssh 到该主机（'+(ssh.user||'root')+'@host:'+(ssh.port||22)+'），'+
@@ -706,7 +707,9 @@ function qRemoteWarn(q){
  return '<div class="dangerbox" style="margin-bottom:10px">'+ic('alert')+
   '<div><b>远程执行未就绪，真实下发会被后端拒绝</b><br>目标主机（'+far.length+' 台，'+nCmd+' 条命令）：<b class="mono">'+esc(far.join('、'))+
   '</b><br><span class="note">'+esc(ssh.reason||'控制台未配置 SSH')+
-  '。到「系统设置 → 远程执行」配置 SSH 用户 / 端口 / 私钥，并点「测试连通性」。'+
+  '。默认前提是各节点已配好 ssh 免密（一般 root 直连）：先确认控制台能 '+
+  '<b class="mono">ssh '+esc(dest)+' hostname</b> 直接登进去；'+
+  '要换用户 / 端口 / 私钥再到「系统设置 → 远程执行」保存。'+
   '现在可以先用 DRY-RUN 生成命令，拿到目标主机上手工执行。</span></div></div>';
 }
 function cmdLines(q){

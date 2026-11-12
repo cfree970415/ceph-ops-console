@@ -342,13 +342,20 @@ function vSettings(){var s=state.settings,a=state.auth||{},canPw=state.mode==='l
   '<div class="note" style="margin:8px 0 10px">'+
    (isOrch?'当前是 cephadm 集群：踢盘 / 换盘 / 新增盘由 orchestrator 下发，<b>本节可以不配</b>。'
           :'当前是 <b>二进制 / 包安装集群</b>：systemctl、ceph-volume 必须在「盘所在主机」上执行，'+
-           '控制台会用 ssh 下发。单节点部署（控制台就在 OSD 主机上）自动本地执行，不需要配 ssh。')+'</div>'+
+           '控制台会用 ssh 下发。<b>只要各节点已经能免密 ssh（默认 root）</b>，本节保持默认即可，'+
+           '不需要额外配置；单节点部署自动本地执行。')+'</div>'+
   '<div class="grid g2" style="gap:10px">'+
    '<div class="fgrp"><label class="fld">SSH 用户</label><input class="inp" data-bind="settings.ssh.user" value="'+esc(ssh.user||'root')+'" placeholder="root"></div>'+
    '<div class="fgrp"><label class="fld">SSH 端口</label><input class="inp" type="number" data-bind="settings.ssh.port" value="'+(ssh.port||22)+'" placeholder="22"></div></div>'+
   '<div class="fgrp"><label class="fld">私钥路径（留空用默认 agent / ~/.ssh）</label><input class="inp" data-bind="settings.ssh.key" value="'+esc(ssh.key||'')+'" placeholder="/root/.ssh/id_rsa"></div>'+
   sw('settings.ssh.enabled','启用远程执行','关闭后动盘命令一律在本机执行；多节点集群会直接拒绝执行（不会把命令打到错误的机器上）',ssh.enabled!==false)+
-  sw('settings.ssh.sudo','远程命令走 sudo -n','目标机上的 ceph-volume 需要 root；sudo 必须配 NOPASSWD，否则会明确报错而不是挂住',ssh.sudo!==false)+
+  /* 默认假设集群已经做完 ssh 免密（一般 root 直连）：这种情况下后端不会加 sudo，
+     所以这里按「用户是不是 root」给不同说明，避免用户以为还要去配 NOPASSWD。 */
+  sw('settings.ssh.sudo','远程命令走 sudo -n',
+   ((ssh.user||'root')==='root')
+    ? '当前是 root 直连：即使打开也不会加 sudo（root 本来就有权限，少一层更稳）。只有目标机没装 sudo 包时这层反而会报错。'
+    : 'SSH 用户不是 root 时才需要：ceph-volume / systemctl 要 root 权限，目标机 sudo 必须配 NOPASSWD，否则会明确报错而不是挂住。',
+   ssh.sudo!==false)+
   '<div class="btn-row" style="margin-top:12px"><button class="btn pri" data-act="ssh-save">'+ic('settings',14)+' 保存配置</button>'+
    '<button class="btn" data-act="ssh-test">'+ic('link',14)+' 测试连通性</button>'+
    '<button class="btn" data-act="nav" data-view="deploy">'+ic('wrench',14)+' 看部署说明</button></div>'+

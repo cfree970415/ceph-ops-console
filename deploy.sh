@@ -86,10 +86,10 @@ Usage:  sudo bash deploy.sh [options]
   --cors-origin LIST  Allowed UI origins (default *; comma separated to restrict)
   --no-auth           Disable login (NOT recommended)
   --ssh-user USER     Remote-exec user for binary/package-installed clusters
-                      (without cephadm, disk ops must run on the disk's host)
+                      (default root; passwordless ssh is assumed, nothing to set)
   --ssh-port N        Remote-exec SSH port (default 22)
-  --ssh-key PATH      SSH private key for remote execution
-  --no-ssh-sudo       Run remote commands without sudo -n (ssh user is root)
+  --ssh-key PATH      SSH private key (default: agent / ~/.ssh of the service account)
+  --no-ssh-sudo       Compatibility flag: root ssh already runs without sudo
   --no-ssh            Disable remote execution (single node / cephadm only)
   --no-firewall       Do not modify firewall rules
   --no-service        Do not register systemd/SysV service
